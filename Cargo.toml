@@ -1,0 +1,31 @@
+[package]
+name = "xor-net"
+version = "0.1.0"
+edition = "2024"
+autoexamples = false
+
+[[example]]
+name = "run_3b"
+path = "examples/run_3b.rs"
+
+[[example]]
+name = "run_benchmark"
+path = "examples/run_benchmark.rs"
+
+[[example]]
+name = "simple_usage"
+path = "examples/simple_usage.rs"
+
+[[example]]
+name = "jepa_policy"
+path = "examples/jepa_policy.rs"
+
+[dependencies]
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+hf-hub = "0.5.0"
+rayon = "1.12.0"
+serde = { version = "1.0.228", features = ["derive"] }
+tokenizers = "0.23.1"
+
