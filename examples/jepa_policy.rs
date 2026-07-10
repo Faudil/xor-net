@@ -1,7 +1,7 @@
-use candle_core::{Device, Tensor, Result, Module};
 use xor_net::bit1::layers::BitLinear;
 use xor_net::bit1_58::layers::TernaryLinear;
 use xor_net::bit1_58::quantization::TernaryPackType;
+use xor_net::tensor::FastTensor;
 
 /// A JEPA Predictor / Policy Block using 1-bit and 1.58-bit layers.
 /// This block represents a typical low-precision neural network architecture
@@ -13,7 +13,7 @@ pub struct JepaPolicyBlock {
 }
 
 impl JepaPolicyBlock {
-    pub fn new(embed_dim: usize, hidden_dim: usize) -> Result<Self> {
+    pub fn new(embed_dim: usize, hidden_dim: usize) -> anyhow::Result<Self> {
         // Initialize mock weights. In a real-world scenario, these would be loaded
         // from a pre-trained checkpoint (e.g., a safetensors file).
         
@@ -61,10 +61,8 @@ impl JepaPolicyBlock {
             proj_out,
         })
     }
-}
 
-impl Module for JepaPolicyBlock {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, xs: &FastTensor) -> anyhow::Result<FastTensor> {
         // Project inputs to hidden space using 1.58-bit math
         let x = self.proj_in.forward(xs)?;
         
@@ -79,13 +77,11 @@ impl Module for JepaPolicyBlock {
         let out = self.proj_out.forward(&x)?;
         
         // Residual connection (f32)
-        out + xs
+        out.add(xs)
     }
 }
 
-fn main() -> Result<()> {
-    let device = Device::Cpu;
-
+fn main() -> anyhow::Result<()> {
     let embed_dim = 256;
     let hidden_dim = 512;
     let batch_size = 4;
@@ -94,7 +90,11 @@ fn main() -> Result<()> {
     let block = JepaPolicyBlock::new(embed_dim, hidden_dim)?;
 
     // Generate mock chess state embedding (e.g. 4 batches of 256 elements)
-    let mock_embeddings = Tensor::randn(0.0f32, 1.0f32, (batch_size, embed_dim), &device)?;
+    // We can use a simple initialization with some values
+    let mock_data: Vec<f32> = (0..batch_size * embed_dim)
+        .map(|i| (i as f32).sin())
+        .collect();
+    let mock_embeddings = FastTensor::new(mock_data, vec![batch_size, embed_dim]);
 
     println!("Input shape: {:?}", mock_embeddings.shape());
 
@@ -103,8 +103,8 @@ fn main() -> Result<()> {
 
     println!("Output shape: {:?}", output.shape());
     println!("\nSample outputs from the first batch (first 5 elements):");
-    let output_slice = output.get(0)?.flatten_all()?.to_vec1::<f32>()?;
-    println!("{:?}", &output_slice[..5]);
+    let output_slice = &output.data[..5];
+    println!("{:?}", output_slice);
 
     println!("\nInference executed successfully using 1-bit & 1.58-bit SIMD kernels!");
 

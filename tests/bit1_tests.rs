@@ -1,7 +1,7 @@
 use xor_net::bit1::quantization::pack_1bit;
 use xor_net::bit1::simd::{xnor_dot_product, xnor_dot_product_avx2};
 use xor_net::bit1::layers::BitLinear;
-use candle_core::{Device, Tensor, Module};
+use xor_net::tensor::FastTensor;
 
 #[test]
 fn test_bit1_packing() {
@@ -35,7 +35,6 @@ fn test_bit1_simd_parity() {
 
 #[test]
 fn test_bit1_linear_layer() {
-    let device = Device::Cpu;
     let in_dim = 4;
     let out_dim = 2;
     let weights = vec![
@@ -44,9 +43,9 @@ fn test_bit1_linear_layer() {
     ];
     let layer = BitLinear::new(in_dim, out_dim, &weights).unwrap();
     
-    let input = Tensor::from_vec(vec![0.5f32, 1.0, -0.5, 2.0], (1, in_dim), &device).unwrap();
+    let input = FastTensor::new(vec![0.5f32, 1.0, -0.5, 2.0], vec![1, in_dim]);
     let out = layer.forward(&input).unwrap();
-    let out_vec = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let out_vec = out.data;
     
     assert_eq!(out_vec, vec![0.0, -4.0]);
 }

@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TernaryPackType {
     Pack4,
     Pack5,
@@ -90,9 +90,94 @@ pub fn unpack_1_58bit_5pack(packed: &[u8], len: usize) -> Vec<f32> {
     weights
 }
 
-/// Absmax quantization for converting f32 activations to i8
-/// Returns (quantized_i8, scale_f32)
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn quantize_f32_to_i8_avx512(activations: &[f32], quantized: &mut [i8]) -> f32 { unsafe {
+    use std::arch::x86_64::*;
+    let mut max_vec = _mm512_setzero_ps();
+    let chunks = activations.len() / 16;
+    let ptr = activations.as_ptr();
+    
+    let sign_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFFFFFF));
+
+    for i in 0..chunks {
+        let v = _mm512_loadu_ps(ptr.add(i * 16));
+        let abs_v = _mm512_and_ps(sign_mask, v);
+        max_vec = _mm512_max_ps(max_vec, abs_v);
+    }
+    
+    let mut max_arr = [0f32; 16];
+    _mm512_storeu_ps(max_arr.as_mut_ptr(), max_vec);
+    let mut max_abs = 0f32;
+    for &m in &max_arr {
+        if m > max_abs { max_abs = m; }
+    }
+    for i in chunks * 16..activations.len() {
+        let abs = activations[i].abs();
+        if abs > max_abs { max_abs = abs; }
+    }
+    
+    let scale = if max_abs > 0.0 { 127.0 / max_abs } else { 1.0 };
+    let inv_scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+    
+    let v_scale = _mm512_set1_ps(scale);
+    let v_max = _mm512_set1_ps(127.0);
+    let v_min = _mm512_set1_ps(-127.0);
+    let out_ptr = quantized.as_mut_ptr();
+    
+    for i in 0..chunks {
+        let v = _mm512_loadu_ps(ptr.add(i * 16));
+        let scaled = _mm512_mul_ps(v, v_scale);
+        let clamped = _mm512_max_ps(v_min, _mm512_min_ps(v_max, scaled));
+        
+        let q_i32 = _mm512_cvtps_epi32(clamped);
+        let q_i8 = _mm512_cvtepi32_epi8(q_i32);
+        _mm_storeu_si128(out_ptr.add(i * 16) as *mut __m128i, q_i8);
+    }
+    
+    for i in chunks * 16..activations.len() {
+        let q = (activations[i] * scale).round();
+        let q_clamped = if q > 127.0 { 127.0 } else if q < -127.0 { -127.0 } else { q };
+        quantized[i] = q_clamped as i8;
+    }
+    
+    inv_scale
+}}
+
+use std::sync::atomic::{AtomicU8, Ordering};
+static HAS_AVX512F: AtomicU8 = AtomicU8::new(0); // 0: uninitialized, 1: no, 2: yes
+
+#[inline(always)]
+fn has_avx512f() -> bool {
+    let val = HAS_AVX512F.load(Ordering::Relaxed);
+    if val != 0 {
+        return val == 2;
+    }
+    let detected = {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            is_x86_feature_detected!("avx512f")
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            false
+        }
+    };
+    HAS_AVX512F.store(if detected { 2 } else { 1 }, Ordering::Relaxed);
+    detected
+}
+
 pub fn quantize_f32_to_i8(activations: &[f32]) -> (Vec<i8>, f32) {
+    let mut quantized = crate::tensor::uninit_vec(activations.len());
+    
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if has_avx512f() {
+            let inv_scale = unsafe { quantize_f32_to_i8_avx512(activations, &mut quantized) };
+            return (quantized, inv_scale);
+        }
+    }
+
     let mut max_abs: f32 = 0.0;
     for &x in activations {
         if x.abs() > max_abs {
@@ -103,11 +188,10 @@ pub fn quantize_f32_to_i8(activations: &[f32]) -> (Vec<i8>, f32) {
     let scale = if max_abs > 0.0 { 127.0 / max_abs } else { 1.0 };
     let inv_scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
     
-    let mut quantized = Vec::with_capacity(activations.len());
-    for &x in activations {
-        let q = (x * scale).round();
+    for i in 0..activations.len() {
+        let q = (activations[i] * scale).round();
         let q_clamped = q.max(-127.0).min(127.0) as i8;
-        quantized.push(q_clamped);
+        quantized[i] = q_clamped;
     }
     
     (quantized, inv_scale)

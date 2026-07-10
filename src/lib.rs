@@ -1,5 +1,10 @@
 pub mod bit1;
 pub mod bit1_58;
+pub mod loader;
+pub mod tensor;
+
+pub use tensor::FastTensor;
+pub use loader::{SafeTensorRepo, SafeTensorLoader};
 
 pub use bit1::layers::BitLinear;
 pub use bit1_58::layers::TernaryLinear;
@@ -17,3 +22,10 @@ pub fn init_threads(num_threads: usize) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+pub mod nn;
+pub mod models;
+
+pub use models::auto::AutoModelForCausalLM;
+pub use nn::{QuantizationConfig, DynamicLinear};
+
+pub use models::llama::{Cache, Config, Llama};

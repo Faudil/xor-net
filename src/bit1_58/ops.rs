@@ -1,6 +1,6 @@
 use candle_core::{CustomOp1, Error, Layout, Result, Shape, CpuStorage};
 use super::quantization::{TernaryPackType, quantize_f32_to_i8};
-use super::simd::{ternary_dot_product_pack4, ternary_dot_product_pack5_scalar};
+use super::simd::{ternary_dot_product_pack4, ternary_dot_product_pack5};
 
 #[derive(Debug, Clone)]
 pub struct TernaryMatMulOp {
@@ -57,15 +57,21 @@ impl CustomOp1 for TernaryMatMulOp {
             
             let (quantized_in, inv_scale) = quantize_f32_to_i8(in_row);
             
-            out_row.par_iter_mut().enumerate().for_each(|(o, out_val)| {
-                let w_row = &self.packed_weights[o * bytes_per_row .. (o + 1) * bytes_per_row];
-                
-                let dot_i32 = match self.pack_type {
-                    TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_in, w_row, self.in_dim),
-                    TernaryPackType::Pack5 => ternary_dot_product_pack5_scalar(&quantized_in, w_row, self.in_dim),
-                };
-                
-                *out_val = dot_i32 as f32 * inv_scale * self.w_scale;
+            
+            let chunk_size = (self.out_dim / rayon::current_num_threads().max(1)).max(128);
+            out_row.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
+                let start_o = chunk_idx * chunk_size;
+                for (i, out_val) in out_chunk.iter_mut().enumerate() {
+                    let o = start_o + i;
+                    let w_row = &self.packed_weights[o * bytes_per_row .. (o + 1) * bytes_per_row];
+                    
+                    let dot_i32 = match self.pack_type {
+                        TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_in, w_row, self.in_dim),
+                        TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_in, w_row, self.in_dim),
+                    };
+                    
+                    *out_val = dot_i32 as f32 * inv_scale * self.w_scale;
+                }
             });
         });
         

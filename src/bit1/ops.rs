@@ -2,6 +2,7 @@ use candle_core::{CustomOp1, Error, Layout, Result, Shape, CpuStorage};
 use super::quantization::pack_1bit;
 use super::simd::xnor_dot_product;
 
+#[derive(Debug, Clone)]
 pub struct BitMatMulOp {
     pub packed_weights: Vec<u8>,
     pub in_dim: usize,
@@ -49,9 +50,14 @@ impl CustomOp1 for BitMatMulOp {
             let in_row = &input_slice[b * self.in_dim .. (b + 1) * self.in_dim];
             let packed_in = pack_1bit(in_row);
             
-            out_row.par_iter_mut().enumerate().for_each(|(o, out_val)| {
-                let w_row = &self.packed_weights[o * bytes_per_row .. (o + 1) * bytes_per_row];
-                *out_val = xnor_dot_product(&packed_in, w_row, self.in_dim);
+            let chunk_size = 64;
+            out_row.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
+                let start_o = chunk_idx * chunk_size;
+                for (i, out_val) in out_chunk.iter_mut().enumerate() {
+                    let o = start_o + i;
+                    let w_row = &self.packed_weights[o * bytes_per_row .. (o + 1) * bytes_per_row];
+                    *out_val = xnor_dot_product(&packed_in, w_row, self.in_dim);
+                }
             });
         });
         

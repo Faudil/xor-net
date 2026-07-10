@@ -5,7 +5,7 @@ use xor_net::bit1_58::quantization::{
 };
 use xor_net::bit1_58::simd::{ternary_dot_product_pack4, ternary_dot_product_pack4_avx2, ternary_dot_product_pack5_scalar};
 use xor_net::bit1_58::layers::TernaryLinear;
-use candle_core::{Device, Tensor, Module};
+use xor_net::tensor::FastTensor;
 
 #[test]
 fn test_ternary_pack_unpack_roundtrip() {
@@ -67,7 +67,6 @@ fn test_ternary_simd_parity() {
 
 #[test]
 fn test_ternary_linear_layer() {
-    let device = Device::Cpu;
     let in_dim = 4;
     let out_dim = 2;
     let weights = vec![
@@ -78,13 +77,13 @@ fn test_ternary_linear_layer() {
     let layer_pack4 = TernaryLinear::new(in_dim, out_dim, &weights, TernaryPackType::Pack4).unwrap();
     let layer_pack5 = TernaryLinear::new(in_dim, out_dim, &weights, TernaryPackType::Pack5).unwrap();
     
-    let input = Tensor::from_vec(vec![0.5f32, 1.0, -0.5, 2.0], (1, in_dim), &device).unwrap();
+    let input = FastTensor::new(vec![0.5f32, 1.0, -0.5, 2.0], vec![1, in_dim]);
     
     let out4 = layer_pack4.forward(&input).unwrap();
-    let out4_vec = out4.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let out4_vec = out4.data;
 
     let out5 = layer_pack5.forward(&input).unwrap();
-    let out5_vec = out5.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let out5_vec = out5.data;
 
     assert_eq!(out4_vec, out5_vec);
     
