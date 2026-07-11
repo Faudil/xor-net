@@ -36,6 +36,25 @@ pub enum LlamaEosToks {
     Multiple(Vec<u32>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Activation {
+    Silu,
+    Relu2,
+}
+
+impl Default for Activation {
+    fn default() -> Self { Self::Silu }
+}
+
+impl Activation {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "relu2" => Activation::Relu2,
+            _ => Activation::Silu,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct LlamaConfig {
     pub hidden_size: usize,
@@ -52,6 +71,8 @@ pub struct LlamaConfig {
     pub rope_scaling: Option<Llama3RopeConfig>,
     pub max_position_embeddings: usize,
     pub tie_word_embeddings: Option<bool>,
+    #[serde(default)]
+    pub hidden_act: Option<String>,
 }
 
 impl LlamaConfig {
@@ -82,6 +103,7 @@ impl LlamaConfig {
             max_position_embeddings: self.max_position_embeddings,
             tie_word_embeddings: self.tie_word_embeddings.unwrap_or(false),
             quantization_config: QuantizationConfig::None,
+            hidden_act: self.hidden_act.as_deref().map(Activation::from_str).unwrap_or_default(),
         }
     }
 }
@@ -103,6 +125,7 @@ pub struct Config {
     pub quantization_config: QuantizationConfig,
     pub max_position_embeddings: usize,
     pub tie_word_embeddings: bool,
+    pub hidden_act: Activation,
 }
 
 impl Config {
@@ -123,6 +146,7 @@ impl Config {
             quantization_config: QuantizationConfig::None,
             max_position_embeddings: DEFAULT_MAX_SEQ_LEN,
             tie_word_embeddings: false,
+            hidden_act: Activation::default(),
         }
     }
 
@@ -143,6 +167,7 @@ impl Config {
             quantization_config: QuantizationConfig::None,
             max_position_embeddings: DEFAULT_MAX_SEQ_LEN,
             tie_word_embeddings: false,
+            hidden_act: Activation::default(),
         }
     }
 }
@@ -332,8 +357,10 @@ impl CausalSelfAttention {
         let v_proj = DynamicLinear::load(size_in, size_kv, &loader.pp("v_proj"), "weight", cfg.quantization_config)?;
         let o_proj = DynamicLinear::load(size_q, size_in, &loader.pp("o_proj"), "weight", cfg.quantization_config)?;
         
-        let inner_attn_ln = if cfg.quantization_config != QuantizationConfig::None && loader.pp("inner_attn_ln").has_tensor("weight") {
+        let inner_attn_ln = if loader.pp("inner_attn_ln").has_tensor("weight") {
             Some(FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("inner_attn_ln"))?)
+        } else if loader.pp("attn_sub_norm").has_tensor("weight") {
+            Some(FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("attn_sub_norm"))?)
         } else {
             None
         };
@@ -357,6 +384,7 @@ struct Mlp {
     c_fc2: DynamicLinear,
     c_proj: DynamicLinear,
     ffn_layernorm: Option<FastRmsNorm>,
+    hidden_act: Activation,
 }
 
 impl Mlp {
@@ -382,7 +410,10 @@ impl Mlp {
             }
         };
 
-        let x_mul = h1.silu_mul_inplace(&h2)?;
+        let x_mul = match self.hidden_act {
+            Activation::Relu2 => h1.relu2_mul_inplace(&h2)?,
+            Activation::Silu => h1.silu_mul_inplace(&h2)?,
+        };
         let x_norm = match &self.ffn_layernorm { 
             Some(ln) => ln.forward(&x_mul)?, 
             None => x_mul 
@@ -396,8 +427,10 @@ impl Mlp {
         let c_fc1 = DynamicLinear::load(h_size, i_size, &loader.pp("gate_proj"), "weight", cfg.quantization_config)?;
         let c_fc2 = DynamicLinear::load(h_size, i_size, &loader.pp("up_proj"), "weight", cfg.quantization_config)?;
         let c_proj = DynamicLinear::load(i_size, h_size, &loader.pp("down_proj"), "weight", cfg.quantization_config)?;
-        let ffn_layernorm = if cfg.quantization_config != QuantizationConfig::None && loader.pp("ffn_layernorm").has_tensor("weight") {
+        let ffn_layernorm = if loader.pp("ffn_layernorm").has_tensor("weight") {
             Some(FastRmsNorm::load(i_size, cfg.rms_norm_eps as f32, &loader.pp("ffn_layernorm"))?)
+        } else if loader.pp("ffn_sub_norm").has_tensor("weight") {
+            Some(FastRmsNorm::load(i_size, cfg.rms_norm_eps as f32, &loader.pp("ffn_sub_norm"))?)
         } else {
             None
         };
@@ -406,6 +439,7 @@ impl Mlp {
             c_fc2,
             c_proj,
             ffn_layernorm,
+            hidden_act: cfg.hidden_act,
         })
     }
 }

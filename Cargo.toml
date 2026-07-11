@@ -32,6 +32,18 @@ path = "examples/bench_layer.rs"
 name = "bench_memory"
 path = "examples/bench_memory.rs"
 
+[[example]]
+name = "load_test"
+path = "examples/load_test.rs"
+
+[[example]]
+name = "run_llama3_8b_158"
+path = "examples/run_llama3_8b_158.rs"
+
+[[example]]
+name = "dump_logits"
+path = "examples/dump_logits.rs"
+
 [dependencies]
 anyhow = "1.0.103"
 candle-core = "0.11.0"

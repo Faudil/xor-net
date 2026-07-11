@@ -28,4 +28,4 @@ pub mod models;
 pub use models::auto::AutoModelForCausalLM;
 pub use nn::{QuantizationConfig, DynamicLinear};
 
-pub use models::llama::{Cache, Config, Llama};
+pub use models::llama::{Cache, Config, Llama, LlamaConfig, Activation};

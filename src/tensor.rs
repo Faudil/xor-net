@@ -183,6 +183,36 @@ impl FastTensor {
         Ok(self)
     }
 
+    pub fn relu2_mul_inplace(mut self, other: &Self) -> anyhow::Result<Self> {
+        if self.shape != other.shape {
+            anyhow::bail!(
+                "FastTensor::relu2_mul_inplace shape mismatch: {:?} != {:?}",
+                self.shape,
+                other.shape
+            );
+        }
+
+        if self.data.len() >= 32768 {
+            self.data.par_chunks_mut(1024)
+                .zip(other.data.par_chunks(1024))
+                .for_each(|(s1_chunk, s2_chunk)| {
+                    for i in 0..s1_chunk.len() {
+                        let x = s1_chunk[i];
+                        let relu = if x > 0.0 { x } else { 0.0 };
+                        s1_chunk[i] = relu * relu * s2_chunk[i];
+                    }
+                });
+        } else {
+            for i in 0..self.data.len() {
+                let x = self.data[i];
+                let relu = if x > 0.0 { x } else { 0.0 };
+                self.data[i] = relu * relu * other.data[i];
+            }
+        }
+
+        Ok(self)
+    }
+
     pub fn rmsnorm(&self, weight: &Self, eps: f32) -> anyhow::Result<Self> {
         let hidden_size = *self.shape.last().ok_or_else(|| {
             anyhow::anyhow!("FastTensor::rmsnorm: empty shape")

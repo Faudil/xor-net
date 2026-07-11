@@ -356,6 +356,18 @@ impl DynamicLinear {
         })
     }
 
+    pub fn new_ternary_direct(packed_weights: Vec<u8>, in_dim: usize, out_dim: usize, pack_type: TernaryPackType, w_scale: f32) -> Self {
+        Self {
+            inner: LinearKind::Ternary(TernaryLinear {
+                packed_weights,
+                in_dim,
+                out_dim,
+                pack_type,
+                w_scale,
+            })
+        }
+    }
+
     pub fn new_bit(in_dim: usize, out_dim: usize, weights_f32: &[f32]) -> anyhow::Result<Self> {
         let l = BitLinear::new(in_dim, out_dim, weights_f32)?;
         Ok(Self {
@@ -380,8 +392,17 @@ impl DynamicLinear {
                 Self::new_bit(in_dim, out_dim, &weight.data)
             }
             QuantizationConfig::Bit1_58(pack_type) => {
+                // Try direct pre-packed path first (preserves original w_scale)
+                if let Ok((packed_weights, w_scale, p_in, p_out)) =
+                    loader.get_prepacked_ternary(&[out_dim, in_dim], name, pack_type)
+                {
+                    return Ok(Self::new_ternary_direct(
+                        packed_weights, p_in, p_out, pack_type, w_scale,
+                    ));
+                }
+                // Not pre-packed (e.g., BF16 weight like lm_head): keep F32 precision
                 let weight = loader.get(&[out_dim, in_dim], name)?;
-                Self::new_ternary(in_dim, out_dim, &weight.data, pack_type)
+                Ok(Self::new_int8(&weight.data, out_dim, in_dim))
             }
         }
     }

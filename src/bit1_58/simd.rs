@@ -321,12 +321,12 @@ pub unsafe fn ternary_dot_product_pack5_avx512(a_i8: &[i8], b_pack5: &[u8], tota
 }}
 
 pub fn ternary_dot_product_pack5(a_i8: &[i8], b_pack5: &[u8], total_elems: usize) -> i32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx512vbmi") {
-            return unsafe { ternary_dot_product_pack5_avx512(a_i8, b_pack5, total_elems) };
-        }
-    }
+    // #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    // {
+    //     if is_x86_feature_detected!("avx512vbmi") {
+    //         return unsafe { ternary_dot_product_pack5_avx512(a_i8, b_pack5, total_elems) };
+    //     }
+    // }
 
     ternary_dot_product_pack5_scalar(a_i8, b_pack5, total_elems)
 }
