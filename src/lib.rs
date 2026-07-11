@@ -24,6 +24,7 @@ pub fn init_threads(num_threads: usize) -> Result<(), Box<dyn std::error::Error>
 
 pub mod nn;
 pub mod models;
+pub mod sampler;
 
 pub use models::auto::AutoModelForCausalLM;
 pub use nn::{QuantizationConfig, DynamicLinear};

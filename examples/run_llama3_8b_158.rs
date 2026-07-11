@@ -1,5 +1,4 @@
-use candle_core::{Device, Tensor};
-use candle_transformers::generation::LogitsProcessor;
+
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::time::Instant;
 use tokenizers::Tokenizer;
@@ -19,7 +18,6 @@ fn main() -> anyhow::Result<()> {
         .and_then(|val| val.parse::<usize>().ok())
         .unwrap_or(0);
     xor_net::init_threads(num_threads).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let device = Device::Cpu;
 
     let model_id = "HF1BitLLM/Llama3-8B-1.58-100B-tokens";
     println!("Loading 1.58-bit model {}...", model_id);
@@ -51,7 +49,7 @@ fn main() -> anyhow::Result<()> {
         .to_vec();
 
     println!("Prompt: '{}'", prompt);
-    let mut logits_processor = LogitsProcessor::new(299792458, Some(0.7), None);
+    let mut sampler = xor_net::sampler::Sampler::new(299792458, Some(0.7), None);
 
     let mut index_pos = 0;
     let max_len = 50;
@@ -70,8 +68,7 @@ fn main() -> anyhow::Result<()> {
         total_forward_time += start_forward.elapsed();
 
         let start_sample = Instant::now();
-        let logits_candle = Tensor::from_vec(logits.data, (logits.shape[2],), &device)?;
-        let next_token = logits_processor.sample(&logits_candle)?;
+        let next_token = sampler.sample(&logits.data)?;
         total_sample_time += start_sample.elapsed();
 
         tokens.push(next_token);
@@ -90,7 +87,7 @@ fn main() -> anyhow::Result<()> {
     let tps = generated_tokens as f64 / elapsed.as_secs_f64();
     println!("Generated {} tokens in {:.2?} ({:.2} tokens/sec)", generated_tokens, elapsed, tps);
     println!("  - Model Forward Time: {:.2?}", total_forward_time);
-    println!("  - Candle Sampling Time: {:.2?}", total_sample_time);
+    println!("  - Native Sampling Time: {:.2?}", total_sample_time);
 
     let (blocks_us, lm_head_us, other_us) = xor_net::models::llama::get_profiling_stats();
     println!("    * [Profile] Transformer Blocks Total: {:.2}ms ({:.2}ms/token)", blocks_us as f64 / 1000.0, (blocks_us as f64 / 1000.0) / generated_tokens as f64);
