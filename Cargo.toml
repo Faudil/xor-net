@@ -44,6 +44,10 @@ path = "examples/run_llama3_8b_158.rs"
 name = "dump_logits"
 path = "examples/dump_logits.rs"
 
+[[example]]
+name = "chat"
+path = "examples/chat.rs"
+
 [dependencies]
 anyhow = "1.0.103"
 candle-core = "0.11.0"

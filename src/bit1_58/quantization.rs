@@ -92,7 +92,7 @@ pub fn unpack_1_58bit_5pack(packed: &[u8], len: usize) -> Vec<f32> {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f")]
-pub unsafe fn quantize_f32_to_i8_avx512(activations: &[f32], quantized: &mut [i8]) -> f32 { unsafe {
+pub unsafe fn quantize_f32_to_i8_avx512(activations: &[f32], quantized: &mut [i8]) -> f32 {
     use std::arch::x86_64::*;
     let mut max_vec = _mm512_setzero_ps();
     let chunks = activations.len() / 16;
@@ -142,7 +142,7 @@ pub unsafe fn quantize_f32_to_i8_avx512(activations: &[f32], quantized: &mut [i8
     }
     
     inv_scale
-}}
+}
 
 use std::sync::atomic::{AtomicU8, Ordering};
 static HAS_AVX512F: AtomicU8 = AtomicU8::new(0); // 0: uninitialized, 1: no, 2: yes
@@ -168,7 +168,7 @@ fn has_avx512f() -> bool {
 }
 
 pub fn quantize_f32_to_i8(activations: &[f32]) -> (Vec<i8>, f32) {
-    let mut quantized = crate::tensor::uninit_vec(activations.len());
+    let mut quantized = crate::util::uninit_vec(activations.len());
     
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {

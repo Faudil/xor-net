@@ -1,8 +1,6 @@
 use candle_core::{CustomOp2, Error, Layout, Result, Shape, Tensor};
 use rayon::prelude::*;
 
-// std::arch imports removed
-
 pub struct FastAddOp;
 
 impl CustomOp2 for FastAddOp {
@@ -39,9 +37,9 @@ impl CustomOp2 for FastAddOp {
             return Err(Error::Msg("FastAddOp: shape mismatch".into()));
         }
         
-        let mut out_data = crate::tensor::uninit_vec(s1_slice.len());
+        let mut out_data = crate::tensor::workspace::get_pooled_buffer(s1_slice.len());
         
-        let chunk_size = 4096; // Good size for parallel
+        let chunk_size = 4096;
         
         out_data.par_chunks_mut(chunk_size)
             .zip(s1_slice.par_chunks(chunk_size))

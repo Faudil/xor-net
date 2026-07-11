@@ -83,7 +83,7 @@ pub fn fast_attention(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let total_kv_len = index_pos + seq_len;
     
-    let mut out_data = crate::tensor::uninit_vec(num_heads * seq_len * head_dim);
+    let mut out_data = crate::tensor::workspace::get_pooled_buffer(num_heads * seq_len * head_dim);
     
     // 2. Parallel Attention computation over Query heads
     out_data.par_chunks_mut(seq_len * head_dim)
@@ -95,7 +95,7 @@ pub fn fast_attention(
             let max_seq_len = cache.max_seq_len;
             
             // Score vector: [seq_len * total_kv_len]
-            let mut scores = crate::tensor::uninit_vec(seq_len * total_kv_len);
+            let mut scores = crate::tensor::workspace::get_pooled_buffer(seq_len * total_kv_len);
             
             for t_q in 0..seq_len {
                 let q_offset = h * (seq_len * head_dim) + t_q * head_dim;

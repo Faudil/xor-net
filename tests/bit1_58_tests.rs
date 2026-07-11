@@ -80,10 +80,10 @@ fn test_ternary_linear_layer() {
     let input = FastTensor::new(vec![0.5f32, 1.0, -0.5, 2.0], vec![1, in_dim]);
     
     let out4 = layer_pack4.forward(&input).unwrap();
-    let out4_vec = out4.data;
+    let out4_vec = &out4.data;
 
     let out5 = layer_pack5.forward(&input).unwrap();
-    let out5_vec = out5.data;
+    let out5_vec = &out5.data;
 
     assert_eq!(out4_vec, out5_vec);
     

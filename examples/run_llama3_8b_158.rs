@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     let model_id = "HF1BitLLM/Llama3-8B-1.58-100B-tokens";
     println!("Loading 1.58-bit model {}...", model_id);
 
-    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4);
+    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, xor_net::nn::LmHeadConfig::Int4);
 
     let load_start = Instant::now();
     let (model, config) = AutoModelForCausalLM::from_pretrained(model_id, quantization)?;

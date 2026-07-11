@@ -6,7 +6,7 @@ use core::arch::x86_64::*;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[target_feature(enable = "popcnt")]
-pub unsafe fn xnor_dot_product_avx2(a: &[u8], b: &[u8], total_bits: usize) -> f32 { unsafe {
+pub unsafe fn xnor_dot_product_avx2(a: &[u8], b: &[u8], total_bits: usize) -> f32 {
     let mut matches = 0;
     let chunks = a.len() / 32;
     let a_ptr = a.as_ptr() as *const __m256i;
@@ -50,7 +50,7 @@ pub unsafe fn xnor_dot_product_avx2(a: &[u8], b: &[u8], total_bits: usize) -> f3
     let padding_bits = (a.len() * 8) - total_bits;
     let valid_matches = matches as usize - padding_bits;
     (2.0 * valid_matches as f32) - total_bits as f32
-}}
+}
 
 use std::sync::atomic::{AtomicU8, Ordering};
 static HAS_AVX2: AtomicU8 = AtomicU8::new(0); // 0: uninitialized, 1: no, 2: yes

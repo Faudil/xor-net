@@ -1,5 +1,5 @@
 pub mod dynamic_linear;
-pub use dynamic_linear::{DynamicLinear, QuantizationConfig, LinearKind};
+pub use dynamic_linear::{DynamicLinear, QuantizationConfig, LinearKind, LmHeadConfig};
 
 pub mod fast_rmsnorm;
 pub mod fast_attention;

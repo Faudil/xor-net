@@ -2,18 +2,6 @@ use rayon::prelude::*;
 use crate::tensor::FastTensor;
 use super::quantization::pack_1bit;
 use super::simd::xnor_dot_product;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-static NUM_THREADS: AtomicUsize = AtomicUsize::new(0);
-
-fn get_num_threads() -> usize {
-    let mut val = NUM_THREADS.load(Ordering::Relaxed);
-    if val == 0 {
-        val = rayon::current_num_threads().max(1);
-        NUM_THREADS.store(val, Ordering::Relaxed);
-    }
-    val
-}
 
 #[derive(Debug, Clone)]
 pub struct BitLinear {
@@ -56,13 +44,13 @@ impl BitLinear {
         let out_dim = self.out_dim;
         let b_size: usize = xs.shape[..rank - 1].iter().product();
         
-        let mut out_data = crate::tensor::uninit_vec(b_size * out_dim);
+        let mut out_data = crate::tensor::workspace::get_pooled_buffer(b_size * out_dim);
         let bytes_per_row = (in_dim + 7) / 8;
         
         if b_size == 1 {
             let in_row = &input_slice[0 .. in_dim];
             let packed_in = pack_1bit(in_row);
-            let num_threads = get_num_threads();
+            let num_threads = crate::util::get_num_threads();
             let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
             
             out_data.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {

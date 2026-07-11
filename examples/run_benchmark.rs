@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
     println!("Loading 1.58-bit model weights for benchmarking...");
     
     let quantization = if use_ternary {
-        QuantizationConfig::Bit1_58(TernaryPackType::Pack4)
+        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, xor_net::nn::LmHeadConfig::Int4)
     } else {
         QuantizationConfig::None
     };
@@ -61,7 +61,8 @@ fn main() -> anyhow::Result<()> {
         let start_pos = tokens.len().saturating_sub(context_size);
         
         let logits = model.forward(&tokens[start_pos..], index_pos, &mut cache)?;
-        let logits_candle = Tensor::from_vec(logits.data, (logits.shape[2],), &device)?;
+        let logits_shape = logits.shape[2];
+        let logits_candle = Tensor::from_vec(logits.into_data(), (logits_shape,), &device)?;
         let next_token = logits_processor.sample(&logits_candle)?;
         
         tokens.push(next_token);

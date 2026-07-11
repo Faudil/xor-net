@@ -2,18 +2,7 @@ use rayon::prelude::*;
 use crate::tensor::FastTensor;
 use super::quantization::{TernaryPackType, pack_1_58bit_4pack, pack_1_58bit_5pack, quantize_f32_to_i8};
 use super::simd::{ternary_dot_product_pack4, ternary_dot_product_pack5};
-use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
-
-static NUM_THREADS: AtomicUsize = AtomicUsize::new(0);
-
-fn get_num_threads() -> usize {
-    let mut val = NUM_THREADS.load(Ordering::Relaxed);
-    if val == 0 {
-        val = rayon::current_num_threads().max(1);
-        NUM_THREADS.store(val, Ordering::Relaxed);
-    }
-    val
-}
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct TernaryLinear {
@@ -68,7 +57,7 @@ impl TernaryLinear {
         let out_dim = self.out_dim;
         let b_size: usize = xs.shape[..rank - 1].iter().product();
         
-        let mut out_data = crate::tensor::uninit_vec(b_size * out_dim);
+        let mut out_data = crate::tensor::workspace::get_pooled_buffer(b_size * out_dim);
         
         let bytes_per_row = match self.pack_type {
             TernaryPackType::Pack4 => (in_dim + 3) / 4,
@@ -80,7 +69,7 @@ impl TernaryLinear {
             let (quantized_in, inv_scale) = quantize_f32_to_i8(in_row);
             
             
-            let num_threads = get_num_threads();
+            let num_threads = crate::util::get_num_threads();
             let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
             
             out_data.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
@@ -130,14 +119,14 @@ impl TernaryLinear {
         let in_dim = self.in_dim;
         let out_dim = self.out_dim;
         
-        let mut out_data = crate::tensor::uninit_vec(out_dim);
+        let mut out_data = crate::tensor::workspace::get_pooled_buffer(out_dim);
         
         let bytes_per_row = match self.pack_type {
             TernaryPackType::Pack4 => (in_dim + 3) / 4,
             TernaryPackType::Pack5 => (in_dim + 4) / 5,
         };
         
-        let num_threads = get_num_threads();
+        let num_threads = crate::util::get_num_threads();
         let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
         
         out_data.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
@@ -167,9 +156,9 @@ impl TernaryLinear {
         let rank = xs.shape.len();
         let in_dim = q_lin.in_dim;
 
-        let mut q_out = crate::tensor::uninit_vec(q_lin.out_dim);
-        let mut k_out = crate::tensor::uninit_vec(k_lin.out_dim);
-        let mut v_out = crate::tensor::uninit_vec(v_lin.out_dim);
+        let mut q_out = crate::tensor::workspace::get_pooled_buffer(q_lin.out_dim);
+        let mut k_out = crate::tensor::workspace::get_pooled_buffer(k_lin.out_dim);
+        let mut v_out = crate::tensor::workspace::get_pooled_buffer(v_lin.out_dim);
 
         let bytes_per_row = match q_lin.pack_type {
             TernaryPackType::Pack4 => (in_dim + 3) / 4,
@@ -180,7 +169,7 @@ impl TernaryLinear {
         let k_out_dim = k_lin.out_dim;
         let total_rows = q_out_dim + k_out_dim + v_lin.out_dim;
 
-        let num_threads = get_num_threads();
+        let num_threads = crate::util::get_num_threads();
         let chunk_size = ((total_rows + num_threads - 1) / num_threads).max(128);
 
         let q_ptr: usize = q_out.as_mut_ptr() as usize;
@@ -284,8 +273,8 @@ impl TernaryLinear {
         let rank = xs.shape.len();
         let in_dim = fc1_lin.in_dim;
 
-        let mut fc1_out = crate::tensor::uninit_vec(fc1_lin.out_dim);
-        let mut fc2_out = crate::tensor::uninit_vec(fc2_lin.out_dim);
+        let mut fc1_out = crate::tensor::workspace::get_pooled_buffer(fc1_lin.out_dim);
+        let mut fc2_out = crate::tensor::workspace::get_pooled_buffer(fc2_lin.out_dim);
 
         let bytes_per_row = match fc1_lin.pack_type {
             TernaryPackType::Pack4 => (in_dim + 3) / 4,
@@ -295,7 +284,7 @@ impl TernaryLinear {
         let fc1_out_dim = fc1_lin.out_dim;
         let total_rows = fc1_out_dim + fc2_lin.out_dim;
 
-        let num_threads = get_num_threads();
+        let num_threads = crate::util::get_num_threads();
         let chunk_size = ((total_rows + num_threads - 1) / num_threads).max(128);
 
         let fc1_ptr: usize = fc1_out.as_mut_ptr() as usize;

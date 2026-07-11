@@ -4,11 +4,12 @@ pub struct Sampler {
     pub seed: u64,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    pub repetition_penalty: f32,
     rng_state: u64,
 }
 
 impl Sampler {
-    pub fn new(seed: u64, temperature: Option<f32>, top_p: Option<f32>) -> Self {
+    pub fn new(seed: u64, temperature: Option<f32>, top_p: Option<f32>, repetition_penalty: f32) -> Self {
         let actual_seed = if seed == 0 {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -23,6 +24,7 @@ impl Sampler {
             seed: actual_seed,
             temperature,
             top_p,
+            repetition_penalty,
             rng_state,
         }
     }
@@ -35,7 +37,22 @@ impl Sampler {
         (val as f32) / (u32::MAX as f32)
     }
 
-    pub fn sample(&mut self, logits: &[f32]) -> anyhow::Result<u32> {
+    pub fn sample(&mut self, logits: &mut [f32], context_tokens: &[u32]) -> anyhow::Result<u32> {
+        if self.repetition_penalty > 1.0 {
+            let mut applied = std::collections::HashSet::new();
+            for &tok in context_tokens {
+                let tok = tok as usize;
+                if tok < logits.len() && applied.insert(tok) {
+                    let val = logits[tok];
+                    if val > 0.0 {
+                        logits[tok] = val / self.repetition_penalty;
+                    } else {
+                        logits[tok] = val * self.repetition_penalty;
+                    }
+                }
+            }
+        }
+        
         let temp = self.temperature.unwrap_or(0.0);
         if temp == 0.0 {
             // Greedy argmax

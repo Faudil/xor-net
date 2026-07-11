@@ -45,7 +45,7 @@ fn test_bit1_linear_layer() {
     
     let input = FastTensor::new(vec![0.5f32, 1.0, -0.5, 2.0], vec![1, in_dim]);
     let out = layer.forward(&input).unwrap();
-    let out_vec = out.data;
+    let out_vec = &out.data;
     
-    assert_eq!(out_vec, vec![0.0, -4.0]);
+    assert_eq!(*out_vec, vec![0.0, -4.0]);
 }

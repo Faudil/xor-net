@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
     let model_id = "1bitLLM/bitnet_b1_58-3B";
     println!("Loading 1.58-bit model {}...", model_id);
     
-    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4);
+    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, xor_net::nn::LmHeadConfig::Int4);
 
     let load_start = Instant::now();
     let (model, config) = AutoModelForCausalLM::from_pretrained(model_id, quantization)?;
@@ -43,7 +43,7 @@ fn main() -> anyhow::Result<()> {
     let tokenizer = Tokenizer::from_file(tokenizer_filename)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     
-    let prompt = "The capital of France is";
+    let prompt = "[System]\nYou are a helpful assistant.\n\n[User]\nHello\n\n[Assistant]\n";
     let mut tokens = tokenizer.encode(prompt, true).map_err(|e| anyhow::anyhow!(e.to_string()))?.get_ids().to_vec();
     
     println!("Prompt: '{}'", prompt);
@@ -66,7 +66,8 @@ fn main() -> anyhow::Result<()> {
         total_forward_time += start_forward.elapsed();
         
         let start_sample = Instant::now();
-        let logits_candle = Tensor::from_vec(logits.data, (logits.shape[2],), &device)?;
+        let logits_shape = logits.shape[2];
+        let logits_candle = Tensor::from_vec(logits.into_data(), (logits_shape,), &device)?;
         let next_token = logits_processor.sample(&logits_candle)?;
         total_sample_time += start_sample.elapsed();
         

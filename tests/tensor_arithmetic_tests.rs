@@ -87,6 +87,22 @@ fn gelu_zero_is_zero() {
 }
 
 #[test]
+fn relu2_mul_known_values() {
+    let a = FastTensor::new(vec![-2.0, 0.0, 1.0, 3.0], vec![4]);
+    let b = FastTensor::new(vec![2.0, 2.0, 2.0, 2.0], vec![4]);
+    let c = a.relu2_mul_inplace(&b).unwrap();
+    assert_close(&c.data, &[0.0, 0.0, 2.0, 18.0], EPS, "relu2_mul");
+}
+
+#[test]
+fn relu2_mul_negative_input() {
+    let a = FastTensor::new(vec![-5.0, -0.5, -100.0], vec![3]);
+    let b = FastTensor::new(vec![1.0, 1.0, 1.0], vec![3]);
+    let c = a.relu2_mul_inplace(&b).unwrap();
+    assert_close(&c.data, &[0.0, 0.0, 0.0], EPS, "relu2_mul negative");
+}
+
+#[test]
 fn gelu_positive_stays_positive() {
     let x: Vec<f32> = (1..=10).map(|i| i as f32 * 0.5).collect();
     let t = FastTensor::new(x, vec![10]);

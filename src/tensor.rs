@@ -1,13 +1,5 @@
 use rayon::prelude::*;
-
-#[inline(always)]
-pub fn uninit_vec<T>(size: usize) -> Vec<T> {
-    let mut v = Vec::with_capacity(size);
-    unsafe {
-        v.set_len(size);
-    }
-    v
-}
+pub mod workspace;
 use std::fmt::{self, Debug};
 
 #[derive(Clone)]
@@ -37,13 +29,26 @@ impl FastTensor {
         );
         Self { data, shape }
     }
+}
 
+impl Drop for FastTensor {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.data);
+        crate::tensor::workspace::return_pooled_buffer(buf);
+    }
+}
+
+impl FastTensor {
     pub fn zeros(shape: Vec<usize>) -> Self {
         let size: usize = shape.iter().product();
         Self {
             data: vec![0.0f32; size],
             shape,
         }
+    }
+
+    pub fn into_data(mut self) -> Vec<f32> {
+        std::mem::take(&mut self.data)
     }
 
     pub fn shape(&self) -> &[usize] {
@@ -81,11 +86,11 @@ impl FastTensor {
                 other.shape
             );
         }
-        let mut out_data = crate::tensor::uninit_vec(self.data.len());
-        if self.data.len() >= 32768 {
-            out_data.par_chunks_mut(4096)
-                .zip(self.data.par_chunks(4096))
-                .zip(other.data.par_chunks(4096))
+        let mut out_data = crate::util::uninit_vec(self.data.len());
+        if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
+            out_data.par_chunks_mut(crate::util::CHUNK_SIZE)
+                .zip(self.data.par_chunks(crate::util::CHUNK_SIZE))
+                .zip(other.data.par_chunks(crate::util::CHUNK_SIZE))
                 .for_each(|((out_chunk, self_chunk), other_chunk)| {
                     for i in 0..out_chunk.len() {
                         out_chunk[i] = self_chunk[i] + other_chunk[i];
@@ -107,11 +112,11 @@ impl FastTensor {
                 other.shape
             );
         }
-        let mut out_data = crate::tensor::uninit_vec(self.data.len());
-        if self.data.len() >= 32768 {
-            out_data.par_chunks_mut(4096)
-                .zip(self.data.par_chunks(4096))
-                .zip(other.data.par_chunks(4096))
+        let mut out_data = crate::util::uninit_vec(self.data.len());
+        if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
+            out_data.par_chunks_mut(crate::util::CHUNK_SIZE)
+                .zip(self.data.par_chunks(crate::util::CHUNK_SIZE))
+                .zip(other.data.par_chunks(crate::util::CHUNK_SIZE))
                 .for_each(|((out_chunk, self_chunk), other_chunk)| {
                     for i in 0..out_chunk.len() {
                         let x = self_chunk[i];
@@ -138,7 +143,7 @@ impl FastTensor {
             );
         }
         
-        if self.data.len() >= 32768 {
+        if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
             self.data.par_chunks_mut(1024)
                 .zip(other.data.par_chunks(1024))
                 .for_each(|(out_chunk, other_chunk)| {
@@ -164,7 +169,7 @@ impl FastTensor {
             );
         }
         
-        if self.data.len() >= 32768 {
+        if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
             self.data.par_chunks_mut(1024)
                 .zip(other.data.par_chunks(1024))
                 .for_each(|(s1_chunk, s2_chunk)| {
@@ -192,7 +197,7 @@ impl FastTensor {
             );
         }
 
-        if self.data.len() >= 32768 {
+        if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
             self.data.par_chunks_mut(1024)
                 .zip(other.data.par_chunks(1024))
                 .for_each(|(s1_chunk, s2_chunk)| {
@@ -225,8 +230,8 @@ impl FastTensor {
             );
         }
         
-        let mut out_data = crate::tensor::uninit_vec(self.data.len());
-        if self.data.len() >= 32768 {
+        let mut out_data = crate::util::uninit_vec(self.data.len());
+        if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
             out_data.par_chunks_mut(hidden_size)
                 .zip(self.data.par_chunks(hidden_size))
                 .for_each(|(out_row, in_row)| {
@@ -265,7 +270,7 @@ impl FastTensor {
         let vocab_size = weight.shape[0];
         let hidden_size = weight.shape[1];
         
-        let mut out_data = crate::tensor::uninit_vec(ids.len() * hidden_size);
+        let mut out_data = crate::tensor::workspace::get_pooled_buffer(ids.len() * hidden_size);
         for (i, &id) in ids.iter().enumerate() {
             let id = id as usize;
             if id >= vocab_size {
@@ -280,8 +285,6 @@ impl FastTensor {
             dest.copy_from_slice(src);
         }
         
-        // Output shape is [b_sz, seq_len, hidden_size] or just [1, seq_len, hidden_size]
-        // Usually, b_sz = 1. Let's make it [1, ids.len(), hidden_size] for consistency with llama.
         Ok(Self::new(out_data, vec![1, ids.len(), hidden_size]))
     }
 
@@ -292,7 +295,7 @@ impl FastTensor {
         };
         let half_dim = head_dim / 2;
         
-        if self.data.len() >= 32768 {
+        if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
             self.data.par_chunks_mut(seq_len * head_dim)
                 .enumerate()
                 .for_each(|(bh, head_out)| {
@@ -346,7 +349,7 @@ impl FastTensor {
             &[b_sz, seq_len, hidden_size] => (b_sz, seq_len, hidden_size),
             _ => anyhow::bail!("slice_last_token: input must be 3D [b_sz, seq_len, hidden_size], got {:?}", self.shape),
         };
-        let mut out_data = crate::tensor::uninit_vec(b_sz * hidden_size);
+        let mut out_data = crate::tensor::workspace::get_pooled_buffer(b_sz * hidden_size);
         for b in 0..b_sz {
             let src = &self.data[b * seq_len * hidden_size + (seq_len - 1) * hidden_size .. b * seq_len * hidden_size + seq_len * hidden_size];
             let dest = &mut out_data[b * hidden_size .. (b + 1) * hidden_size];
@@ -363,7 +366,7 @@ impl FastTensor {
         if hidden_size != num_heads * head_dim {
             anyhow::bail!("transpose_seq_to_heads: hidden_size {} must equal num_heads {} * head_dim {}", hidden_size, num_heads, head_dim);
         }
-        let mut out_data = crate::tensor::uninit_vec(self.data.len());
+        let mut out_data = crate::util::uninit_vec(self.data.len());
         
         out_data.par_chunks_mut(seq_len * head_dim)
             .enumerate()
@@ -385,7 +388,7 @@ impl FastTensor {
             _ => anyhow::bail!("transpose_heads_to_seq: input must be 4D, got {:?}", self.shape),
         };
         let hidden_size = num_heads * head_dim;
-        let mut out_data = crate::tensor::uninit_vec(self.data.len());
+        let mut out_data = crate::util::uninit_vec(self.data.len());
         
         out_data.par_chunks_mut(hidden_size)
             .enumerate()
@@ -402,7 +405,7 @@ impl FastTensor {
     }
 
     pub fn gelu(&self) -> anyhow::Result<Self> {
-        let mut out_data = crate::tensor::uninit_vec(self.data.len());
+        let mut out_data = crate::util::uninit_vec(self.data.len());
         out_data.par_iter_mut().zip(self.data.par_iter()).for_each(|(out, &x)| {
             let x_cube = x * x * x;
             let inner = 0.79788456f32 * (x + 0.044715f32 * x_cube);

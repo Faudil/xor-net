@@ -8,6 +8,7 @@ use crate::loader::SafeTensorLoader;
 use std::f32::consts::PI;
 
 use crate::nn::dynamic_linear::LinearKind;
+use rayon::prelude::*;
 
 pub const DEFAULT_MAX_SEQ_LEN: usize = 4096;
 
@@ -568,11 +569,11 @@ impl Llama {
             )?
         };
         let ln_f = FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("model.norm"))?;
-        let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
-        for i in 0..cfg.num_hidden_layers {
-            let block = Block::load(loader.pp(format!("model.layers.{i}")), cfg)?;
-            blocks.push(block);
-        }
+        let blocks: Result<Vec<_>, _> = (0..cfg.num_hidden_layers)
+            .into_par_iter()
+            .map(|i| Block::load(loader.pp(format!("model.layers.{i}")), cfg))
+            .collect();
+        let blocks = blocks?;
 
         Ok(Self {
             wte,

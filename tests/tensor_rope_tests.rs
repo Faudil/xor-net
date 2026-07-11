@@ -67,6 +67,14 @@ fn rope_preserves_norm() {
 }
 
 #[test]
+fn rope_invalid_shape() {
+    let t = FastTensor::new(vec![1.0, 2.0, 3.0], vec![3]);
+    let cos = FastTensor::new(vec![1.0, 1.0], vec![1, 2]);
+    let sin = FastTensor::new(vec![0.0, 0.0], vec![1, 2]);
+    assert!(t.rope_inplace(&cos, &sin, 0).is_err());
+}
+
+#[test]
 fn rope_multi_head() {
     // 2 heads, 1 token, head_dim=4
     let x = FastTensor::new(

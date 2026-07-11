@@ -7,8 +7,8 @@ fn to_fast(t: &Tensor) -> Result<FastTensor> {
     Ok(FastTensor::new(data, t.shape().dims().to_vec()))
 }
 
-fn to_candle(ft: FastTensor, dev: &Device) -> Result<Tensor> {
-    Tensor::from_vec(ft.data, ft.shape, dev)
+fn to_candle(ft: &FastTensor, dev: &Device) -> Result<Tensor> {
+    Tensor::from_vec(ft.data.clone(), ft.shape.clone(), dev)
 }
 
 // Helper to compute standard Candle attention with KV cache
@@ -123,7 +123,7 @@ fn test_fast_attention_parity_single_token() -> Result<()> {
         head_dim,
     ).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
     
-    let candle_out_prompt = to_candle(fast_out_prompt, &device)?;
+    let candle_out_prompt = to_candle(&fast_out_prompt, &device)?;
     
     let (ref_out_prompt, candle_k1, candle_v1) = candle_standard_attention(
         &q_prompt,
@@ -164,7 +164,7 @@ fn test_fast_attention_parity_single_token() -> Result<()> {
         head_dim,
     ).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
     
-    let candle_out_token = to_candle(fast_out_token, &device)?;
+    let candle_out_token = to_candle(&fast_out_token, &device)?;
     
     let (ref_out_token, _, _) = candle_standard_attention(
         &q_token,

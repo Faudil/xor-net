@@ -63,8 +63,9 @@ fn main() -> anyhow::Result<()> {
 
         let logits = model.forward(&tokens[start_pos..], index_pos, &mut cache)?;
 
+        let logits_shape = logits.shape[2];
         let logits_candle =
-            Tensor::from_vec(logits.data, (logits.shape[2],), &device)?;
+            Tensor::from_vec(logits.into_data(), (logits_shape,), &device)?;
         let next_token = logits_processor.sample(&logits_candle)?;
 
         tokens.push(next_token);

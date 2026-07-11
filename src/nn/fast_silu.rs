@@ -1,8 +1,6 @@
 use candle_core::{CustomOp2, Error, Layout, Result, Tensor};
 use rayon::prelude::*;
 
-// std::arch imports removed
-
 pub struct FastSiluMulOp;
 
 impl CustomOp2 for FastSiluMulOp {
@@ -39,7 +37,7 @@ impl CustomOp2 for FastSiluMulOp {
             return Err(Error::Msg("FastSiluMulOp: shape mismatch".into()));
         }
         
-        let mut out_data = crate::tensor::uninit_vec(s1_slice.len());
+        let mut out_data = crate::tensor::workspace::get_pooled_buffer(s1_slice.len());
         let chunk_size = 4096;
         
         out_data.par_chunks_mut(chunk_size)
@@ -48,9 +46,7 @@ impl CustomOp2 for FastSiluMulOp {
             .for_each(|((out_chunk, s1_chunk), s2_chunk): ((&mut [f32], &[f32]), &[f32])| {
                 let len = out_chunk.len();
                 
-                // For SiLU we will use standard scalar exp() but parallelized.
-                // Doing it via Rayon is highly scalable and 12x faster than single core.
-                // We could use AVX-512 exp approximations later if needed.
+
                 for j in 0..len {
                     let x = s1_chunk[j];
                     let y = s2_chunk[j];
