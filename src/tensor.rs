@@ -1,4 +1,5 @@
 use rayon::prelude::*;
+use crate::nn::fast_attention_simd::{rms_norm, rope_inplace as rope_simd_inplace};
 pub mod workspace;
 use std::fmt::{self, Debug};
 
@@ -231,31 +232,14 @@ impl FastTensor {
         }
         
         let mut out_data = crate::util::uninit_vec(self.data.len());
-        if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
-            out_data.par_chunks_mut(hidden_size)
-                .zip(self.data.par_chunks(hidden_size))
-                .for_each(|(out_row, in_row)| {
-                    let mut sum_sq = 0.0f32;
-                    for &x in in_row.iter() {
-                        sum_sq += x * x;
-                    }
-                    let inv_std = 1.0f32 / (sum_sq / hidden_size as f32 + eps).sqrt();
-                    for i in 0..hidden_size {
-                        out_row[i] = in_row[i] * inv_std * weight.data[i];
-                    }
-                });
-        } else {
-            for (out_row, in_row) in out_data.chunks_mut(hidden_size).zip(self.data.chunks(hidden_size)) {
-                let mut sum_sq = 0.0f32;
-                for &x in in_row.iter() {
-                    sum_sq += x * x;
-                }
-                let inv_std = 1.0f32 / (sum_sq / hidden_size as f32 + eps).sqrt();
-                for i in 0..hidden_size {
-                    out_row[i] = in_row[i] * inv_std * weight.data[i];
-                }
-            }
-        }
+        
+        out_data.par_chunks_mut(hidden_size)
+            .zip(self.data.par_chunks(hidden_size))
+            .for_each(|(out_row, in_row)| {
+                let mut row_copy: Vec<f32> = in_row.to_vec();
+                rms_norm(&mut row_copy, &weight.data, eps);
+                out_row.copy_from_slice(&row_copy);
+            });
         
         Ok(Self::new(out_data, self.shape.clone()))
     }
@@ -293,53 +277,20 @@ impl FastTensor {
             &[b_sz, num_heads, seq_len, head_dim] => (b_sz, num_heads, seq_len, head_dim),
             _ => anyhow::bail!("rope_inplace: input must be 4D shape [b_sz, num_heads, seq_len, head_dim], got {:?}", self.shape),
         };
-        let half_dim = head_dim / 2;
         
-        if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
-            self.data.par_chunks_mut(seq_len * head_dim)
-                .enumerate()
-                .for_each(|(bh, head_out)| {
-                    let _b = bh / num_heads;
-                    for t in 0..seq_len {
-                        let pos = index_pos + t;
-                        let cos_pos = &cos.data[pos * half_dim .. (pos + 1) * half_dim];
-                        let sin_pos = &sin.data[pos * half_dim .. (pos + 1) * half_dim];
-                        
-                        let token_vec = &mut head_out[t * head_dim .. (t + 1) * head_dim];
-                        for d in 0..half_dim {
-                            let v_real = token_vec[d];
-                            let v_imag = token_vec[d + half_dim];
-                            
-                            let c = cos_pos[d];
-                            let s = sin_pos[d];
-                            
-                            token_vec[d] = v_real * c - v_imag * s;
-                            token_vec[d + half_dim] = v_real * s + v_imag * c;
-                        }
-                    }
-                });
-        } else {
-            for (bh, head_out) in self.data.chunks_mut(seq_len * head_dim).enumerate() {
+        self.data.par_chunks_mut(seq_len * head_dim)
+            .enumerate()
+            .for_each(|(bh, head_out)| {
                 let _b = bh / num_heads;
                 for t in 0..seq_len {
                     let pos = index_pos + t;
-                    let cos_pos = &cos.data[pos * half_dim .. (pos + 1) * half_dim];
-                    let sin_pos = &sin.data[pos * half_dim .. (pos + 1) * half_dim];
+                    let cos_pos = &cos.data[pos * (head_dim / 2) .. (pos + 1) * (head_dim / 2)];
+                    let sin_pos = &sin.data[pos * (head_dim / 2) .. (pos + 1) * (head_dim / 2)];
                     
                     let token_vec = &mut head_out[t * head_dim .. (t + 1) * head_dim];
-                    for d in 0..half_dim {
-                        let v_real = token_vec[d];
-                        let v_imag = token_vec[d + half_dim];
-                        
-                        let c = cos_pos[d];
-                        let s = sin_pos[d];
-                        
-                        token_vec[d] = v_real * c - v_imag * s;
-                        token_vec[d + half_dim] = v_real * s + v_imag * c;
-                    }
+                    rope_simd_inplace(token_vec, cos_pos, sin_pos, pos, head_dim);
                 }
-            }
-        }
+            });
             
         Ok(self)
     }

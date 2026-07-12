@@ -44,7 +44,7 @@ fn load_hf_model(
 fn load_local_model(model_dir: &Path) -> anyhow::Result<(Llama, Config, Tokenizer)> {
     eprintln!("Loading model from: {}...", model_dir.display());
     let load_start = Instant::now();
-    let (model, config) = AutoModelForCausalLM::from_local(model_dir, QuantizationConfig::None)?;
+    let (model, config) = AutoModelForCausalLM::from_local(model_dir, QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4))?;
     eprintln!("Model loaded in {:.2?}", load_start.elapsed());
 
     let tokenizer_path = model_dir.join("tokenizer.json");

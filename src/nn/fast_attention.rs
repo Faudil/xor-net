@@ -1,5 +1,25 @@
 use crate::tensor::FastTensor;
+use crate::nn::fast_attention_simd::{softmax_inplace, weighted_sum, batched_dot_product};
 use rayon::prelude::*;
+use std::cell::RefCell;
+
+thread_local! {
+    static SCORE_BUFFER: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+}
+
+fn get_score_buffer(size: usize) -> Vec<f32> {
+    SCORE_BUFFER.with(|buf| {
+        let mut b = buf.borrow_mut();
+        if b.capacity() < size {
+            b.clear();
+            b.reserve(size);
+        }
+        b.resize(size, 0.0);
+        let result = b.clone();
+        b.clear();
+        result
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct CpuRingCache {
@@ -61,7 +81,6 @@ pub fn fast_attention(
         for t_new in 0..seq_len {
             let t_abs = index_pos + t_new;
             if t_abs >= max_seq_len {
-                // Ring buffer wrapping if we exceed max position embeddings
                 let wrapped_t = t_abs % max_seq_len;
                 let dest_offset = h_kv * (max_seq_len * head_dim) + wrapped_t * head_dim;
                 let src_offset = h_kv * (seq_len * head_dim) + t_new * head_dim;
@@ -80,78 +99,76 @@ pub fn fast_attention(
         }
     }
     
+    // 2. Parallel Attention computation over KV heads
+    let heads_per_kv = num_heads / num_kv_heads;
+    let mut out_data = vec![0.0f32; num_heads * seq_len * head_dim];
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let total_kv_len = index_pos + seq_len;
     
-    let mut out_data = crate::tensor::workspace::get_pooled_buffer(num_heads * seq_len * head_dim);
-    
-    // 2. Parallel Attention computation over Query heads
-    out_data.par_chunks_mut(seq_len * head_dim)
+    // Parallel over KV heads - each KV head writes to disjoint output regions
+    out_data.par_chunks_mut(heads_per_kv * seq_len * head_dim)
         .enumerate()
-        .for_each(|(h, head_out)| {
-            let h_kv = h / (num_heads / num_kv_heads);
+        .for_each(|(h_kv, kv_head_out)| {
             let k_buf = &cache.k_buffers[layer_idx];
             let v_buf = &cache.v_buffers[layer_idx];
             let max_seq_len = cache.max_seq_len;
             
-            // Score vector: [seq_len * total_kv_len]
-            let mut scores = crate::tensor::workspace::get_pooled_buffer(seq_len * total_kv_len);
+            // Process all Q heads that map to this KV head
+            let q_head_start = h_kv * heads_per_kv;
+            let q_head_end = q_head_start + heads_per_kv;
             
-            for t_q in 0..seq_len {
-                let q_offset = h * (seq_len * head_dim) + t_q * head_dim;
-                let q_vec = &q_data[q_offset .. q_offset + head_dim];
+            // Thread-local score buffer (reused across Q heads and query positions)
+            let max_kv_len = index_pos + seq_len;
+            let mut scores = get_score_buffer(max_kv_len * seq_len);
+            
+            for h in q_head_start..q_head_end {
+                let local_h = h - q_head_start;
+                let head_out_base = local_h * seq_len * head_dim;
                 
-                let limit = index_pos + t_q;
-                
-                for t_k in 0..=limit {
-                    let k_offset = h_kv * (max_seq_len * head_dim) + (t_k % max_seq_len) * head_dim;
-                    let k_vec = &k_buf[k_offset .. k_offset + head_dim];
+                for t_q in 0..seq_len {
+                    let q_offset = h * (seq_len * head_dim) + t_q * head_dim;
+                    let q_vec = &q_data[q_offset .. q_offset + head_dim];
+                    let out_vec = &mut kv_head_out[head_out_base + t_q * head_dim .. head_out_base + (t_q + 1) * head_dim];
                     
-                    let mut sum = 0.0f32;
-                    for d in 0..head_dim {
-                        sum += q_vec[d] * k_vec[d];
-                    }
-                    scores[t_q * total_kv_len + t_k] = sum * scale;
-                }
-                
-                // Mask future tokens
-                for t_k in (limit + 1)..total_kv_len {
-                    scores[t_q * total_kv_len + t_k] = f32::NEG_INFINITY;
-                }
-                
-                // Softmax
-                let row_scores = &mut scores[t_q * total_kv_len .. (t_q + 1) * total_kv_len];
-                let mut max_score = f32::NEG_INFINITY;
-                for &s in row_scores.iter() {
-                    if s > max_score { max_score = s; }
-                }
-                
-                let mut sum_exp = 0.0f32;
-                for s in row_scores.iter_mut() {
-                    *s = (*s - max_score).exp();
-                    sum_exp += *s;
-                }
-                
-                let inv_sum_exp = 1.0 / sum_exp;
-                for s in row_scores.iter_mut() {
-                    *s *= inv_sum_exp;
-                }
-                
-                // Weighted sum over V
-                let out_vec = &mut head_out[t_q * head_dim .. (t_q + 1) * head_dim];
-                out_vec.fill(0.0f32);
-                for t_k in 0..total_kv_len {
-                    let attn_w = row_scores[t_k];
-                    if attn_w < 1e-6 { continue; } // Skip negligible weights
+                    let limit = index_pos + t_q;
+                    let total_kv_len = limit + 1;
                     
-                    let v_offset = h_kv * (max_seq_len * head_dim) + (t_k % max_seq_len) * head_dim;
-                    let v_vec = &v_buf[v_offset .. v_offset + head_dim];
-                    for d in 0..head_dim {
-                        out_vec[d] += attn_w * v_vec[d];
+                    // Compute Q * K^T using batched SIMD dot products
+                    let batch_size = 16;
+                    let mut t_k = 0;
+                    while t_k <= limit {
+                        let batch_end = (t_k + batch_size).min(limit + 1);
+                        let batch_len = batch_end - t_k;
+                        let mut batch_scores = [0.0f32; 16];
+                        
+                        batched_dot_product(
+                            q_vec, k_buf, h_kv, max_seq_len, head_dim,
+                            t_k, batch_end, &mut batch_scores
+                        );
+                        
+                        for i in 0..batch_len {
+                            scores[t_k + i] = batch_scores[i] * scale;
+                        }
+                        t_k = batch_end;
                     }
+                    
+                    // Softmax (SIMD-optimized)
+                    let row_scores = &mut scores[..total_kv_len];
+                    softmax_inplace(row_scores);
+                    
+                    // Weighted sum over V using SIMD
+                    out_vec.fill(0.0f32);
+                    weighted_sum(
+                        out_vec,
+                        row_scores,
+                        v_buf,
+                        h_kv,
+                        max_seq_len,
+                        head_dim,
+                        total_kv_len,
+                    );
                 }
             }
         });
-        
+    
     Ok(FastTensor::new(out_data, vec![b_sz, num_heads, seq_len, head_dim]))
 }

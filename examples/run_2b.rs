@@ -4,7 +4,8 @@ use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::path::Path;
 use std::time::Instant;
 use tokenizers::Tokenizer;
-use xor_net::{AutoModelForCausalLM, QuantizationConfig};
+use xor_net::{AutoModelForCausalLM, QuantizationConfig, TernaryPackType};
+use xor_net::nn::LmHeadConfig;
 
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
@@ -20,7 +21,7 @@ fn main() -> anyhow::Result<()> {
     let model_path = std::env::args().nth(1).unwrap_or_else(|| {
         "/home/faudil/RustroverProjects/XorNet/models/bitnet-2b".to_string()
     });
-    let quantization = QuantizationConfig::None;
+    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4);
 
     let load_start = Instant::now();
     let (model, config) = if Path::new(&model_path).is_dir() {

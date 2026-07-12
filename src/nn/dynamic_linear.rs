@@ -4,75 +4,7 @@ use crate::bit1::layers::BitLinear;
 use crate::bit1_58::layers::TernaryLinear;
 use crate::bit1_58::quantization::TernaryPackType;
 use crate::loader::SafeTensorLoader;
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
-pub unsafe fn dot_product_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-    let n = a.len();
-    let mut sum0 = _mm256_setzero_ps();
-    let mut sum1 = _mm256_setzero_ps();
-    let mut sum2 = _mm256_setzero_ps();
-    let mut sum3 = _mm256_setzero_ps();
-    let mut i = 0;
-    
-    while i + 32 <= n {
-        let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
-        let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
-        let va1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
-        let vb1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
-        let va2 = _mm256_loadu_ps(a.as_ptr().add(i + 16));
-        let vb2 = _mm256_loadu_ps(b.as_ptr().add(i + 16));
-        let va3 = _mm256_loadu_ps(a.as_ptr().add(i + 24));
-        let vb3 = _mm256_loadu_ps(b.as_ptr().add(i + 24));
-        
-        sum0 = _mm256_fmadd_ps(va0, vb0, sum0);
-        sum1 = _mm256_fmadd_ps(va1, vb1, sum1);
-        sum2 = _mm256_fmadd_ps(va2, vb2, sum2);
-        sum3 = _mm256_fmadd_ps(va3, vb3, sum3);
-        
-        i += 32;
-    }
-    
-    let mut sum8 = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
-    
-    while i + 8 <= n {
-        let va = _mm256_loadu_ps(a.as_ptr().add(i));
-        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
-        sum8 = _mm256_fmadd_ps(va, vb, sum8);
-        i += 8;
-    }
-    
-    let mut temp = [0.0f32; 8];
-    _mm256_storeu_ps(temp.as_mut_ptr(), sum8);
-    let mut total = temp[0] + temp[1] + temp[2] + temp[3] + temp[4] + temp[5] + temp[6] + temp[7];
-    
-    while i < n {
-        total += a[i] * b[i];
-        i += 1;
-    }
-    
-    total
-}
-
-#[inline(always)]
-pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { dot_product_f32_avx2(a, b) };
-        }
-    }
-    
-    let mut sum = 0.0f32;
-    for i in 0..a.len() {
-        sum += a[i] * b[i];
-    }
-    sum
-}
+use crate::nn::fast_attention_simd::dot_product_f32;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
