@@ -118,7 +118,7 @@ pub fn fast_attention(
             
             // Thread-local score buffer (reused across Q heads and query positions)
             let max_kv_len = index_pos + seq_len;
-            let mut scores = get_score_buffer(max_kv_len * seq_len);
+            let mut scores = get_score_buffer(max_kv_len);
             
             for h in q_head_start..q_head_end {
                 let local_h = h - q_head_start;

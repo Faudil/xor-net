@@ -132,7 +132,6 @@ pub fn load_packed_ternary_weight(
     let stored_in_dim = expected_in_dim;
     let stored_rows = expected_out_dim / 4;
     let mut data = vec![0.0f32; expected_len];
-    let inv_w_scale = 1.0 / w_scale;
     for k in 0..expected_len {
         let byte_idx = k / 4;
         let j = k % 4;
@@ -140,7 +139,7 @@ pub fn load_packed_ternary_weight(
         let col = byte_idx % stored_in_dim;
         let o = j * stored_rows + row_p;
         let i = col;
-        data[o * expected_in_dim + i] = ternary_values[k] * inv_w_scale;
+        data[o * expected_in_dim + i] = ternary_values[k] * w_scale;
     }
 
     Ok(FastTensor::new(data, expected_shape.to_vec()))
@@ -261,6 +260,10 @@ impl<'a> SafeTensorLoader<'a> {
         self.get(&[size], name)
     }
 
+    pub fn prefix_ends_with(&self, suffix: &str) -> bool {
+        self.prefix.ends_with(suffix)
+    }
+
     pub fn has_tensor(&self, name: &str) -> bool {
         let key = if self.prefix.is_empty() {
             name.to_string()
@@ -319,7 +322,6 @@ impl<'a> SafeTensorLoader<'a> {
         let sbytes = &self.repo.buffers[sinfo.file_idx][sinfo.start..sinfo.end];
         let scale_data = convert_to_f32_vec(sbytes, sinfo.dtype)?;
         let w_scale = scale_data[0];
-        let inv_w_scale = 1.0 / w_scale;
 
         let out_dim = expected_out;
         let in_dim = expected_in;
@@ -364,7 +366,7 @@ impl<'a> SafeTensorLoader<'a> {
             }
         };
 
-        Ok((repacked, inv_w_scale, in_dim, out_dim))
+        Ok((repacked, w_scale, in_dim, out_dim))
     }
 
     /// Load a weight tensor that may be packed in 1.58-bit ternary format (Pack4).
