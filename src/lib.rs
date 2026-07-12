@@ -9,6 +9,9 @@ pub mod nn;
 pub mod models;
 pub mod sampler;
 
+#[cfg(feature = "python")]
+pub mod python;
+
 pub use tensor::FastTensor;
 pub use loader::{SafeTensorRepo, SafeTensorLoader};
 pub use bit1::layers::BitLinear;

@@ -1,0 +1,48 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "xor-net"
+version = "0.1.0"
+description = "High-performance CPU inference engine for 1-bit and 1.58-bit quantized LLMs using SIMD-accelerated bitwise operations"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "faudil", email = "faudil@example.com"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[tool.maturin]
+features = ["python"]
+bindings = "pyo3"
+module-name = "xor_net"
+exclude = [
+    "/src/*",
+    "/tests/*",
+    "/examples/*",
+    "/.github/*",
+    "/*.md",
+    "!README.md",
+    "/Cargo.lock",
+]
+
+[tool.maturin.sdist]
+include = ["README.md", "LICENSE", "Cargo.toml", "src/**/*.rs"]
+
+[project.optional-dependencies]
+test = ["pytest", "huggingface-hub"]

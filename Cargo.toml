@@ -3,6 +3,12 @@ name = "xor-net"
 version = "0.1.0"
 edition = "2024"
 autoexamples = false
+license = "MIT"
+repository = "https://github.com/faudil/xor-net"
+description = "High-performance CPU inference engine for 1-bit and 1.58-bit quantized LLMs using SIMD-accelerated bitwise operations"
+readme = "README.md"
+categories = ["machine-learning", "science", "wasm"]
+keywords = ["llm", "quantization", "bitnet", "1-bit", "1.58-bit", "simd", "inference"]
 
 [[example]]
 name = "run_3b"
@@ -61,6 +67,11 @@ tokenizers = "0.23.1"
 jemallocator = "0.5.4"
 safetensors = "0.5.2"
 memmap2 = "0.9.11"
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310", "generate-import-lib"], optional = true }
+
+[features]
+default = []
+python = ["pyo3"]
 
 [profile.release]
 opt-level = 3
