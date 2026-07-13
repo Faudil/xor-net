@@ -25,8 +25,7 @@ vs `pack4` which uses 16 bytes per 64 weights (`in_dim/4`). Saving:
 ```
 
 On the 2B model this shrinks the weight file from ~521 MB (`pack4`) to ~408 MB
-(~18% smaller) and, when streamed straight from RAM at decode time, cuts the
-per-token weight traffic by the same fraction.
+(~18% smaller).
 
 ## On-disk layout (little-endian)
 
@@ -76,13 +75,28 @@ The decode path is verified lossless by `xor_net::bit1_58::sparse` unit tests
 (`sparse_decode_roundtrip`, `dense_and_sparse_dot_match`) which assert the
 sparse dot product equals the dense `pack4` dot product **exactly**.
 
-## Runtime note
+## Runtime note — performance is parity, not faster
 
-For simplicity the current runtime keeps each block's mask and **lane-order**
-sign as two `u64`s in RAM (16 bytes/block), so the decoded form is the same
-size as `pack4` and the sparse path is performance-neutral versus dense. The
-on-disk file is still ~18% smaller. Reading the *compact* 12-byte block and
-expanding the signs to lane order with a vectorised gather (instead of the
-current `u64` decode) is the follow-up that turns the on-disk saving into a
-per-token speedup; it is the remaining piece for the bandwidth-bound engine to
-convert the ~25% smaller weight stream into throughput.
+The engine is **compute/decode-bound, not bandwidth-bound**. The dense `pack4`
+path already uses the AVX-512 VNNI `vpdpbusd` kernel with 16 accumulators, and
+a prefetch-distance sweep shows no speedup (the HW stream prefetcher already
+serves the sequential weight read). Because the activation is dense, the SIMD
+sparse block must still process all 64 lanes every block (masked), so weight
+sparsity reduces *neither* FLOPs nor decode work.
+
+Two practical consequences:
+
+* The current runtime keeps each block's mask and **lane-order** sign as two
+  `u64`s in RAM (16 bytes/block), identical to `pack4`, so the sparse path is
+  performance-neutral: **~51 tok/s dense vs ~49 tok/s sparse on the 2B model,
+  with bit-identical output** (verified by the correctness unit tests).
+* Even reading the *compact* 12-byte block and expanding signs with a vectorised
+  gather would not help throughput here: it would only shrink the weight stream,
+  and at ~27 GB/s effective the path is not stream-bound. The on-disk file is
+  still ~18% smaller.
+
+Reaching the 80 tok/s target needs an architectural change (e.g. **batched
+GEMV** — computing all output rows of a matrix in one call so the activation is
+loaded once and the weight stream stays sequential across rows, keeping the
+accumulators saturated), not weight compression. XorSparse is delivered as a
+lossless, on-disk-smaller alternative to `pack4`.
