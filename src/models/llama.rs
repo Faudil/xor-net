@@ -505,21 +505,22 @@ impl Mlp {
         Ok(mlp)
     }
 
-    /// Print the projection kinds once (when `XORNET_DEBUG` is set) so the user
-    /// can confirm whether `c_proj` is non-ternary and thus forces the
-    /// fused-MLP fallback path.
+    /// When `XORNET_DEBUG` is set, print this block's MLP projection kinds so
+    /// the user can see exactly which blocks are non-ternary (and therefore
+    /// force the fused-MLP fallback path).
     fn debug_print_kinds(&self) {
-        if !MLP_KIND_PRINTED.swap(true, Ordering::Relaxed)
-            && std::env::var("XORNET_DEBUG").is_ok()
-        {
-            eprintln!(
-                "[xor-net] MLP projection kinds: gate={} up={} down={} ffn_norm={}",
-                linear_kind_tag(&self.c_fc1.inner),
-                linear_kind_tag(&self.c_fc2.inner),
-                linear_kind_tag(&self.c_proj.inner),
-                if self.ffn_layernorm.is_some() { "Some" } else { "None" },
-            );
+        if std::env::var("XORNET_DEBUG").is_err() {
+            return;
         }
+        let idx = MLP_DBG_IDX.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[xor-net] MLP[{}] gate={} up={} down={} ffn_norm={}",
+            idx,
+            linear_kind_tag(&self.c_fc1.inner),
+            linear_kind_tag(&self.c_fc2.inner),
+            linear_kind_tag(&self.c_proj.inner),
+            if self.ffn_layernorm.is_some() { "Some" } else { "None" },
+        );
     }
 }
 
@@ -579,7 +580,7 @@ impl Block {
     }
 }
 
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub static TIME_BLOCKS: AtomicU64 = AtomicU64::new(0);
 pub static TIME_LM_HEAD: AtomicU64 = AtomicU64::new(0);
@@ -591,9 +592,9 @@ pub static TIME_MLP_GEMV: AtomicU64 = AtomicU64::new(0);   // gate+up+silu+down 
 pub static TIME_MLP_DOWN: AtomicU64 = AtomicU64::new(0);   // just down_proj
 pub static TIME_NORM: AtomicU64 = AtomicU64::new(0);       // rms norms + residuals
 
-/// One-time debug flag so the projection-kind dump (which explains the
-/// fused-MLP fallback) is printed only once at model load.
-static MLP_KIND_PRINTED: AtomicBool = AtomicBool::new(false);
+/// Debug block counter so each block's projection kinds can be dumped when
+/// `XORNET_DEBUG` is set (which explains the fused-MLP fallback).
+static MLP_DBG_IDX: AtomicUsize = AtomicUsize::new(0);
 
 fn linear_kind_tag(k: &crate::nn::dynamic_linear::LinearKind) -> &'static str {
     use crate::nn::dynamic_linear::LinearKind;
