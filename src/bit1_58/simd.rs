@@ -3,6 +3,8 @@ use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx512bw")]
 pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
@@ -205,11 +207,33 @@ pub unsafe fn ternary_dot_product_pack4_avx2(a_i8: &[i8], b_pack4: &[u8], total_
     }
 }
 
+/// Tunable weight prefetch look-ahead (in bytes) for the VNNI GEMV kernel.
+/// Set via `XORNET_VNNI_PREFETCH` (0 = uninitialized → default 256). Larger
+/// values issue weight prefetches further ahead to hide DDR5 latency; the
+/// optimum depends on the memory controller and how many concurrent weight
+/// streams the surrounding rayon fan-out issues.
+static VNNI_PREFETCH_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn vnni_prefetch_bytes() -> usize {
+    let mut v = VNNI_PREFETCH_BYTES.load(Ordering::Relaxed);
+    if v == 0 {
+        v = std::env::var("XORNET_VNNI_PREFETCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&x| x > 0)
+            .unwrap_or(256);
+        VNNI_PREFETCH_BYTES.store(v, Ordering::Relaxed);
+    }
+    v
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 pub unsafe fn ternary_dot_product_pack4_avx512_vnni(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
     let a_ptr = a_i8.as_ptr() as *const __m512i;
     let b_ptr = b_pack4.as_ptr();
+    let pf = vnni_prefetch_bytes();
 
     let zero = _mm512_setzero_si512();
     // 16 independent accumulators hide the ~5-cycle dpbusd latency.
@@ -228,7 +252,7 @@ pub unsafe fn ternary_dot_product_pack4_avx512_vnni(a_i8: &[i8], b_pack4: &[u8],
     let mut idx = 0usize;
 
     while idx < step16 {
-        _mm_prefetch(b_ptr.add(idx * 16 + 256) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(b_ptr.add(idx * 16 + pf) as *const i8, _MM_HINT_T0);
 
         macro_rules! block {
             ($k:expr) => {{
@@ -269,7 +293,7 @@ pub unsafe fn ternary_dot_product_pack4_avx512_vnni(a_i8: &[i8], b_pack4: &[u8],
 
     // Cleanup: remaining chunks (< 16) accumulate into `merged`.
     while idx < chunks64 {
-        _mm_prefetch(b_ptr.add(idx * 16 + 256) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(b_ptr.add(idx * 16 + pf) as *const i8, _MM_HINT_T0);
         let acts = _mm512_loadu_si512(a_ptr.add(idx));
         let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(b_ptr.add(idx * 16) as *const __m128i));
         let p0 = _mm512_and_si512(w32, mask3);

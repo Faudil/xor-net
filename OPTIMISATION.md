@@ -7,6 +7,51 @@
 - **CPU**: Ryzen 5 9600X (6C/12T Zen 5), 32GB DDR5 dual-channel (~55 GB/s)
 - **AVX-512**: `avx512f`, `avx512bw`, `avx512vbmi`, `avx512_vnni` all available
 
+### Also tested: `bitnet_b1.58-2B` (2B, 30 layers)
+
+Same `hidden_size=3200`, `intermediate_size=8640`, `vocab_size=32002`, `ffn_layernorm=Some`,
+Silu activation. All transformer-layer projections load as **Ternary** (Pack4) — including
+`down_proj` — so the all-ternary fused path (`fused_mlp_all`) is taken during generation.
+
+---
+
+## Current State (2B, DDR5, post-VNNI kernel)
+
+Optimizations landed (all pushed to `main`):
+
+- **Fused MLP dispatch removed** — `Mlp::forward` routes gate+up+silu+down into a single
+  fused forward, eliminating the separate `DynamicLinear` virtual call + re-quantization.
+- **Vectorized SiLU/ReLU²** (`silu_inplace_avx512`, Taylor `exp`) replaces the scalar libm loop.
+- **VNNI `vpdpbusd` kernel** (`ternary_dot_product_pack4_avx512_vnni`) implemented and
+  dispatched ahead of the `avx512bw` kernel when `avx512_vnni` is detected. This was the
+  original "Future Direction #1".
+- **Per-block MLP-kind diagnostic** (`XORNET_DEBUG=1`) confirms every block is
+  `gate=Ternary up=Ternary down=Ternary`.
+
+### Measured decode rate (2B, 12 threads, long generation ~295 tokens)
+
+| Stage | ms/tok | Notes |
+|-------|--------|-------|
+| Attn | 6.2 | bandwidth-bound (QKV+O, 4 GEMVs/block) |
+| MLP gate+up | 9.4 | fused, **~42.6 GB/s ≈ 77% of DDR5** |
+| MLP down | ~0.0 (gen) / 0.26 (prefill) | fused during generation; prefill uses the `b_size>1` fallback |
+| Norms | 0.15 | |
+| SiLU+quant | 3.2 | vectorized; minor |
+| LM Head | 5.7 | Int8 |
+| **Total** | **~16.1 Blocks** | **≈ 41 tok/s** |
+
+**The 2B model decodes at ~41 tok/s on this DDR5 box** — it is fundamentally
+**RAM-bandwidth-bound** at ~77% of the DDR5 ceiling for the dominant MLP GEMV.
+
+### Critical measurement caveat
+
+Short-prompt runs badly under-measure decode rate. The per-token breakdown divides total
+block time by *generated* tokens, but the **prefill** forward uses the slower `b_size>1`
+fallback (non-fused `TernaryLinear::forward`), and its cost is amortized over few generated
+tokens. Example: prompt `"hi"` (10 tokens) shows **23 tok/s** with MLP gate+up 19.5 ms,
+whereas a 295-token generation shows **41 tok/s** with MLP gate+up 9.4 ms. **Always
+benchmark with a long generation to get the true decode rate.**
+
 ---
 
 ## 1.58-bit Ternary Format
@@ -122,7 +167,9 @@ Activations are contiguous memory, but each trit position k needs values at offs
 | Row prefetching | `_mm_prefetch` for next weight row in fused QKV/MLP loops (lookahead=6 rows) | No consistent gain |
 | Dual accumulator | 128 values/step Pack4 kernel (2× 64) | Slightly slower (register pressure) |
 | Pack5 production | See above | 2× slower than Pack4 |
-| Thread scaling | 4, 6, 8, 12 threads | 8 threads best (6 phys + 2 SMT) |
+| Thread scaling | 4, 6, 8, 12 threads | **12 threads best post-VNNI** (memory-bound → SMT helps overlap RAM latency). Old "8 best" was pre-VNNI. |
+| VNNI prefetch distance | `XORNET_VNNI_PREFETCH` swept 256→4096 bytes | **Flat (41.2–41.6 tok/s)** — HW prefetcher already hides DDR5 latency; 256 is optimal |
+| Cache-block / tile GEMV | Tiled micro-kernel for activation reuse | **No-op**: activation is 3.2 KB (already in L1); weights (620 MB/token) ≫ 32 MB L3 must come from RAM every token |
 
 ---
 
@@ -135,9 +182,11 @@ Activations are contiguous memory, but each trit position k needs values at offs
 
 ## Future Directions
 
-- **VNNI `vpdpbusd` kernel**: Native `u8 × i8 → i32` dot product could replace the 3-instruction `maddubs → madd → add` chain with a single instruction per 64 values. Might free execution ports for better memory-level parallelism.
-- **Tile-based matmul**: Process multiple output rows together to improve cache reuse on activations.
+- **VNNI `vpdpbusd` kernel**: ✅ Done — implemented (`ternary_dot_product_pack4_avx512_vnni`) and dispatched ahead of the `avx512bw` kernel. Engaged on this Zen 5 box.
+- **Tile-based matmul**: ❌ No-op for this shape (see experiments table). Activation is 3.2 KB (L1-resident); weight traffic is irreducible.
 - **Quantization fusion**: Fuse activation quantization with the preceding RMSNorm to reduce temporary allocations.
+- **Fused prefill (b_size>1)**: The prefill forward still uses the non-fused `b_size>1` fallback (re-quantizes per row, `down` via `c_proj.forward`). Extending `fused_mlp_all` to `b_size>1` would remove the prefill-only `MLP down` cost and speed up long-context / many-short-exchange chat. One-time per prompt, so low priority for generation-bound workloads.
+- **Speculative decoding**: The dominant cost is weight *traffic* per decode step (RAM-bandwidth-bound). Generating N tokens per step via a draft model (or layer-skipping self-speculation) amortizes that traffic and is the only lever that meaningfully raises tok/s for this algorithm on this hardware.
 
 ---
 
