@@ -1,9 +1,8 @@
-use candle_core::{Device, Tensor};
-use candle_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::path::Path;
 use std::time::Instant;
 use tokenizers::Tokenizer;
+use xor_net::Sampler;
 use xor_net::{AutoModelForCausalLM, QuantizationConfig, TernaryPackType};
 use xor_net::nn::LmHeadConfig;
 
@@ -16,7 +15,6 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 fn main() -> anyhow::Result<()> {
     xor_net::init_threads(0).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let device = Device::Cpu;
 
     let model_path = std::env::args().nth(1).unwrap_or_else(|| {
         "/home/faudil/RustroverProjects/XorNet/models/bitnet-2b".to_string()
@@ -52,7 +50,8 @@ fn main() -> anyhow::Result<()> {
         .to_vec();
 
     println!("Prompt: '{}'", prompt);
-    let mut logits_processor = LogitsProcessor::new(299792458, Some(0.7), None);
+
+    let mut sampler = Sampler::new(299792458, None, None, 1.8);
 
     let mut index_pos = 0;
     let max_len = 100;
@@ -63,11 +62,9 @@ fn main() -> anyhow::Result<()> {
         let start_pos = tokens.len().saturating_sub(context_size);
 
         let logits = model.forward(&tokens[start_pos..], index_pos, &mut cache)?;
+        let mut logits_data = logits.into_data();
 
-        let logits_shape = logits.shape[2];
-        let logits_candle =
-            Tensor::from_vec(logits.into_data(), (logits_shape,), &device)?;
-        let next_token = logits_processor.sample(&logits_candle)?;
+        let next_token = sampler.sample(&mut logits_data, &tokens)?;
 
         tokens.push(next_token);
         index_pos += context_size;

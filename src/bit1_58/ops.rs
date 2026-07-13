@@ -8,7 +8,7 @@ pub struct TernaryMatMulOp {
     pub in_dim: usize,
     pub out_dim: usize,
     pub pack_type: TernaryPackType,
-    pub w_scale: f32,
+    pub w_scales: Vec<f32>,
 }
 
 impl CustomOp1 for TernaryMatMulOp {
@@ -70,7 +70,7 @@ impl CustomOp1 for TernaryMatMulOp {
                         TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_in, w_row, self.in_dim),
                     };
                     
-                    *out_val = dot_i32 as f32 * inv_scale * self.w_scale;
+                    *out_val = dot_i32 as f32 * inv_scale * self.w_scales[o];
                 }
             });
         });

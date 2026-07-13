@@ -2,11 +2,11 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::time::Instant;
 use tokenizers::Tokenizer;
+use xor_net::Sampler;
 use xor_net::{AutoModelForCausalLM, Cache, Config, Llama, QuantizationConfig};
 use xor_net::bit1_58::quantization::TernaryPackType;
 use xor_net::models::llama::LlamaEosToks;
 use xor_net::nn::LmHeadConfig;
-use xor_net::sampler::Sampler;
 
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
@@ -16,7 +16,7 @@ use jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 const SYSTEM_PROMPT: &str = "You are a helpful, knowledgeable, and friendly AI assistant. You provide clear, concise, and accurate responses.";
-const MAX_NEW_TOKENS: usize = 512;
+const MAX_NEW_TOKENS: usize = 1024;
 
 fn load_hf_model(
     repo_id: &str,
@@ -80,11 +80,22 @@ fn is_eos_token(token: u32, config: &Config) -> bool {
 }
 
 fn uses_llama3_template(config: &Config) -> bool {
+    // Llama3 chat models have eos_token_id = [128009] (single), meaning <|eot_id|>.
+    // Base models using the Llama3 tokenizer have eos_token_id = [128001, 128009],
+    // with both <|end_of_text|> and <|eot_id|>. Only use the chat template for
+    // actual chat models, not base models.
+    if config.bos_token_id != Some(128000) {
+        return false;
+    }
     match config.eos_token_id {
         Some(LlamaEosToks::Single(id)) => id == 128009,
-        Some(LlamaEosToks::Multiple(ref ids)) => ids.contains(&128009),
+        Some(LlamaEosToks::Multiple(_)) => false,
         None => false,
     }
+}
+
+fn is_llama3_tokenizer(config: &Config) -> bool {
+    config.bos_token_id == Some(128000)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -98,15 +109,11 @@ fn main() -> anyhow::Result<()> {
     let model_arg = args.get(1).map(|s| s.as_str()).unwrap_or("2b");
 
     let (model, config, tokenizer) = match model_arg {
-        "2b" => {
-            let model_path = std::env::var("XORNET_MODEL").unwrap_or_else(|_| {
-                format!(
-                    "{}/RustroverProjects/XorNet/models/bitnet-2b",
-                    std::env::var("HOME").unwrap_or_default()
-                )
-            });
-            load_local_model(Path::new(&model_path))?
-        }
+        "2b" => load_hf_model(
+            "microsoft/bitnet-b1.58-2B-4T",
+            "main",
+            QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8),
+        )?,
         "3b" => load_hf_model(
             "1bitLLM/bitnet_b1_58-3B",
             "main",
@@ -121,7 +128,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let mut cache = Cache::new(true, &config)?;
-    let mut sampler = Sampler::new(0, Some(0.8), Some(0.95), 1.1);
+    let mut sampler = Sampler::new(42, Some(0.8), Some(0.95), 1.1);
 
     println!("\n╔══════════════════════════════════════╗");
     println!("║        XorNet Chat v0.1              ║");
@@ -149,15 +156,32 @@ fn main() -> anyhow::Result<()> {
         }
 
         let use_llama3 = uses_llama3_template(&config);
+        let is_llama3_base = !use_llama3 && is_llama3_tokenizer(&config);
+
         if use_llama3 {
             let user_prompt = if context_tokens.is_empty() {
                 format!(
-                    "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{SYSTEM_PROMPT}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{input}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                    "<|start_header_id|>system<|end_header_id|>\n\n{SYSTEM_PROMPT}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{input}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
                 )
             } else {
                 format!(
                     "<|start_header_id|>user<|end_header_id|>\n\n{input}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
                 )
+            };
+
+            let add_special = context_tokens.is_empty();
+            let user_ids = tokenizer
+                .encode(user_prompt.as_str(), add_special)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                .get_ids()
+                .to_vec();
+
+            context_tokens.extend(&user_ids);
+        } else if is_llama3_base {
+            let user_prompt = if context_tokens.is_empty() {
+                format!("System: {}\nUser: {}<|eot_id|>\nAssistant: ", SYSTEM_PROMPT, input)
+            } else {
+                format!("User: {}<|eot_id|>\nAssistant: ", input)
             };
 
             let add_special = context_tokens.is_empty();
@@ -191,7 +215,7 @@ fn main() -> anyhow::Result<()> {
         let mut generated = 0usize;
         let mut total_forward = std::time::Duration::ZERO;
         let mut total_sample = std::time::Duration::ZERO;
-
+        
         let mut response_tokens: Vec<u32> = Vec::new();
         let mut prev_text = String::new();
 
@@ -202,7 +226,6 @@ fn main() -> anyhow::Result<()> {
             xor_net::models::llama::get_profiling_stats();
 
         const PREFILL_CHUNK_SIZE: usize = 512;
-        const REPETITION_PENALTY_WINDOW: usize = 64;
 
         for _step in 0..MAX_NEW_TOKENS {
             let context_size = if index_pos < context_tokens.len() {
@@ -214,17 +237,13 @@ fn main() -> anyhow::Result<()> {
             let start_pos = index_pos;
 
             let t0 = Instant::now();
-            let mut logits = model.forward(&tokens[start_pos..start_pos + context_size], index_pos, &mut cache)?;
+            let logits = model.forward(&tokens[start_pos..start_pos + context_size], index_pos, &mut cache)?;
             total_forward += t0.elapsed();
 
             let t0 = Instant::now();
-            let penalty_context: Vec<u32> = if index_pos < context_tokens.len() {
-                context_tokens[start_pos..start_pos + context_size].to_vec()
-            } else {
-                let start = response_tokens.len().saturating_sub(REPETITION_PENALTY_WINDOW);
-                response_tokens[start..].to_vec()
-            };
-            let next_token = sampler.sample(&mut logits.data, &penalty_context)?;
+            let mut logits_data = logits.into_data();
+
+            let next_token = sampler.sample(&mut logits_data, &response_tokens)?;
             total_sample += t0.elapsed();
 
             tokens.push(next_token);
@@ -248,7 +267,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                if text.ends_with("[User]") || text.ends_with("\nUser:") || text.ends_with("\n\n") {
+                if text.ends_with("[User]") || text.ends_with("\nUser:") {
                     break;
                 }
             }

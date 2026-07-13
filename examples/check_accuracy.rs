@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("Loading {} with {:?}...", model_id, qtype);
     let load_start = Instant::now();
-    let (model, config) = AutoModelForCausalLM::from_pretrained(&model_id, quantization)?;
+    let (model, config) = AutoModelForCausalLM::from_local(std::path::Path::new(&model_id), quantization)?;
     println!("  Loaded in {:.2?}", load_start.elapsed());
 
     // Test tokens

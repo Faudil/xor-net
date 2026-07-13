@@ -88,7 +88,7 @@ fn test_ternary_linear_layer() {
     assert_eq!(out4_vec, out5_vec);
     
     assert!((out4_vec[0] - 1.879921).abs() < 1e-4);
-    assert!((out4_vec[1] - (-0.944881)).abs() < 1e-4);
+    assert!((out4_vec[1] - (-0.944882)).abs() < 1e-4);
 }
 
 #[test]

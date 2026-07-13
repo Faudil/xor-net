@@ -397,8 +397,8 @@ pub fn rope_inplace(x: &mut [f32], cos: &[f32], sin: &[f32], index_pos: usize, h
     }
     
     for i in 0..half_dim {
-        let cos_val = cos[index_pos * half_dim + i];
-        let sin_val = sin[index_pos * half_dim + i];
+        let cos_val = cos[i];
+        let sin_val = sin[i];
         let x1 = x[i];
         let x2 = x[i + half_dim];
         x[i] = x1 * cos_val - x2 * sin_val;

@@ -20,6 +20,7 @@ pub use bit1_58::quantization::TernaryPackType;
 pub use models::auto::AutoModelForCausalLM;
 pub use nn::{QuantizationConfig, DynamicLinear};
 pub use models::llama::{Cache, Config, Llama, LlamaConfig, Activation};
+pub use sampler::Sampler;
 
 pub fn init_threads(num_threads: usize) -> Result<(), Box<dyn std::error::Error>> {
     rayon::ThreadPoolBuilder::new()

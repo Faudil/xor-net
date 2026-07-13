@@ -246,6 +246,7 @@ impl Cache {
                 num_kv_heads,
                 config.max_position_embeddings,
                 head_dim,
+                true,
             ))
         } else {
             None

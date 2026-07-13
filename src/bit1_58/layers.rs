@@ -10,33 +10,46 @@ pub struct TernaryLinear {
     pub in_dim: usize,
     pub out_dim: usize,
     pub pack_type: TernaryPackType,
-    pub w_scale: f32,
+    pub w_scales: Vec<f32>,
 }
 
 impl TernaryLinear {
-    pub fn new(in_dim: usize, out_dim: usize, weights_f32: &[f32], pack_type: TernaryPackType) -> anyhow::Result<Self> {
+    pub fn new(in_dim: usize, out_dim: usize, weights_f32: &[f32], pack_type: TernaryPackType, provided_scale: Option<f32>) -> anyhow::Result<Self> {
         if weights_f32.len() != in_dim * out_dim {
             anyhow::bail!("Weight length must match in_dim * out_dim");
         }
         
-        let sum_abs: f32 = weights_f32.par_iter().map(|x| x.abs()).sum();
-        let w_scale = if weights_f32.len() > 0 { sum_abs / weights_f32.len() as f32 } else { 1.0 };
-        
-        let packed_weights: Vec<u8> = match pack_type {
-            TernaryPackType::Pack4 => {
-                weights_f32.par_chunks(in_dim).flat_map_iter(|row| pack_1_58bit_4pack(row, w_scale)).collect()
-            },
-            TernaryPackType::Pack5 => {
-                weights_f32.par_chunks(in_dim).flat_map_iter(|row| pack_1_58bit_5pack(row, w_scale)).collect()
+        let already_ternary = weights_f32.iter().all(|&w| w == -1.0 || w == 0.0 || w == 1.0);
+        let mut w_scales = Vec::with_capacity(out_dim);
+        let mut packed_weights = Vec::with_capacity((out_dim * in_dim + 3) / 4);
+
+        if already_ternary {
+            let global_w_scale = provided_scale.unwrap_or(1.0);
+            for row in weights_f32.chunks(in_dim) {
+                w_scales.push(global_w_scale);
+                match pack_type {
+                    TernaryPackType::Pack4 => packed_weights.extend(pack_1_58bit_4pack(row, global_w_scale)),
+                    TernaryPackType::Pack5 => packed_weights.extend(pack_1_58bit_5pack(row, global_w_scale)),
+                }
             }
-        };
+        } else {
+            let global_sum_abs: f32 = weights_f32.iter().map(|x| x.abs()).sum();
+            let global_w_scale = if weights_f32.is_empty() { 1.0 } else { global_sum_abs / weights_f32.len() as f32 };
+            for row in weights_f32.chunks(in_dim) {
+                w_scales.push(global_w_scale);
+                match pack_type {
+                    TernaryPackType::Pack4 => packed_weights.extend(pack_1_58bit_4pack(row, global_w_scale)),
+                    TernaryPackType::Pack5 => packed_weights.extend(pack_1_58bit_5pack(row, global_w_scale)),
+                }
+            }
+        }
         
         Ok(Self {
             packed_weights,
             in_dim,
             out_dim,
             pack_type,
-            w_scale,
+            w_scales,
         })
     }
 
@@ -81,7 +94,7 @@ impl TernaryLinear {
                         TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_in, w_row, in_dim),
                         TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_in, w_row, in_dim),
                     };
-                    *out_val = dot_i32 as f32 * inv_scale * self.w_scale;
+                    *out_val = dot_i32 as f32 * inv_scale * self.w_scales[o];
                 }
             });
         } else {
@@ -96,7 +109,7 @@ impl TernaryLinear {
                         TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_in, w_row, in_dim),
                         TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_in, w_row, in_dim),
                     };
-                    out_row[o] = dot_i32 as f32 * inv_scale * self.w_scale;
+                    out_row[o] = dot_i32 as f32 * inv_scale * self.w_scales[o];
                 }
             });
         }
@@ -138,7 +151,7 @@ impl TernaryLinear {
                     TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
                     TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
                 };
-                *out_val = dot_i32 as f32 * inv_scale * self.w_scale;
+                *out_val = dot_i32 as f32 * inv_scale * self.w_scales[o];
             }
         });
         
@@ -178,9 +191,9 @@ impl TernaryLinear {
         let q_packed = &q_lin.packed_weights;
         let k_packed = &k_lin.packed_weights;
         let v_packed = &v_lin.packed_weights;
-        let q_w = q_lin.w_scale;
-        let k_w = k_lin.w_scale;
-        let v_w = v_lin.w_scale;
+        let q_w = &q_lin.w_scales;
+        let k_w = &k_lin.w_scales;
+        let v_w = &v_lin.w_scales;
 
         let next_row = AtomicU64::new(0);
         let num_threads = rayon::current_num_threads();
@@ -198,7 +211,7 @@ impl TernaryLinear {
                                 TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
                                 TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
                             };
-                            unsafe { *(q_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * q_w; }
+                            unsafe { *(q_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * q_w[row_idx]; }
                         } else if row_idx < q_out_dim + k_out_dim {
                             let kr = row_idx - q_out_dim;
                             let w_row = &k_packed[kr * bytes_per_row .. (kr + 1) * bytes_per_row];
@@ -206,7 +219,7 @@ impl TernaryLinear {
                                 TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
                                 TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
                             };
-                            unsafe { *(k_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * k_w; }
+                            unsafe { *(k_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * k_w[kr]; }
                         } else {
                             let vr = row_idx - q_out_dim - k_out_dim;
                             let w_row = &v_packed[vr * bytes_per_row .. (vr + 1) * bytes_per_row];
@@ -214,7 +227,7 @@ impl TernaryLinear {
                                 TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
                                 TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
                             };
-                            unsafe { *(v_ptr as *mut f32).add(vr) = dot as f32 * inv_scale * v_w; }
+                            unsafe { *(v_ptr as *mut f32).add(vr) = dot as f32 * inv_scale * v_w[vr]; }
                         }
                     }
                 });
@@ -230,7 +243,7 @@ impl TernaryLinear {
                             TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
                             TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
                         };
-                        unsafe { *(q_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * q_w; }
+                        unsafe { *(q_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * q_w[row_idx]; }
                     } else if row_idx < q_out_dim + k_out_dim {
                         let kr = row_idx - q_out_dim;
                         let w_row = &k_packed[kr * bytes_per_row .. (kr + 1) * bytes_per_row];
@@ -238,7 +251,7 @@ impl TernaryLinear {
                             TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
                             TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
                         };
-                        unsafe { *(k_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * k_w; }
+                        unsafe { *(k_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * k_w[kr]; }
                     } else {
                         let vr = row_idx - q_out_dim - k_out_dim;
                         let w_row = &v_packed[vr * bytes_per_row .. (vr + 1) * bytes_per_row];
@@ -246,7 +259,7 @@ impl TernaryLinear {
                             TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
                             TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
                         };
-                        unsafe { *(v_ptr as *mut f32).add(vr) = dot as f32 * inv_scale * v_w; }
+                        unsafe { *(v_ptr as *mut f32).add(vr) = dot as f32 * inv_scale * v_w[vr]; }
                     }
                 }
             }
@@ -291,8 +304,8 @@ impl TernaryLinear {
         let fc2_ptr: usize = fc2_out.as_mut_ptr() as usize;
         let fc1_packed = &fc1_lin.packed_weights;
         let fc2_packed = &fc2_lin.packed_weights;
-        let fc1_w = fc1_lin.w_scale;
-        let fc2_w = fc2_lin.w_scale;
+        let fc1_w = &fc1_lin.w_scales;
+        let fc2_w = &fc2_lin.w_scales;
 
         let next_row = AtomicU64::new(0);
         let num_threads = rayon::current_num_threads();
@@ -310,7 +323,7 @@ impl TernaryLinear {
                                 TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
                                 TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
                             };
-                            unsafe { *(fc1_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * fc1_w; }
+                            unsafe { *(fc1_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * fc1_w[row_idx]; }
                         } else {
                             let kr = row_idx - fc1_out_dim;
                             let w_row = &fc2_packed[kr * bytes_per_row .. (kr + 1) * bytes_per_row];
@@ -318,7 +331,7 @@ impl TernaryLinear {
                                 TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
                                 TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
                             };
-                            unsafe { *(fc2_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * fc2_w; }
+                            unsafe { *(fc2_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * fc2_w[kr]; }
                         }
                     }
                 });
@@ -334,7 +347,7 @@ impl TernaryLinear {
                             TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
                             TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
                         };
-                        unsafe { *(fc1_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * fc1_w; }
+                        unsafe { *(fc1_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * fc1_w[row_idx]; }
                     } else {
                         let kr = row_idx - fc1_out_dim;
                         let w_row = &fc2_packed[kr * bytes_per_row .. (kr + 1) * bytes_per_row];
@@ -342,7 +355,7 @@ impl TernaryLinear {
                             TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
                             TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
                         };
-                        unsafe { *(fc2_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * fc2_w; }
+                        unsafe { *(fc2_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * fc2_w[kr]; }
                     }
                 }
             }

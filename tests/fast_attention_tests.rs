@@ -99,7 +99,7 @@ fn test_fast_attention_parity_single_token() -> Result<()> {
     let max_seq_len = 32;
     let head_dim = 8;
     
-    let mut cache = CpuRingCache::new(num_layers, num_kv_heads, max_seq_len, head_dim);
+    let mut cache = CpuRingCache::new(num_layers, num_kv_heads, max_seq_len, head_dim, false);
     
     // Phase 1: Prompt phase (seq_len = 4)
     let prompt_len = 4;
@@ -197,7 +197,7 @@ fn test_ring_wrapping_correctness() -> Result<()> {
     let max_seq_len = 4;
     let head_dim = 4;
     
-    let mut cache = CpuRingCache::new(num_layers, num_kv_heads, max_seq_len, head_dim);
+    let mut cache = CpuRingCache::new(num_layers, num_kv_heads, max_seq_len, head_dim, false);
     
     // Write 4 tokens (completely filling the cache)
     for pos in 0..4 {

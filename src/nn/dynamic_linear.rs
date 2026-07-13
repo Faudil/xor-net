@@ -462,21 +462,21 @@ impl DynamicLinear {
         }
     }
 
-    pub fn new_ternary(in_dim: usize, out_dim: usize, weights_f32: &[f32], pack_type: TernaryPackType) -> anyhow::Result<Self> {
-        let l = TernaryLinear::new(in_dim, out_dim, weights_f32, pack_type)?;
+    pub fn new_ternary(in_dim: usize, out_dim: usize, weights_f32: &[f32], pack_type: TernaryPackType, provided_scale: Option<f32>) -> anyhow::Result<Self> {
+        let l = TernaryLinear::new(in_dim, out_dim, weights_f32, pack_type, provided_scale)?;
         Ok(Self {
             inner: LinearKind::Ternary(l),
         })
     }
 
-    pub fn new_ternary_direct(packed_weights: Vec<u8>, in_dim: usize, out_dim: usize, pack_type: TernaryPackType, w_scale: f32) -> Self {
+    pub fn new_ternary_direct(packed_weights: Vec<u8>, in_dim: usize, out_dim: usize, pack_type: TernaryPackType, w_scales: Vec<f32>) -> Self {
         Self {
             inner: LinearKind::Ternary(TernaryLinear {
                 packed_weights,
                 in_dim,
                 out_dim,
                 pack_type,
-                w_scale,
+                w_scales,
             })
         }
     }
@@ -505,18 +505,19 @@ impl DynamicLinear {
                 Self::new_bit(in_dim, out_dim, &weight.data)
             }
             QuantizationConfig::Bit1_58(pack_type, lm_head_cfg) => {
-                if let Ok((packed_weights, w_scale, p_in, p_out)) =
+                if let Ok((packed_weights, w_scales, p_in, p_out)) =
                     loader.get_prepacked_ternary(&[out_dim, in_dim], name, pack_type)
                 {
                     return Ok(Self::new_ternary_direct(
-                        packed_weights, p_in, p_out, pack_type, w_scale,
+                        packed_weights, p_in, p_out, pack_type, w_scales,
                     ));
                 }
                 
                 let weight = loader.get(&[out_dim, in_dim], name)?;
                 // Only apply lm_head quantization to the LM head layer.
-                // For transformer layers, fall back to f32 to avoid precision loss
-                // (the 1bitLLM/bitnet_b1_58-3B stores FP32 weights, not packed ternary).
+                // For transformer layers, ternarize the FP32 weights on-the-fly.
+                // (Models like 1bitLLM/bitnet_b1_58-3B store FP32 pre-ternarization weights
+                //  that must be ternarized at load time to match the training behaviour.)
                 if loader.prefix_ends_with("lm_head") {
                     match lm_head_cfg {
                         LmHeadConfig::Int4 => Ok(Self::new_int4(&weight.data, out_dim, in_dim)),
@@ -524,7 +525,10 @@ impl DynamicLinear {
                         LmHeadConfig::F16 | LmHeadConfig::F32 => Ok(Self::new_standard(weight)),
                     }
                 } else {
-                    Ok(Self::new_standard(weight))
+                    let scale_name = format!("{}_scale", name);
+                    let provided_scale = loader.get(&[1], &scale_name).map(|s| s.data[0]).ok();
+                    eprintln!("Loaded scale for {}: {:?}", name, provided_scale);
+                    Self::new_ternary(in_dim, out_dim, &weight.data, pack_type, provided_scale)
                 }
             }
         }

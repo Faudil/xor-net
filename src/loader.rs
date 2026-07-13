@@ -113,7 +113,10 @@ pub fn load_packed_ternary_weight(
     let weight_bytes = &repo.buffers[info.file_idx][info.start..info.end];
     let scale_bytes = &repo.buffers[sinfo.file_idx][sinfo.start..sinfo.end];
     let scale_data = convert_to_f32_vec(scale_bytes, sinfo.dtype)?;
-    let w_scale = scale_data[0];
+    // The stored weight_scale is 1/α (the inverse of the actual ternary scale
+    // factor α = mean(|W_fp|)). Invert it so that code consuming this value
+    // can always multiply by the scale, regardless of source.
+    let w_scale = 1.0 / scale_data[0];
 
     let packed_data: Vec<u8> = weight_bytes.iter().map(|&b| b).collect();
     let expected_out_dim = expected_shape[0];
@@ -281,13 +284,13 @@ impl<'a> SafeTensorLoader<'a> {
     /// which is what the dot product expects, and returns the converted packed bytes
     /// along with the original weight_scale.
     ///
-    /// Returns (packed_weights_in_input_dim_order, w_scale, in_dim, out_dim).
+    /// Returns (packed_weights_in_input_dim_order, w_scales, in_dim, out_dim).
     pub fn get_prepacked_ternary(
         &self,
         expected_shape: &[usize],
         name: &str,
         pack_type: TernaryPackType,
-    ) -> anyhow::Result<(Vec<u8>, f32, usize, usize)> {
+    ) -> anyhow::Result<(Vec<u8>, Vec<f32>, usize, usize)> {
         let key = if self.prefix.is_empty() {
             name.to_string()
         } else {
@@ -321,6 +324,7 @@ impl<'a> SafeTensorLoader<'a> {
             .ok_or_else(|| anyhow::anyhow!("Packed weight '{}' has no companion weight_scale '{}'", key, scale_key))?;
         let sbytes = &self.repo.buffers[sinfo.file_idx][sinfo.start..sinfo.end];
         let scale_data = convert_to_f32_vec(sbytes, sinfo.dtype)?;
+        // The stored weight_scale is the actual multiplier (γ).
         let w_scale = scale_data[0];
 
         let out_dim = expected_out;
@@ -366,7 +370,8 @@ impl<'a> SafeTensorLoader<'a> {
             }
         };
 
-        Ok((repacked, w_scale, in_dim, out_dim))
+        let w_scales = vec![w_scale; out_dim];
+        Ok((repacked, w_scales, in_dim, out_dim))
     }
 
     /// Load a weight tensor that may be packed in 1.58-bit ternary format (Pack4).

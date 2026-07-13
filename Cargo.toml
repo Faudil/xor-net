@@ -58,11 +58,17 @@ path = "examples/chat.rs"
 name = "check_accuracy"
 path = "examples/check_accuracy.rs"
 
+[[example]]
+name = "dump_logits_for_compare"
+path = "examples/dump_logits_for_compare.rs"
+
+[[example]]
+name = "check_8b_accuracy"
+path = "examples/check_8b_accuracy.rs"
+
 [dependencies]
 anyhow = "1.0.103"
 candle-core = "0.11.0"
-candle-nn = "0.11.0"
-candle-transformers = "0.11.0"
 hf-hub = "0.5.0"
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -72,6 +78,10 @@ jemallocator = "0.5.4"
 safetensors = "0.5.2"
 memmap2 = "0.9.11"
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310", "generate-import-lib"], optional = true }
+
+[dev-dependencies]
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
 
 [features]
 default = []

@@ -13,27 +13,17 @@ fn main() -> anyhow::Result<()> {
     )?;
     
     let tokenizer_path = Path::new(model_path).join("tokenizer.json");
-    let tokenizer = if tokenizer_path.exists() {
-        Tokenizer::from_file(tokenizer_path).unwrap()
-    } else {
-        let api = hf_hub::api::sync::Api::new()?;
-        let repo = api.repo(hf_hub::Repo::new(
-            "microsoft/bitnet-b1.58-2B-4T".to_string(),
-            hf_hub::RepoType::Model,
-        ));
-        let path = repo.get("tokenizer.json")?;
-        Tokenizer::from_file(path).unwrap()
-    };
+    let tokenizer = if tokenizer_path.exists() { Tokenizer::from_file(tokenizer_path).unwrap() } else { let api = hf_hub::api::sync::Api::new().unwrap(); let repo = api.repo(hf_hub::Repo::new("microsoft/bitnet-b1.58-2B-4T".to_string(), hf_hub::RepoType::Model)); let path = repo.get("tokenizer.json").unwrap(); Tokenizer::from_file(path).unwrap() };
 
-    let mut sampler = Sampler::new(3132833641, Some(0.0), Some(0.95), 1.0);
+    let mut sampler = Sampler::new(3132833641, Some(0.8), Some(0.95), 1.2); // use higher temp and repetition penalty 1.2
 
-    let prompt2 = "Quantum physics, also known as quantum mechanics, is a branch of physics";
+    let prompt2 = "The first ten numbers are: 1, 2, 3, 4, 5, ";
 
     let mut tokens = vec![config.bos_token_id.unwrap_or(1)];
     tokens.extend(tokenizer.encode(prompt2, false).unwrap().get_ids());
 
     println!("=== Testing Prompt ===");
-    println!("Tokens: {:?}", tokens);
+    println!("Prompt: {}", prompt2);
     
     let mut cache = Cache::new(true, &config)?;
     let mut response_tokens = Vec::new();
@@ -49,7 +39,7 @@ fn main() -> anyhow::Result<()> {
     }
     
     let mut current_pos = tokens.len() - 1;
-    for _ in 0..100 {
+    for _ in 0..20 {
         let logits = model.forward(&tokens[current_pos..current_pos+1], current_pos, &mut cache)?;
         let mut logits_data = logits.into_data();
         let next_token = sampler.sample(&mut logits_data, &response_tokens)?;

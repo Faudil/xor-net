@@ -13,7 +13,7 @@ fn attention_single_token_is_identity() {
     let num_heads = 2;
     let num_kv_heads = 2;
     let head_dim = 4;
-    let mut cache = CpuRingCache::new(1, num_kv_heads, 32, head_dim);
+    let mut cache = CpuRingCache::new(1, num_kv_heads, 32, head_dim, false);
 
     let q = FastTensor::new(vec![1.0; num_heads * head_dim], vec![1, num_heads, 1, head_dim]);
     let k = FastTensor::new(vec![1.0; num_kv_heads * head_dim], vec![1, num_kv_heads, 1, head_dim]);
@@ -36,7 +36,7 @@ fn attention_causal_mask_second_token_no_future() {
     let num_heads = 1;
     let num_kv_heads = 1;
     let head_dim = 2;
-    let mut cache = CpuRingCache::new(1, num_kv_heads, 32, head_dim);
+    let mut cache = CpuRingCache::new(1, num_kv_heads, 32, head_dim, false);
 
     // Step 0: insert K=[1,0], V=[10,0]
     let q0 = FastTensor::new(vec![1.0, 0.0], vec![1, 1, 1, 2]);
@@ -76,7 +76,7 @@ fn attention_output_finite() {
     let num_kv_heads = 2;
     let head_dim = 8;
     let seq_len = 6;
-    let mut cache = CpuRingCache::new(1, num_kv_heads, 64, head_dim);
+    let mut cache = CpuRingCache::new(1, num_kv_heads, 64, head_dim, false);
 
     let q_data: Vec<f32> = (0..num_heads * seq_len * head_dim)
         .map(|i| (i as f32 * 0.1).sin())
@@ -102,7 +102,7 @@ fn attention_output_finite() {
 fn cache_write_correctness() {
     let num_kv_heads = 1;
     let head_dim = 2;
-    let mut cache = CpuRingCache::new(1, num_kv_heads, 8, head_dim);
+    let mut cache = CpuRingCache::new(1, num_kv_heads, 8, head_dim, false);
 
     // Write token at pos 0 with K=[5,6]
     let q = FastTensor::new(vec![1.0, 1.0], vec![1, 1, 1, 2]);

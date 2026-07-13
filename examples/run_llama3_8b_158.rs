@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
         .to_vec();
 
     println!("Prompt: '{}'", prompt);
-    let mut sampler = xor_net::sampler::Sampler::new(299792458, Some(0.7), None);
+    let mut sampler = xor_net::sampler::Sampler::new(299792458, Some(0.7), None, 1.0);
 
     let mut index_pos = 0;
     let max_len = 50;
@@ -64,11 +64,11 @@ fn main() -> anyhow::Result<()> {
         let start_pos = tokens.len().saturating_sub(context_size);
 
         let start_forward = Instant::now();
-        let logits = model.forward(&tokens[start_pos..], index_pos, &mut cache)?;
+        let mut logits = model.forward(&tokens[start_pos..], index_pos, &mut cache)?;
         total_forward_time += start_forward.elapsed();
 
         let start_sample = Instant::now();
-        let next_token = sampler.sample(&logits.data)?;
+        let next_token = sampler.sample(&mut logits.data, &tokens[..])?;
         total_sample_time += start_sample.elapsed();
 
         tokens.push(next_token);

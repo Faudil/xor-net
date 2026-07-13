@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
     let model_id = "1bitLLM/bitnet_b1_58-3B";
     println!("Loading 1.58-bit model {}...", model_id);
     
-    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, xor_net::nn::LmHeadConfig::Int4);
+    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, xor_net::nn::LmHeadConfig::F32);
 
     let load_start = Instant::now();
     let (model, config) = AutoModelForCausalLM::from_pretrained(model_id, quantization)?;
