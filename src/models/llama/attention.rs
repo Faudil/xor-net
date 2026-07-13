@@ -8,6 +8,24 @@ use crate::loader::SafeTensorLoader;
 use crate::models::llama::{Cache, Config};
 use anyhow::Result;
 
+/// Issue a non-temporal prefetch for the leading cache line of a projection's
+/// packed ternary weights (no-op for non-ternary projections).
+fn prefetch_proj(lin: &DynamicLinear) {
+    if let LinearKind::Ternary(t) = &lin.inner {
+        if !t.packed_weights.is_empty() {
+            unsafe { crate::models::llama::prefetch_weight(t.packed_weights.as_ptr()) };
+        }
+    }
+}
+
+/// Bytes of packed ternary weight memory for a projection (0 if not ternary).
+fn proj_bytes(lin: &DynamicLinear) -> usize {
+    match &lin.inner {
+        LinearKind::Ternary(t) => t.packed_weights.len(),
+        _ => 0,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CausalSelfAttention {
     q_proj: DynamicLinear,
@@ -92,6 +110,24 @@ impl CausalSelfAttention {
         }
 
         anyhow::bail!("KV Cache is required for FastTensor inference");
+    }
+
+    /// Prefetch the leading cache lines of all four projections' weights so the
+    /// next block's weight stream can begin while this block is still computing.
+    pub(crate) fn prefetch_weights(&self) {
+        prefetch_proj(&self.q_proj);
+        prefetch_proj(&self.k_proj);
+        prefetch_proj(&self.v_proj);
+        prefetch_proj(&self.o_proj);
+    }
+
+    /// Bytes of packed ternary weight memory owned by this attention block
+    /// (used for the per-token bandwidth estimate).
+    pub(crate) fn weight_bytes(&self) -> usize {
+        proj_bytes(&self.q_proj)
+            + proj_bytes(&self.k_proj)
+            + proj_bytes(&self.v_proj)
+            + proj_bytes(&self.o_proj)
     }
 
     pub(crate) fn load(loader: SafeTensorLoader, cfg: &Config) -> Result<Self> {

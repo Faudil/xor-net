@@ -48,13 +48,31 @@ impl TernaryLinear {
                 }
             }
         } else {
-            let global_sum_abs: f32 = weights_f32.iter().map(|x| x.abs()).sum();
-            let global_w_scale = if weights_f32.is_empty() { 1.0 } else { global_sum_abs / weights_f32.len() as f32 };
-            for row in weights_f32.chunks(in_dim) {
-                w_scales.push(global_w_scale);
-                match pack_type {
-                    TernaryPackType::Pack4 => packed_weights.extend(pack_1_58bit_4pack(row, global_w_scale)),
-                    TernaryPackType::Pack5 => packed_weights.extend(pack_1_58bit_5pack(row, global_w_scale)),
+            match provided_scale {
+                Some(global_w_scale) => {
+                    for row in weights_f32.chunks(in_dim) {
+                        w_scales.push(global_w_scale);
+                        match pack_type {
+                            TernaryPackType::Pack4 => packed_weights.extend(pack_1_58bit_4pack(row, global_w_scale)),
+                            TernaryPackType::Pack5 => packed_weights.extend(pack_1_58bit_5pack(row, global_w_scale)),
+                        }
+                    }
+                }
+                None => {
+                    // Per-row scale (BitNet γ): each output neuron gets its own
+                    // scale. Used when no precomputed `_scale` tensor is
+                    // supplied (e.g. a tied/embedded LM head). A single global
+                    // scale is far too coarse for the logits projection and
+                    // destroys accuracy.
+                    for row in weights_f32.chunks(in_dim) {
+                        let sum_abs: f32 = row.iter().map(|x| x.abs()).sum();
+                        let s = if row.is_empty() { 1.0 } else { sum_abs / row.len() as f32 };
+                        w_scales.push(s);
+                        match pack_type {
+                            TernaryPackType::Pack4 => packed_weights.extend(pack_1_58bit_4pack(row, s)),
+                            TernaryPackType::Pack5 => packed_weights.extend(pack_1_58bit_5pack(row, s)),
+                        }
+                    }
                 }
             }
         }

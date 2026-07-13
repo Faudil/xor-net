@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
     println!("Loading 1.58-bit model weights for benchmarking...");
     
     let quantization = if use_ternary {
-        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, xor_net::nn::LmHeadConfig::Int4)
+        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, xor_net::nn::LmHeadConfig::Int4, false)
     } else {
         QuantizationConfig::None
     };

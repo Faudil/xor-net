@@ -191,6 +191,48 @@ Activations are contiguous memory, but each trit position k needs values at offs
 
 ---
 
+## LM Head Precision (2026-07)
+
+Added a runtime `XORNET_LMHEAD` option (`int8` | `int4` | `ternary`) plus an int8 VNNI
+GEMV, so the head's precision/perf tradeoff can be compared directly.
+
+### Key findings (2B, `tie_word_embeddings=true`)
+
+- The 2B LM head is **tied to the word embedding**, so it is built directly from the
+  fp32 embedding weights (`DynamicLinear::new_int8` in `src/models/llama/mod.rs`). The
+  `LmHeadConfig` previously only affected *non-tied* heads (3B/8B), so for 2B it was
+  **ignored** — all three modes gave identical 5.5 ms/tok. `mod.rs` now dispatches the
+  tied head on `LmHeadConfig` (int8/int4/ternary), making the option meaningful for 2B.
+- The int8 head is **memory-bound**, not compute-bound: it streams 102 MB/tok from RAM
+  (~3.3 ms floor at 31 GB/s). So the new int8 **VNNI `vpdpbusd` GEMV**
+  (`dot_product_i8_avx512_vnni` + `Int8Linear::weight_row_sum` zero-point correction)
+  is *correct* and engaged (`use_vnni=true` confirmed) but gives **no speedup** — the
+  bottleneck is weight traffic, not MAC throughput. It still benefits genuinely-int8
+  non-tied heads (e.g. 8B), where the path is exercised.
+- Per-mode LM-head cost (2B, 12 threads):
+
+  | Mode  | Weight stream | LM Head ms/tok | Accuracy |
+  |-------|---------------|----------------|----------|
+  | int8  | 102 MB        | **5.56**       | coherent (baseline) |
+  | int4  | ~13 MB        | **3.05**       | coherent — **fast+accurate sweet spot** |
+  | ternary | ~26 MB      | **1.57**       | **garbage** (3-level too coarse for logits) |
+
+- **Ternaryizing the head is a precision catastrophe** for this model. Per-row BitNet
+  scales (`TernaryLinear::new` now uses per-row γ when no `_scale` tensor is supplied)
+  did not rescue it — the 3-level quantization of the *logits* projection destroys
+  token selection. int4 (16 levels) stays coherent. **Recommendation: keep int8 as the
+  accurate default; `XORNET_LMHEAD=int4` is the recommended speed/accuracy choice for 2B.**
+
+### Files changed
+- `src/nn/dynamic_linear.rs`: `dot_product_i8_avx512_vnni`, `Int8Linear::weight_row_sum`,
+  VNNI dispatch in `Int8Linear::{forward,forward_with_quantized}`, `LmHeadConfig::Ternary`,
+  loader handles `Ternary` for non-tied heads.
+- `src/bit1_58/layers.rs`: `TernaryLinear::new` uses per-row scale when `provided_scale=None`.
+- `src/models/llama/mod.rs`: tied-head dispatch on `LmHeadConfig` (int8/int4/ternary).
+- `examples/chat.rs`: `XORNET_LMHEAD` env selector.
+
+---
+
 ## Files
 
 | File | Contents |
@@ -199,6 +241,7 @@ Activations are contiguous memory, but each trit position k needs values at offs
 | `src/bit1_58/layers.rs` | Fused QKV/MLP forward, parallel row dispatch |
 | `src/bit1_58/quantization.rs` | Pack4/Pack5 encode/decode, activation quantization |
 | `src/bit1_58/ops.rs` | TernaryMatMulOp (candle CustomOp) |
-| `src/nn/dynamic_linear.rs` | Int8Linear, dot_product_i8 dispatch, F32Linear |
-| `src/models/llama.rs` | Model loading, lm_head Int8 path |
+| `src/nn/dynamic_linear.rs` | Int8Linear (incl. VNNI GEMV), Int4Linear, TernaryLinear, F32Linear, dot_product_i8 dispatch, `LmHeadConfig` |
+| `src/models/llama/mod.rs` | Model loading, tied-head `LmHeadConfig` dispatch |
+| `src/models/llama/{attention,mlp,block}.rs` | Split submodules (QKV/O, fused MLP, residual block) |
 | `Cargo.toml` | `lto = "fat"`, `codegen-units = 1`, `panic = "abort"` |

@@ -8,6 +8,24 @@ use crate::loader::SafeTensorLoader;
 use crate::models::llama::{Activation, Config, TIME_MLP_DOWN};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Issue a non-temporal prefetch for the leading cache line of a projection's
+/// packed ternary weights (no-op for non-ternary projections).
+fn prefetch_proj(lin: &DynamicLinear) {
+    if let LinearKind::Ternary(t) = &lin.inner {
+        if !t.packed_weights.is_empty() {
+            unsafe { crate::models::llama::prefetch_weight(t.packed_weights.as_ptr()) };
+        }
+    }
+}
+
+/// Bytes of packed ternary weight memory for a projection (0 if not ternary).
+fn proj_bytes(lin: &DynamicLinear) -> usize {
+    match &lin.inner {
+        LinearKind::Ternary(t) => t.packed_weights.len(),
+        _ => 0,
+    }
+}
+
 /// Monotonic block index used to label per-block MLP-kind diagnostics.
 pub(crate) static MLP_DBG_IDX: AtomicUsize = AtomicUsize::new(0);
 
@@ -111,6 +129,19 @@ impl Mlp {
         let result = self.c_proj.forward(&x_norm);
         TIME_MLP_DOWN.fetch_add(t_down.elapsed().as_micros() as u64, Ordering::Relaxed);
         result
+    }
+
+    /// Prefetch the leading cache lines of gate/up/down weights so the next
+    /// block's weight stream can begin while this block is still computing.
+    pub(crate) fn prefetch_weights(&self) {
+        prefetch_proj(&self.c_fc1);
+        prefetch_proj(&self.c_fc2);
+        prefetch_proj(&self.c_proj);
+    }
+
+    /// Bytes of packed ternary weight memory owned by this MLP (bandwidth estimate).
+    pub(crate) fn weight_bytes(&self) -> usize {
+        proj_bytes(&self.c_fc1) + proj_bytes(&self.c_fc2) + proj_bytes(&self.c_proj)
     }
 
     pub(crate) fn load(loader: SafeTensorLoader, cfg: &Config) -> anyhow::Result<Self> {

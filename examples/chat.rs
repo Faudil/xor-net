@@ -41,10 +41,25 @@ fn load_hf_model(
     Ok((model, config, tokenizer))
 }
 
+/// User-selectable LM-head precision. Set XORNET_LMHEAD to `int8`, `int4`, or
+/// `ternary` (ternary routes the head through the fast VNNI `dpbusd` path).
+/// Falls back to `default` when unset/invalid.
+fn lmhead_cfg(default: LmHeadConfig) -> LmHeadConfig {
+    match std::env::var("XORNET_LMHEAD").as_deref() {
+        Ok("int8") => LmHeadConfig::Int8,
+        Ok("int4") => LmHeadConfig::Int4,
+        Ok("ternary") => LmHeadConfig::Ternary,
+        _ => default,
+    }
+}
+
 fn load_local_model(model_dir: &Path) -> anyhow::Result<(Llama, Config, Tokenizer)> {
     eprintln!("Loading model from: {}...", model_dir.display());
     let load_start = Instant::now();
-    let (model, config) = AutoModelForCausalLM::from_local(model_dir, QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, false))?;
+    let (model, config) = AutoModelForCausalLM::from_local(
+        model_dir,
+        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, lmhead_cfg(LmHeadConfig::Int4), false),
+    )?;
     eprintln!("Model loaded in {:.2?}", load_start.elapsed());
 
     let tokenizer_path = model_dir.join("tokenizer.json");
@@ -124,17 +139,29 @@ fn main() -> anyhow::Result<()> {
         "2b" => load_hf_model(
             "microsoft/bitnet-b1.58-2B-4T",
             "main",
-            QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8, false),
+            QuantizationConfig::Bit1_58(
+                TernaryPackType::Pack4,
+                lmhead_cfg(LmHeadConfig::Int8),
+                false,
+            ),
         )?,
         "3b" => load_hf_model(
             "1bitLLM/bitnet_b1_58-3B",
             "main",
-            QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, false),
+            QuantizationConfig::Bit1_58(
+                TernaryPackType::Pack4,
+                lmhead_cfg(LmHeadConfig::Int4),
+                false,
+            ),
         )?,
         "8b" => load_hf_model(
             "HF1BitLLM/Llama3-8B-1.58-100B-tokens",
             "main",
-            QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8, true),
+            QuantizationConfig::Bit1_58(
+                TernaryPackType::Pack4,
+                lmhead_cfg(LmHeadConfig::Int8),
+                true,
+            ),
         )?,
         _ => load_local_model(Path::new(model_arg))?,
     };
@@ -425,6 +452,15 @@ fn main() -> anyhow::Result<()> {
                 mlp_down_us as f64 / 1000.0 / g,
                 norm_us as f64 / 1000.0 / g,
                 silu_us as f64 / 1000.0 / g,
+            );
+            // Effective memory bandwidth of the weight stream: how close are we
+            // to the DDR5 ceiling? (Approximate; see `weight_bytes_per_token`.)
+            let wbytes = model.weight_bytes_per_token();
+            let gbps = (wbytes as f64) * tps / 1e9;
+            println!(
+                " └ Weight stream: {:.1} MB/tok | {:.1} GB/s effective (DDR5 ceiling ~55 GB/s)",
+                wbytes as f64 / 1e6,
+                gbps,
             );
             if spec_drafted > 0 {
                 let rate = spec_accepted as f64 / spec_drafted as f64;

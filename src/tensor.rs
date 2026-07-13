@@ -21,7 +21,7 @@ impl Debug for FastTensor {
 impl FastTensor {
     pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Self {
         let expected_size: usize = shape.iter().product();
-        assert_eq!(
+        debug_assert_eq!(
             data.len(),
             expected_size,
             "FastTensor::new shape mismatch: data len is {}, expected {}",
@@ -149,12 +149,18 @@ impl FastTensor {
                 .zip(other.data.par_chunks(1024))
                 .for_each(|(out_chunk, other_chunk)| {
                     for i in 0..out_chunk.len() {
-                        out_chunk[i] += other_chunk[i];
+                        debug_assert!(i < out_chunk.len() && i < other_chunk.len());
+                        unsafe {
+                            *out_chunk.get_unchecked_mut(i) += *other_chunk.get_unchecked(i);
+                        }
                     }
                 });
         } else {
             for i in 0..self.data.len() {
-                self.data[i] += other.data[i];
+                debug_assert!(i < self.data.len() && i < other.data.len());
+                unsafe {
+                    *self.data.get_unchecked_mut(i) += *other.data.get_unchecked(i);
+                }
             }
         }
             
@@ -175,14 +181,22 @@ impl FastTensor {
                 .zip(other.data.par_chunks(1024))
                 .for_each(|(s1_chunk, s2_chunk)| {
                     for i in 0..s1_chunk.len() {
-                        let x = s1_chunk[i];
-                        s1_chunk[i] = (x / (1.0 + (-x).exp())) * s2_chunk[i];
+                        debug_assert!(i < s1_chunk.len() && i < s2_chunk.len());
+                        unsafe {
+                            let x = *s1_chunk.get_unchecked(i);
+                            *s1_chunk.get_unchecked_mut(i) =
+                                (x / (1.0 + (-x).exp())) * *s2_chunk.get_unchecked(i);
+                        }
                     }
                 });
         } else {
             for i in 0..self.data.len() {
-                let x = self.data[i];
-                self.data[i] = (x / (1.0 + (-x).exp())) * other.data[i];
+                debug_assert!(i < self.data.len() && i < other.data.len());
+                unsafe {
+                    let x = *self.data.get_unchecked(i);
+                    *self.data.get_unchecked_mut(i) =
+                        (x / (1.0 + (-x).exp())) * *other.data.get_unchecked(i);
+                }
             }
         }
             
@@ -203,16 +217,22 @@ impl FastTensor {
                 .zip(other.data.par_chunks(1024))
                 .for_each(|(s1_chunk, s2_chunk)| {
                     for i in 0..s1_chunk.len() {
-                        let x = s1_chunk[i];
-                        let relu = if x > 0.0 { x } else { 0.0 };
-                        s1_chunk[i] = relu * relu * s2_chunk[i];
+                        debug_assert!(i < s1_chunk.len() && i < s2_chunk.len());
+                        unsafe {
+                            let x = *s1_chunk.get_unchecked(i);
+                            let relu = if x > 0.0 { x } else { 0.0 };
+                            *s1_chunk.get_unchecked_mut(i) = relu * relu * *s2_chunk.get_unchecked(i);
+                        }
                     }
                 });
         } else {
             for i in 0..self.data.len() {
-                let x = self.data[i];
-                let relu = if x > 0.0 { x } else { 0.0 };
-                self.data[i] = relu * relu * other.data[i];
+                debug_assert!(i < self.data.len() && i < other.data.len());
+                unsafe {
+                    let x = *self.data.get_unchecked(i);
+                    let relu = if x > 0.0 { x } else { 0.0 };
+                    *self.data.get_unchecked_mut(i) = relu * relu * *other.data.get_unchecked(i);
+                }
             }
         }
 

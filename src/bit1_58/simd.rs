@@ -51,8 +51,8 @@ pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], tota
     let mut idx = 0usize;
 
     while idx < step4 {
-        _mm_prefetch(b_ptr.add(idx * 16 + 64) as *const i8, _MM_HINT_T0);
-        _mm_prefetch(b_ptr.add(idx * 16 + 128) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(b_ptr.add(idx * 16 + 64) as *const i8, _MM_HINT_NTA);
+        _mm_prefetch(b_ptr.add(idx * 16 + 128) as *const i8, _MM_HINT_NTA);
 
         macro_rules! block {
             ($acc:expr, $i:expr) => {{
@@ -92,7 +92,7 @@ pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], tota
 
     // Cleanup: remaining chunks (< 4)
     while idx < chunks64 {
-        _mm_prefetch(b_ptr.add(idx * 16 + 256) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(b_ptr.add(idx * 16 + 256) as *const i8, _MM_HINT_NTA);
         let acts = _mm512_loadu_si512(a_ptr.add(idx));
         let packed_w = _mm_loadu_si128(b_ptr.add(idx * 16) as *const __m128i);
         let w32 = _mm512_cvtepu8_epi32(packed_w);
@@ -152,7 +152,7 @@ pub unsafe fn ternary_dot_product_pack4_avx2(a_i8: &[i8], b_pack4: &[u8], total_
         let step = chunks32 / 2 * 2;
         let mut i = 0;
         while i < step {
-            _mm_prefetch(b_ptr.add(i * 8 + 16) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(b_ptr.add(i * 8 + 16) as *const i8, _MM_HINT_NTA);
 
             let acts0 = _mm256_loadu_si256(a_ptr.add(i));
             let packed_w0 = _mm_loadl_epi64(b_ptr.add(i * 8) as *const __m128i);
@@ -231,6 +231,12 @@ pub unsafe fn ternary_dot_product_pack4_avx2(a_i8: &[i8], b_pack4: &[u8], total_
 /// values issue weight prefetches further ahead to hide DDR5 latency; the
 /// optimum depends on the memory controller and how many concurrent weight
 /// streams the surrounding rayon fan-out issues.
+///
+/// Weight prefetches use the non-temporal hint (`_MM_HINT_NTA`) because each
+/// weight byte is read exactly once: pulling it into L1/L2 would only evict the
+/// reused activation vector and RoPE tables, so we keep the weights out of the
+/// low-level caches. (A true streaming `vmovntdqa` load would need 16-byte
+/// aligned weight buffers, which the current `Vec<u8>` does not guarantee.)
 static VNNI_PREFETCH_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
@@ -271,7 +277,7 @@ pub unsafe fn ternary_dot_product_pack4_avx512_vnni(a_i8: &[i8], b_pack4: &[u8],
     let mut idx = 0usize;
 
     while idx < step16 {
-        _mm_prefetch(b_ptr.add(idx * 16 + pf) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(b_ptr.add(idx * 16 + pf) as *const i8, _MM_HINT_NTA);
 
         macro_rules! block {
             ($k:expr) => {{
@@ -312,7 +318,7 @@ pub unsafe fn ternary_dot_product_pack4_avx512_vnni(a_i8: &[i8], b_pack4: &[u8],
 
     // Cleanup: remaining chunks (< 16) accumulate into `merged`.
     while idx < chunks64 {
-        _mm_prefetch(b_ptr.add(idx * 16 + pf) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(b_ptr.add(idx * 16 + pf) as *const i8, _MM_HINT_NTA);
         let acts = _mm512_loadu_si512(a_ptr.add(idx));
         let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(b_ptr.add(idx * 16) as *const __m128i));
         let p0 = _mm512_and_si512(w32, mask3);

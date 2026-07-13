@@ -18,6 +18,17 @@ pub(crate) struct Block {
 }
 
 impl Block {
+    /// Prefetch the next block's weight matrices (see `prefetch_weight`).
+    pub(crate) fn prefetch_weights(&self) {
+        self.attn.prefetch_weights();
+        self.mlp.prefetch_weights();
+    }
+
+    /// Bytes of packed ternary weight memory owned by this block (bandwidth estimate).
+    pub(crate) fn weight_bytes(&self) -> usize {
+        self.attn.weight_bytes() + self.mlp.weight_bytes()
+    }
+
     pub(crate) fn forward(
         &self,
         x: &FastTensor,

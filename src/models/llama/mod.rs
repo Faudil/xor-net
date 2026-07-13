@@ -12,7 +12,8 @@ pub mod block;
 pub mod mlp;
 
 use crate::tensor::FastTensor;
-use crate::nn::{DynamicLinear, QuantizationConfig, FastRmsNorm, CpuRingCache};
+use crate::nn::{DynamicLinear, QuantizationConfig, LmHeadConfig, FastRmsNorm, CpuRingCache};
+use crate::bit1_58::quantization::TernaryPackType;
 use crate::loader::SafeTensorLoader;
 use std::f32::consts::PI;
 
@@ -340,6 +341,31 @@ pub fn get_mlp_silu_time() -> u64 {
     crate::bit1_58::layers::TIME_SILU.load(Ordering::Relaxed)
 }
 
+/// Non-temporal prefetch of the first cache line at `ptr`. Used to overlap the
+/// next transformer block's weight fetch with the current block's compute so
+/// the per-layer memory latency is hidden rather than serialised.
+#[inline]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) unsafe fn prefetch_weight(ptr: *const u8) {
+    core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_NTA);
+}
+
+#[inline]
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) unsafe fn prefetch_weight(_ptr: *const u8) {}
+
+/// Bytes of packed weight memory a linear streams from RAM per token (used for
+/// the bandwidth estimate). `Standard` f32 is treated as 0 — it does not occur
+/// on the BitNet models we run, and returning 0 keeps the estimate conservative.
+fn linear_packed_bytes(lin: &DynamicLinear) -> usize {
+    match &lin.inner {
+        LinearKind::Ternary(t) => t.packed_weights.len(),
+        LinearKind::Int8(l) => l.weight_i8.len(),
+        LinearKind::Int4(l) => l.weight_i4.len(),
+        _ => 0,
+    }
+}
+
 pub fn get_profiling_stats() -> (u64, u64, u64) {
     (
         TIME_BLOCKS.load(Ordering::Relaxed),
@@ -377,6 +403,23 @@ impl Llama {
         self.wte.forward(x)
     }
 
+    /// Approximate packed-weight bytes streamed from RAM per generated token:
+    /// the transformer linears (fully read every token) + the lm_head + the
+    /// single embedding row. Used by the `XORNET_DEBUG` print to estimate
+    /// effective memory bandwidth against the DDR5 ceiling.
+    pub fn weight_bytes_per_token(&self) -> usize {
+        let mut total = self.hidden_size() * 4; // one embedding row
+        for b in &self.blocks {
+            total += b.weight_bytes();
+        }
+        total += linear_packed_bytes(&self.lm_head);
+        total
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.wte.weight.shape[1]
+    }
+
     pub fn forward_input_embed(
         &self,
         input_embed: &FastTensor,
@@ -401,6 +444,11 @@ impl Llama {
 
         let start_blocks = std::time::Instant::now();
         for (block_idx, block) in self.blocks.iter().enumerate() {
+            // Start fetching the next block's weights now so their memory
+            // latency overlaps with this block's compute (Phase 3).
+            if block_idx + 1 < self.blocks.len() {
+                self.blocks[block_idx + 1].prefetch_weights();
+            }
             x = block.forward(&x, index_pos, block_idx, cache)?;
         }
         let blocks_elapsed = start_blocks.elapsed().as_micros() as u64;
@@ -464,8 +512,38 @@ impl Llama {
     pub fn load(loader: &SafeTensorLoader, cfg: &Config) -> anyhow::Result<Self> {
         let wte_weight = loader.get(&[cfg.vocab_size, cfg.hidden_size], "model.embed_tokens.weight")?;
         let wte = FastEmbedding::new(wte_weight);
+        // When the LM head is tied to the word embedding we control its
+        // precision directly from `LmHeadConfig`. Ternary/int4 shrink the
+        // per-token weight stream (102 MB → 25/13 MB) which is the real lever
+        // on the memory-bound head; int8 keeps the prior behaviour.
+        let lm_head_cfg = match &cfg.quantization_config {
+            QuantizationConfig::Bit1_58(_, l, _) => *l,
+            QuantizationConfig::Bit1(l) => *l,
+            QuantizationConfig::None => LmHeadConfig::F32,
+        };
+        let pack_type = match &cfg.quantization_config {
+            QuantizationConfig::Bit1_58(p, _, _) => *p,
+            _ => TernaryPackType::Pack4,
+        };
         let lm_head = if cfg.tie_word_embeddings {
-            DynamicLinear::new_int8(&wte.weight.data, cfg.vocab_size, cfg.hidden_size)
+            match lm_head_cfg {
+                LmHeadConfig::Int8 => {
+                    DynamicLinear::new_int8(&wte.weight.data, cfg.vocab_size, cfg.hidden_size)
+                }
+                LmHeadConfig::Int4 => {
+                    DynamicLinear::new_int4(&wte.weight.data, cfg.vocab_size, cfg.hidden_size)
+                }
+                LmHeadConfig::Ternary => DynamicLinear::new_ternary(
+                    cfg.hidden_size,
+                    cfg.vocab_size,
+                    &wte.weight.data,
+                    pack_type,
+                    None,
+                )?,
+                LmHeadConfig::F16 | LmHeadConfig::F32 => {
+                    DynamicLinear::new_int8(&wte.weight.data, cfg.vocab_size, cfg.hidden_size)
+                }
+            }
         } else {
             DynamicLinear::load(
                 cfg.hidden_size,
