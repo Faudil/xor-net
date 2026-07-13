@@ -2,7 +2,7 @@ use std::path::Path;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use crate::models::llama::{Config, Llama, LlamaConfig};
 use crate::nn::QuantizationConfig;
-use crate::loader::{SafeTensorRepo, SafeTensorLoader};
+use crate::loader::{SafeTensorRepo, SafeTensorLoader, sparse_loader::SparseFile};
 
 pub struct AutoModelForCausalLM;
 
@@ -48,7 +48,20 @@ impl AutoModelForCausalLM {
 
         let repo = SafeTensorRepo::load(&filenames)?;
         let loader = SafeTensorLoader::new(&repo);
-        let model = Llama::load(&loader, &config)?;
+
+        // XorSparse: if requested and a pre-built `model.sparse` exists, load it
+        // so the engine streams the smaller sparse blobs. Otherwise the engine
+        // ternarizes+re-encodes on the fly (also triggered by XORNET_WEIGHT_FMT).
+        let sparse_file = if crate::nn::dynamic_linear::sparse_requested() {
+            model_dir
+                .join("model.sparse")
+                .exists()
+                .then(|| SparseFile::open(&model_dir.join("model.sparse")).ok())
+                .flatten()
+        } else {
+            None
+        };
+        let model = Llama::load(&loader, &config, sparse_file.as_ref())?;
         Ok((model, config))
     }
 
@@ -99,7 +112,7 @@ impl AutoModelForCausalLM {
         let repo = SafeTensorRepo::load(&filenames)?;
         let loader = SafeTensorLoader::new(&repo);
 
-        let model = Llama::load(&loader, &config)?;
+        let model = Llama::load(&loader, &config, None)?;
         Ok((model, config))
     }
 }

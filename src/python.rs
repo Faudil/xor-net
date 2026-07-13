@@ -32,7 +32,7 @@ impl QuantizationConfigPy {
             _ => return Err(PyRuntimeError::new_err(format!("Unknown lm_head config: {lm_head}"))),
         };
         Ok(Self {
-            inner: QuantizationConfig::Bit1_58(pack, lm_head_config),
+            inner: QuantizationConfig::Bit1_58(pack, lm_head_config, true),
         })
     }
 }

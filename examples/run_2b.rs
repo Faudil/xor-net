@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
     let model_path = std::env::args().nth(1).unwrap_or_else(|| {
         "/home/faudil/RustroverProjects/XorNet/models/bitnet-2b".to_string()
     });
-    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4);
+    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, true);
 
     let load_start = Instant::now();
     let (model, config) = if Path::new(&model_path).is_dir() {

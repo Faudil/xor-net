@@ -10,9 +10,9 @@ fn main() -> anyhow::Result<()> {
     let qtype = std::env::args().nth(2).unwrap_or_else(|| "none".to_string());
 
     let quantization = match qtype.to_lowercase().as_str() {
-        "bit1_58_int4" | "int4" => QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4),
-        "bit1_58_int8" | "int8" => QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8),
-        "bit1_58_f32" | "f32" => QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::F32),
+        "bit1_58_int4" | "int4" => QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, true),
+        "bit1_58_int8" | "int8" => QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8, true),
+        "bit1_58_f32" | "f32" => QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::F32, true),
         _ => QuantizationConfig::None,
     };
 

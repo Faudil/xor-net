@@ -6,6 +6,9 @@ use memmap2::Mmap;
 use crate::tensor::FastTensor;
 use crate::bit1_58::quantization::{pack_1_58bit_4pack, pack_1_58bit_5pack, unpack_1_58bit_4pack, unpack_1_58bit_5pack, TernaryPackType};
 
+pub mod sparse_loader;
+pub use sparse_loader::SparseFile;
+
 fn convert_to_f32_vec(bytes: &[u8], dtype: Dtype) -> anyhow::Result<Vec<f32>> {
     match dtype {
         Dtype::F32 => {
@@ -241,6 +244,16 @@ impl<'a> SafeTensorLoader<'a> {
         }
     }
 
+    /// The fully-qualified tensor name for `name` under this loader's prefix
+    /// (matches the safetensors key). Used to look tensors up in a `SparseFile`.
+    pub(crate) fn full_name(&self, name: &str) -> String {
+        if self.prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}.{}", self.prefix, name)
+        }
+    }
+
     pub fn get(&self, shape: &[usize], name: &str) -> anyhow::Result<FastTensor> {
         let key = if self.prefix.is_empty() {
             name.to_string()
@@ -424,4 +437,11 @@ impl<'a> SafeTensorLoader<'a> {
             expected_shape
         )
     }
+}
+
+/// Convenience: decode a single scalar scale tensor (used by the
+/// `convert_sparse` tool) to its `f32` value.
+pub fn convert_scale_bytes(bytes: &[u8], dtype: Dtype) -> anyhow::Result<f32> {
+    let v = convert_to_f32_vec(bytes, dtype)?;
+    Ok(v[0])
 }

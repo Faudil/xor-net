@@ -1,7 +1,11 @@
 use rayon::prelude::*;
 use crate::tensor::FastTensor;
-use super::quantization::{TernaryPackType, pack_1_58bit_4pack, pack_1_58bit_5pack, quantize_f32_to_i8};
+use super::quantization::{
+    TernaryPackType, pack_1_58bit_4pack, pack_1_58bit_5pack, unpack_1_58bit_4pack,
+    unpack_1_58bit_5pack, quantize_f32_to_i8,
+};
 use super::simd::{ternary_dot_product_pack4, ternary_dot_product_pack5};
+use super::sparse::{SparseTernary, encode_sparse_row_into};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -14,6 +18,14 @@ fn ternary_dot(pack_type: TernaryPackType, input: &[i8], weights: &[u8], n: usiz
     }
 }
 
+/// Storage backing a [`TernaryLinear`]. Dense keeps the packed (pack4/pack5)
+/// weights; Sparse keeps the lossless XorSparse blobs (only non-zero signs).
+#[derive(Debug, Clone)]
+pub enum TernaryRep {
+    Dense(Vec<u8>),
+    Sparse(SparseTernary),
+}
+
 /// Time spent in the MLP activation (SiLU/ReLU2) + the silu->i8 quantization
 /// pass, across all tokens. Used to confirm how much of the MLP budget the
 /// scalar `exp()` loop accounts for (and to verify the vectorized replacement).
@@ -21,11 +33,58 @@ pub static TIME_SILU: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct TernaryLinear {
-    pub packed_weights: Vec<u8>,
+    pub rep: TernaryRep,
     pub in_dim: usize,
     pub out_dim: usize,
     pub pack_type: TernaryPackType,
     pub w_scales: Vec<f32>,
+}
+
+/// Ternarize one row of f32 weights into `{-1, 0, +1}` (as `i8`) and return the
+/// per-row scale. Mirrors the scale logic in [`TernaryLinear::new`].
+fn ternarize_row(row: &[f32], provided_scale: Option<f32>, already_ternary: bool) -> (Vec<i8>, f32) {
+    if already_ternary {
+        let s = provided_scale.unwrap_or(1.0);
+        let vals: Vec<i8> = row.iter().map(|&w| w as i8).collect();
+        (vals, s)
+    } else {
+        match provided_scale {
+            Some(s) => {
+                let vals = row
+                    .iter()
+                    .map(|&w| {
+                        let q = (w / s).round().max(-1.0).min(1.0);
+                        if q < -0.5 {
+                            -1
+                        } else if q > 0.5 {
+                            1
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                (vals, s)
+            }
+            None => {
+                let sum_abs: f32 = row.iter().map(|x| x.abs()).sum();
+                let s = if row.is_empty() { 1.0 } else { sum_abs / row.len() as f32 };
+                let vals = row
+                    .iter()
+                    .map(|&w| {
+                        let q = (w / s).round().max(-1.0).min(1.0);
+                        if q < -0.5 {
+                            -1
+                        } else if q > 0.5 {
+                            1
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                (vals, s)
+            }
+        }
+    }
 }
 
 impl TernaryLinear {
@@ -78,12 +137,126 @@ impl TernaryLinear {
         }
         
         Ok(Self {
-            packed_weights,
+            rep: TernaryRep::Dense(packed_weights),
             in_dim,
             out_dim,
             pack_type,
             w_scales,
         })
+    }
+
+    /// Build a lossless sparse (XorSparse) ternary linear from f32 weights,
+    /// ternarizing each row exactly as [`TernaryLinear::new`] does, then encoding
+    /// only the non-zero signs. Bit-exact to the dense path on decode.
+    pub fn new_sparse(
+        in_dim: usize,
+        out_dim: usize,
+        weights_f32: &[f32],
+        pack_type: TernaryPackType,
+        provided_scale: Option<f32>,
+    ) -> anyhow::Result<Self> {
+        if weights_f32.len() != in_dim * out_dim {
+            anyhow::bail!("Weight length must match in_dim * out_dim");
+        }
+        let already_ternary = weights_f32.iter().all(|&w| w == -1.0 || w == 0.0 || w == 1.0);
+        let mut blob = Vec::new();
+        let mut row_offsets = Vec::with_capacity(out_dim);
+        let mut w_scales = Vec::with_capacity(out_dim);
+        for row in weights_f32.chunks(in_dim) {
+            let (vals, scale) = ternarize_row(row, provided_scale, already_ternary);
+            w_scales.push(scale);
+            row_offsets.push(blob.len());
+            encode_sparse_row_into(&mut blob, &vals, in_dim);
+        }
+        let st = SparseTernary::from_blob(blob, out_dim);
+        Ok(Self {
+            rep: TernaryRep::Sparse(st),
+            in_dim,
+            out_dim,
+            pack_type,
+            w_scales,
+        })
+    }
+
+    /// Build a sparse ternary linear from already-packed (pack4/pack5) weights,
+    /// unpacking to ternary values then re-encoding as XorSparse. Lossless.
+    pub fn new_sparse_from_packed(
+        packed: Vec<u8>,
+        in_dim: usize,
+        out_dim: usize,
+        pack_type: TernaryPackType,
+        w_scales: Vec<f32>,
+    ) -> anyhow::Result<Self> {
+        let expected_len = in_dim * out_dim;
+        let ternary = match pack_type {
+            TernaryPackType::Pack4 => unpack_1_58bit_4pack(&packed, expected_len),
+            TernaryPackType::Pack5 => unpack_1_58bit_5pack(&packed, expected_len),
+        };
+        let ternary_i8: Vec<i8> = ternary.iter().map(|&w| w as i8).collect();
+        let mut blob = Vec::new();
+        let mut row_offsets = Vec::with_capacity(out_dim);
+        for r in 0..out_dim {
+            row_offsets.push(blob.len());
+            encode_sparse_row_into(&mut blob, &ternary_i8[r * in_dim..], in_dim);
+        }
+        let st = SparseTernary::from_blob(blob, out_dim);
+        Ok(Self {
+            rep: TernaryRep::Sparse(st),
+            in_dim,
+            out_dim,
+            pack_type,
+            w_scales,
+        })
+    }
+
+    /// Dot product of output row `row` against the (already i8-quantised) input.
+    /// Dispatches to the dense packed kernel or the XorSparse kernel depending on
+    /// the storage backing.
+    #[inline]
+    pub fn dot_row(&self, row: usize, input: &[i8], n: usize) -> i32 {
+        match &self.rep {
+            TernaryRep::Dense(pw) => {
+                let bpr = match self.pack_type {
+                    TernaryPackType::Pack4 => (self.in_dim + 3) / 4,
+                    TernaryPackType::Pack5 => (self.in_dim + 4) / 5,
+                };
+                let w = &pw[row * bpr..(row + 1) * bpr];
+                ternary_dot(self.pack_type, input, w, n)
+            }
+            TernaryRep::Sparse(s) => {
+                let (m, sg) = s.blocks(row);
+                crate::bit1_58::simd::ternary_dot_product_sparse(input, m, sg, s.num_blocks, n)
+            }
+        }
+    }
+
+    /// Bytes of weight memory streamed from RAM per token (bandwidth estimate).
+    pub fn packed_bytes(&self) -> usize {
+        match &self.rep {
+            TernaryRep::Dense(pw) => pw.len(),
+            TernaryRep::Sparse(s) => s.blob.len(),
+        }
+    }
+
+    /// Pointer to the leading bytes of the weight storage (for non-temporal
+    /// prefetch). `None` for empty weights.
+    pub fn prefetch_ptr(&self) -> Option<*const u8> {
+        match &self.rep {
+            TernaryRep::Dense(pw) => {
+                if pw.is_empty() {
+                    None
+                } else {
+                    Some(pw.as_ptr())
+                }
+            }
+            TernaryRep::Sparse(s) => {
+                if s.blob.is_empty() {
+                    None
+                } else {
+                    Some(s.blob.as_ptr())
+                }
+            }
+        }
     }
 
     pub fn forward(&self, xs: &FastTensor) -> anyhow::Result<FastTensor> {
@@ -105,11 +278,6 @@ impl TernaryLinear {
         
         let mut out_data = crate::tensor::workspace::get_pooled_buffer(b_size * out_dim);
         
-        let bytes_per_row = match self.pack_type {
-            TernaryPackType::Pack4 => (in_dim + 3) / 4,
-            TernaryPackType::Pack5 => (in_dim + 4) / 5,
-        };
-        
         if b_size == 1 {
             let in_row = &input_slice[0 .. in_dim];
             let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(in_dim);
@@ -122,11 +290,7 @@ impl TernaryLinear {
                 let start_o = chunk_idx * chunk_size;
                 for (i, out_val) in out_chunk.iter_mut().enumerate() {
                     let o = start_o + i;
-                    let w_row = &self.packed_weights[o * bytes_per_row .. (o + 1) * bytes_per_row];
-                    let dot_i32 = match self.pack_type {
-                        TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_in, w_row, in_dim),
-                        TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_in, w_row, in_dim),
-                    };
+                    let dot_i32 = self.dot_row(o, &quantized_in, in_dim);
                     *out_val = dot_i32 as f32 * inv_scale * self.w_scales[o];
                 }
             });
@@ -138,11 +302,7 @@ impl TernaryLinear {
                 let inv_scale = quantize_f32_to_i8(in_row, &mut quantized_in);
                 
                 for o in 0..out_dim {
-                    let w_row = &self.packed_weights[o * bytes_per_row .. (o + 1) * bytes_per_row];
-                    let dot_i32 = match self.pack_type {
-                        TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_in, w_row, in_dim),
-                        TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_in, w_row, in_dim),
-                    };
+                    let dot_i32 = self.dot_row(o, &quantized_in, in_dim);
                     out_row[o] = dot_i32 as f32 * inv_scale * self.w_scales[o];
                 }
                 crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
@@ -169,11 +329,6 @@ impl TernaryLinear {
         
         let mut out_data = crate::tensor::workspace::get_pooled_buffer(out_dim);
         
-        let bytes_per_row = match self.pack_type {
-            TernaryPackType::Pack4 => (in_dim + 3) / 4,
-            TernaryPackType::Pack5 => (in_dim + 4) / 5,
-        };
-        
         let num_threads = crate::util::get_num_threads();
         let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
         
@@ -181,11 +336,7 @@ impl TernaryLinear {
             let start_o = chunk_idx * chunk_size;
             for (i, out_val) in out_chunk.iter_mut().enumerate() {
                 let o = start_o + i;
-                let w_row = &self.packed_weights[o * bytes_per_row .. (o + 1) * bytes_per_row];
-                let dot_i32 = match self.pack_type {
-                    TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                    TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                };
+                let dot_i32 = self.dot_row(o, quantized_in, in_dim);
                 *out_val = dot_i32 as f32 * inv_scale * self.w_scales[o];
             }
         });
@@ -208,11 +359,6 @@ impl TernaryLinear {
         let mut k_out = crate::tensor::workspace::get_pooled_buffer(k_lin.out_dim);
         let mut v_out = crate::tensor::workspace::get_pooled_buffer(v_lin.out_dim);
 
-        let bytes_per_row = match q_lin.pack_type {
-            TernaryPackType::Pack4 => (in_dim + 3) / 4,
-            TernaryPackType::Pack5 => (in_dim + 4) / 5,
-        };
-
         let q_out_dim = q_lin.out_dim;
         let k_out_dim = k_lin.out_dim;
         let total_rows = q_out_dim + k_out_dim + v_lin.out_dim;
@@ -226,28 +372,21 @@ impl TernaryLinear {
         let q_ptr: usize = q_out.as_mut_ptr() as usize;
         let k_ptr: usize = k_out.as_mut_ptr() as usize;
         let v_ptr: usize = v_out.as_mut_ptr() as usize;
-        let q_packed = &q_lin.packed_weights;
-        let k_packed = &k_lin.packed_weights;
-        let v_packed = &v_lin.packed_weights;
         let q_w = &q_lin.w_scales;
         let k_w = &k_lin.w_scales;
         let v_w = &v_lin.w_scales;
-        let pack_type = q_lin.pack_type;
 
         let compute_row = |row_idx: usize| {
             if row_idx < q_out_dim {
-                let w_row = &q_packed[row_idx * bytes_per_row..(row_idx + 1) * bytes_per_row];
-                let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                let dot = q_lin.dot_row(row_idx, quantized_in, in_dim);
                 unsafe { *(q_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * q_w[row_idx]; }
             } else if row_idx < q_out_dim + k_out_dim {
                 let kr = row_idx - q_out_dim;
-                let w_row = &k_packed[kr * bytes_per_row..(kr + 1) * bytes_per_row];
-                let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                let dot = k_lin.dot_row(kr, quantized_in, in_dim);
                 unsafe { *(k_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * k_w[kr]; }
             } else {
                 let vr = row_idx - q_out_dim - k_out_dim;
-                let w_row = &v_packed[vr * bytes_per_row..(vr + 1) * bytes_per_row];
-                let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                let dot = v_lin.dot_row(vr, quantized_in, in_dim);
                 unsafe { *(v_ptr as *mut f32).add(vr) = dot as f32 * inv_scale * v_w[vr]; }
             }
         };
@@ -297,11 +436,6 @@ impl TernaryLinear {
         let mut fc1_out = crate::tensor::workspace::get_pooled_buffer(fc1_lin.out_dim);
         let mut fc2_out = crate::tensor::workspace::get_pooled_buffer(fc2_lin.out_dim);
 
-        let bytes_per_row = match fc1_lin.pack_type {
-            TernaryPackType::Pack4 => (in_dim + 3) / 4,
-            TernaryPackType::Pack5 => (in_dim + 4) / 5,
-        };
-
         let fc1_out_dim = fc1_lin.out_dim;
         let total_rows = fc1_out_dim + fc2_lin.out_dim;
 
@@ -310,21 +444,16 @@ impl TernaryLinear {
 
         let fc1_ptr: usize = fc1_out.as_mut_ptr() as usize;
         let fc2_ptr: usize = fc2_out.as_mut_ptr() as usize;
-        let fc1_packed = &fc1_lin.packed_weights;
-        let fc2_packed = &fc2_lin.packed_weights;
         let fc1_w = &fc1_lin.w_scales;
         let fc2_w = &fc2_lin.w_scales;
-        let pack_type = fc1_lin.pack_type;
 
         let compute_row = |row_idx: usize| {
             if row_idx < fc1_out_dim {
-                let w_row = &fc1_packed[row_idx * bytes_per_row..(row_idx + 1) * bytes_per_row];
-                let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                let dot = fc1_lin.dot_row(row_idx, quantized_in, in_dim);
                 unsafe { *(fc1_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * fc1_w[row_idx]; }
             } else {
                 let kr = row_idx - fc1_out_dim;
-                let w_row = &fc2_packed[kr * bytes_per_row..(kr + 1) * bytes_per_row];
-                let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                let dot = fc2_lin.dot_row(kr, quantized_in, in_dim);
                 unsafe { *(fc2_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * fc2_w[kr]; }
             }
         };
@@ -384,15 +513,6 @@ impl TernaryLinear {
         let mut gate_buf = crate::tensor::workspace::get_pooled_buffer(inter);
         let mut up_buf   = crate::tensor::workspace::get_pooled_buffer(inter);
 
-        let bytes_gate = match gate_lin.pack_type {
-            TernaryPackType::Pack4 => (in_dim + 3) / 4,
-            TernaryPackType::Pack5 => (in_dim + 4) / 5,
-        };
-        let bytes_down = match down_lin.pack_type {
-            TernaryPackType::Pack4 => (inter + 3) / 4,
-            TernaryPackType::Pack5 => (inter + 4) / 5,
-        };
-
         let total_rows12 = inter + inter; // gate rows + up rows
         let num_threads  = rayon::current_num_threads();
         let chunk12      = ((total_rows12 + num_threads - 1) / num_threads).max(128);
@@ -400,22 +520,17 @@ impl TernaryLinear {
         let gate_ptr: usize = gate_buf.as_mut_ptr() as usize;
         let up_ptr:   usize = up_buf.as_mut_ptr() as usize;
 
-        let gate_packed = &gate_lin.packed_weights;
-        let up_packed   = &up_lin.packed_weights;
         let gate_w      = &gate_lin.w_scales;
         let up_w        = &up_lin.w_scales;
-        let pack_type   = gate_lin.pack_type;
 
         {
             let compute12 = |r: usize| {
                 if r < inter {
-                    let w_row = &gate_packed[r * bytes_gate..(r + 1) * bytes_gate];
-                    let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                    let dot = gate_lin.dot_row(r, quantized_in, in_dim);
                     unsafe { *(gate_ptr as *mut f32).add(r) = dot as f32 * inv_scale_in * gate_w[r]; }
                 } else {
                     let ur = r - inter;
-                    let w_row = &up_packed[ur * bytes_gate..(ur + 1) * bytes_gate];
-                    let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                    let dot = up_lin.dot_row(ur, quantized_in, in_dim);
                     unsafe { *(up_ptr as *mut f32).add(ur) = dot as f32 * inv_scale_in * up_w[ur]; }
                 }
             };
@@ -457,12 +572,10 @@ impl TernaryLinear {
             let mut down_buf = crate::tensor::workspace::get_pooled_buffer(out_dim);
             let chunk3 = ((out_dim + num_threads - 1) / num_threads).max(128);
             let down_ptr: usize = down_buf.as_mut_ptr() as usize;
-            let down_packed = &down_lin.packed_weights;
             let down_w = &down_lin.w_scales;
             {
                 let compute_down = |r: usize| {
-                    let w_row = &down_packed[r * bytes_down..(r + 1) * bytes_down];
-                    let dot = ternary_dot(pack_type, &quantized_mid, w_row, inter);
+                    let dot = down_lin.dot_row(r, &quantized_mid, inter);
                     unsafe { *(down_ptr as *mut f32).add(r) = dot as f32 * inv_scale_mid * down_w[r]; }
                 };
                 let next_row3 = AtomicU64::new(0);
@@ -500,12 +613,10 @@ impl TernaryLinear {
         let mut down_buf = crate::tensor::workspace::get_pooled_buffer(out_dim);
         let chunk3    = ((out_dim + num_threads - 1) / num_threads).max(128);
         let down_ptr: usize = down_buf.as_mut_ptr() as usize;
-        let down_packed = &down_lin.packed_weights;
         let down_w      = &down_lin.w_scales;
         {
             let compute_down = |r: usize| {
-                let w_row = &down_packed[r * bytes_down..(r + 1) * bytes_down];
-                let dot = ternary_dot(pack_type, &quantized_mid, w_row, inter);
+                let dot = down_lin.dot_row(r, &quantized_mid, inter);
                 unsafe { *(down_ptr as *mut f32).add(r) = dot as f32 * inv_scale_mid * down_w[r]; }
             };
             let next_row3 = AtomicU64::new(0);
@@ -559,11 +670,6 @@ impl TernaryLinear {
         let mut gate_buf = crate::tensor::workspace::get_pooled_buffer(inter);
         let mut up_buf   = crate::tensor::workspace::get_pooled_buffer(inter);
 
-        let bytes_gate = match gate_lin.pack_type {
-            TernaryPackType::Pack4 => (in_dim + 3) / 4,
-            TernaryPackType::Pack5 => (in_dim + 4) / 5,
-        };
-
         let total_rows12 = inter + inter; // gate rows + up rows
         let num_threads  = rayon::current_num_threads();
         let chunk12      = ((total_rows12 + num_threads - 1) / num_threads).max(128);
@@ -571,22 +677,17 @@ impl TernaryLinear {
         let gate_ptr: usize = gate_buf.as_mut_ptr() as usize;
         let up_ptr:   usize = up_buf.as_mut_ptr() as usize;
 
-        let gate_packed = &gate_lin.packed_weights;
-        let up_packed   = &up_lin.packed_weights;
         let gate_w      = &gate_lin.w_scales;
         let up_w        = &up_lin.w_scales;
-        let pack_type   = gate_lin.pack_type;
 
         {
             let compute12 = |r: usize| {
                 if r < inter {
-                    let w_row = &gate_packed[r * bytes_gate..(r + 1) * bytes_gate];
-                    let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                    let dot = gate_lin.dot_row(r, quantized_in, in_dim);
                     unsafe { *(gate_ptr as *mut f32).add(r) = dot as f32 * inv_scale_in * gate_w[r]; }
                 } else {
                     let ur = r - inter;
-                    let w_row = &up_packed[ur * bytes_gate..(ur + 1) * bytes_gate];
-                    let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                    let dot = up_lin.dot_row(ur, quantized_in, in_dim);
                     unsafe { *(up_ptr as *mut f32).add(ur) = dot as f32 * inv_scale_in * up_w[ur]; }
                 }
             };

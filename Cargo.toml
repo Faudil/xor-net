@@ -66,6 +66,10 @@ path = "examples/dump_logits_for_compare.rs"
 name = "check_8b_accuracy"
 path = "examples/check_8b_accuracy.rs"
 
+[[bin]]
+name = "convert_sparse"
+path = "src/bin/convert_sparse.rs"
+
 [dependencies]
 anyhow = "1.0.103"
 candle-core = "0.11.0"

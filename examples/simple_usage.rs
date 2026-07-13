@@ -9,7 +9,7 @@ fn main() -> anyhow::Result<()> {
     let model_path = "/home/faudil/RustroverProjects/XorNet/models/bitnet-2b";
     let (model, config) = AutoModelForCausalLM::from_local(
         Path::new(model_path), 
-        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4)
+        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, true)
     )?;
     
     let tokenizer_path = Path::new(model_path).join("tokenizer.json");

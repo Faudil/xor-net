@@ -3,7 +3,7 @@
 
 use crate::tensor::FastTensor;
 use crate::nn::FastRmsNorm;
-use crate::loader::SafeTensorLoader;
+use crate::loader::{SafeTensorLoader, sparse_loader::SparseFile};
 use crate::models::llama::{
     attention::CausalSelfAttention, mlp::Mlp, Cache, Config, TIME_ATTN_GEMV, TIME_MLP_GEMV, TIME_NORM,
 };
@@ -62,9 +62,9 @@ impl Block {
         result
     }
 
-    pub(crate) fn load(loader: SafeTensorLoader, cfg: &Config) -> anyhow::Result<Self> {
-        let attn = CausalSelfAttention::load(loader.pp("self_attn"), cfg)?;
-        let mlp = Mlp::load(loader.pp("mlp"), cfg)?;
+    pub(crate) fn load(loader: SafeTensorLoader, cfg: &Config, sparse: Option<&SparseFile>) -> anyhow::Result<Self> {
+        let attn = CausalSelfAttention::load(loader.pp("self_attn"), cfg, sparse)?;
+        let mlp = Mlp::load(loader.pp("mlp"), cfg, sparse)?;
         let rms_1 = FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("input_layernorm"))?;
         let rms_2 =
             FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("post_attention_layernorm"))?;

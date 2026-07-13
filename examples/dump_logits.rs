@@ -6,7 +6,7 @@ use std::time::Instant;
 fn main() {
     let (model, config) = AutoModelForCausalLM::from_pretrained(
         "1bitLLM/bitnet_b1_58-3B", 
-        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8)
+        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8, true)
     ).unwrap();
 
     let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];

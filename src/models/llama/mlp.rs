@@ -4,7 +4,7 @@
 use crate::tensor::FastTensor;
 use crate::nn::{DynamicLinear, FastRmsNorm};
 use crate::nn::dynamic_linear::LinearKind;
-use crate::loader::SafeTensorLoader;
+use crate::loader::{SafeTensorLoader, sparse_loader::SparseFile};
 use crate::models::llama::{Activation, Config, TIME_MLP_DOWN};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// packed ternary weights (no-op for non-ternary projections).
 fn prefetch_proj(lin: &DynamicLinear) {
     if let LinearKind::Ternary(t) = &lin.inner {
-        if !t.packed_weights.is_empty() {
-            unsafe { crate::models::llama::prefetch_weight(t.packed_weights.as_ptr()) };
+        if let Some(ptr) = t.prefetch_ptr() {
+            unsafe { crate::models::llama::prefetch_weight(ptr); }
         }
     }
 }
@@ -21,7 +21,7 @@ fn prefetch_proj(lin: &DynamicLinear) {
 /// Bytes of packed ternary weight memory for a projection (0 if not ternary).
 fn proj_bytes(lin: &DynamicLinear) -> usize {
     match &lin.inner {
-        LinearKind::Ternary(t) => t.packed_weights.len(),
+        LinearKind::Ternary(t) => t.packed_bytes(),
         _ => 0,
     }
 }
@@ -144,15 +144,15 @@ impl Mlp {
         proj_bytes(&self.c_fc1) + proj_bytes(&self.c_fc2) + proj_bytes(&self.c_proj)
     }
 
-    pub(crate) fn load(loader: SafeTensorLoader, cfg: &Config) -> anyhow::Result<Self> {
+    pub(crate) fn load(loader: SafeTensorLoader, cfg: &Config, sparse: Option<&SparseFile>) -> anyhow::Result<Self> {
         let h_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
         let c_fc1 =
-            DynamicLinear::load(h_size, i_size, &loader.pp("gate_proj"), "weight", cfg.quantization_config)?;
+            DynamicLinear::load(h_size, i_size, &loader.pp("gate_proj"), "weight", cfg.quantization_config, sparse)?;
         let c_fc2 =
-            DynamicLinear::load(h_size, i_size, &loader.pp("up_proj"), "weight", cfg.quantization_config)?;
+            DynamicLinear::load(h_size, i_size, &loader.pp("up_proj"), "weight", cfg.quantization_config, sparse)?;
         let c_proj =
-            DynamicLinear::load(i_size, h_size, &loader.pp("down_proj"), "weight", cfg.quantization_config)?;
+            DynamicLinear::load(i_size, h_size, &loader.pp("down_proj"), "weight", cfg.quantization_config, sparse)?;
         let ffn_layernorm = if loader.pp("ffn_layernorm").has_tensor("weight") {
             Some(FastRmsNorm::load(i_size, cfg.rms_norm_eps as f32, &loader.pp("ffn_layernorm"))?)
         } else if loader.pp("ffn_sub_norm").has_tensor("weight") {

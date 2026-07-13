@@ -4,7 +4,7 @@
 use crate::tensor::FastTensor;
 use crate::nn::{DynamicLinear, FastRmsNorm};
 use crate::nn::dynamic_linear::LinearKind;
-use crate::loader::SafeTensorLoader;
+use crate::loader::{SafeTensorLoader, sparse_loader::SparseFile};
 use crate::models::llama::{Cache, Config};
 use anyhow::Result;
 
@@ -12,8 +12,8 @@ use anyhow::Result;
 /// packed ternary weights (no-op for non-ternary projections).
 fn prefetch_proj(lin: &DynamicLinear) {
     if let LinearKind::Ternary(t) = &lin.inner {
-        if !t.packed_weights.is_empty() {
-            unsafe { crate::models::llama::prefetch_weight(t.packed_weights.as_ptr()) };
+        if let Some(ptr) = t.prefetch_ptr() {
+            unsafe { crate::models::llama::prefetch_weight(ptr); }
         }
     }
 }
@@ -21,7 +21,7 @@ fn prefetch_proj(lin: &DynamicLinear) {
 /// Bytes of packed ternary weight memory for a projection (0 if not ternary).
 fn proj_bytes(lin: &DynamicLinear) -> usize {
     match &lin.inner {
-        LinearKind::Ternary(t) => t.packed_weights.len(),
+        LinearKind::Ternary(t) => t.packed_bytes(),
         _ => 0,
     }
 }
@@ -130,19 +130,19 @@ impl CausalSelfAttention {
             + proj_bytes(&self.o_proj)
     }
 
-    pub(crate) fn load(loader: SafeTensorLoader, cfg: &Config) -> Result<Self> {
+    pub(crate) fn load(loader: SafeTensorLoader, cfg: &Config, sparse: Option<&SparseFile>) -> Result<Self> {
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
         let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
 
         let q_proj =
-            DynamicLinear::load(size_in, size_q, &loader.pp("q_proj"), "weight", cfg.quantization_config)?;
+            DynamicLinear::load(size_in, size_q, &loader.pp("q_proj"), "weight", cfg.quantization_config, sparse)?;
         let k_proj =
-            DynamicLinear::load(size_in, size_kv, &loader.pp("k_proj"), "weight", cfg.quantization_config)?;
+            DynamicLinear::load(size_in, size_kv, &loader.pp("k_proj"), "weight", cfg.quantization_config, sparse)?;
         let v_proj =
-            DynamicLinear::load(size_in, size_kv, &loader.pp("v_proj"), "weight", cfg.quantization_config)?;
+            DynamicLinear::load(size_in, size_kv, &loader.pp("v_proj"), "weight", cfg.quantization_config, sparse)?;
         let o_proj =
-            DynamicLinear::load(size_q, size_in, &loader.pp("o_proj"), "weight", cfg.quantization_config)?;
+            DynamicLinear::load(size_q, size_in, &loader.pp("o_proj"), "weight", cfg.quantization_config, sparse)?;
 
         let inner_attn_ln = if loader.pp("inner_attn_ln").has_tensor("weight") {
             Some(FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("inner_attn_ln"))?)

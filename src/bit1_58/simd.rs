@@ -412,3 +412,272 @@ pub fn ternary_dot_product_pack5_scalar(a_i8: &[i8], b_pack5: &[u8], total_elems
     
     total_sum
 }
+
+// ===========================================================================
+// XorSparse lossless sparse ternary dot product
+// ===========================================================================
+
+/// Dot product of one block of 64 activations against the ternary weight signs
+/// described by `mask` (non-zero positions) and `sb` (sign bits: 1 => -1).
+/// `a` holds the 64 activations (i8); only the low `a.len()` lanes are valid
+/// Scalar XorSparse row dot product. Consumes the decoded per-block lane-order
+/// `masks`/`signs` (no parsing, no set-order expansion).
+pub fn ternary_dot_product_sparse_scalar(
+    a_i8: &[i8],
+    masks: &[u64],
+    signs: &[u64],
+    num_blocks: usize,
+    in_dim: usize,
+) -> i32 {
+    let mut total = 0i32;
+    for b in 0..num_blocks {
+        let mask = masks[b];
+        let k2 = signs[b];
+        let start = b * 64;
+        let end = (start + 64).min(in_dim);
+        total += dot_block_sparse_scalar(&a_i8[start..end], mask, k2);
+    }
+    total
+}
+
+/// One 64-lane block, scalar fallback. `k2` is the lane-order sign mask (bit *k*
+/// set ⇒ weight at lane *k* is `-1`).
+#[inline]
+fn dot_block_sparse_scalar(a: &[i8], mask: u64, k2: u64) -> i32 {
+    let mut acc = 0i32;
+    let mut bit = 0;
+    let mut m = mask;
+    while m != 0 {
+        if m & 1 != 0 {
+            let sign = if (k2 >> bit) & 1 != 0 { -1 } else { 1 };
+            acc += a[bit] as i32 * sign;
+        }
+        m >>= 1;
+        bit += 1;
+    }
+    acc
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn ternary_dot_block_avx512(a: __m512i, mask: u64, k2: u64) -> __m512i {
+    use core::arch::x86_64::*;
+    let ones_u8 = _mm512_set1_epi8(1);
+    let ones_i16 = _mm512_set1_epi16(1);
+    let zero = _mm512_setzero_si512();
+
+    // `k2` is the lane-order sign mask (bit *k* set ⇒ weight at lane *k* is `-1`).
+    let k1 = _load_mask64(&mask);
+    let k2m = _load_mask64(&k2);
+    let k_pos = _kandn_mask64(k2m, k1); // +1 positions
+    let k_neg = _kand_mask64(k1, k2m); // -1 positions
+
+    // Signed product sa = a*w in one fused step: -a at neg lanes, +a at pos
+    // lanes, 0 elsewhere. `mask_sub(src, k, a, b) = k ? a - b : src` and
+    // `mask_add(src, k, a, b) = k ? a + b : src`.
+    let t = _mm512_mask_sub_epi8(zero, k_neg, zero, a); // -a at neg, 0 else
+    let sa = _mm512_mask_add_epi8(t, k_pos, zero, a); // +a at pos, else t
+    _mm512_madd_epi16(_mm512_maddubs_epi16(ones_u8, sa), ones_i16)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn ternary_dot_product_sparse_avx512(
+    a_i8: &[i8],
+    masks: &[u64],
+    signs: &[u64],
+    num_blocks: usize,
+    in_dim: usize,
+) -> i32 {
+    use core::arch::x86_64::*;
+    let a_ptr = a_i8.as_ptr();
+    let zero = _mm512_setzero_si512();
+    let mut acc = [zero; 16];
+    let mut block_idx = 0usize;
+
+    for b in 0..num_blocks {
+        let mask = masks[b];
+        let k2 = signs[b];
+        let start = b * 64;
+        let n = (start + 64).min(in_dim) - start;
+        // The final block may be short; fall back to scalar for it.
+        if b + 1 == num_blocks && n < 64 {
+            let mut tmp = [0i8; 64];
+            tmp[..n].copy_from_slice(&a_i8[start..start + n]);
+            let d = dot_block_sparse_scalar(&tmp[..n], mask, k2);
+            let mut merged = acc[block_idx % 16];
+            merged = _mm512_add_epi32(merged, _mm512_set1_epi32(d));
+            acc[block_idx % 16] = merged;
+            break;
+        }
+
+        let a = _mm512_loadu_si512(a_ptr.add(start) as *const __m512i);
+        let partial = ternary_dot_block_avx512(a, mask, k2);
+        acc[block_idx % 16] = _mm512_add_epi32(acc[block_idx % 16], partial);
+        block_idx += 1;
+    }
+
+    let mut merged = acc[0];
+    for k in 1..16 {
+        merged = _mm512_add_epi32(merged, acc[k]);
+    }
+    let mut tmp = [0i32; 16];
+    _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, merged);
+    tmp.iter().sum::<i32>()
+}
+
+/// XorSparse row dot product. Consumes the decoded per-block lane-order
+/// `masks`/`signs` (built once at load). Dispatches to the AVX-512 kernel when
+/// available, otherwise scalar.
+pub fn ternary_dot_product_sparse(
+    a_i8: &[i8],
+    masks: &[u64],
+    signs: &[u64],
+    num_blocks: usize,
+    in_dim: usize,
+) -> i32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            return unsafe {
+                ternary_dot_product_sparse_avx512(a_i8, masks, signs, num_blocks, in_dim)
+            };
+        }
+    }
+    ternary_dot_product_sparse_scalar(a_i8, masks, signs, num_blocks, in_dim)
+}
+
+#[cfg(test)]
+mod sparse_correctness_tests {
+    use crate::bit1_58::quantization::pack_1_58bit_4pack;
+    use crate::bit1_58::sparse::{encode_sparse_tensor, SparseTernary};
+
+    // Simple deterministic LCG so the test needs no external deps.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn random_dense(in_dim: usize, out_dim: usize, rng: &mut Lcg) -> Vec<f32> {
+        (0..out_dim * in_dim)
+            .map(|_| match rng.below(3) {
+                0 => -1.0,
+                1 => 0.0,
+                _ => 1.0,
+            })
+            .collect()
+    }
+
+    fn random_act(n: usize, rng: &mut Lcg) -> Vec<i8> {
+        (0..n).map(|_| (rng.below(7) as i8) - 3).collect()
+    }
+
+    #[test]
+    fn dense_and_sparse_dot_match() {
+        let mut rng = Lcg(0x1234_5678_9abc_def0);
+        for (in_dim, out_dim) in [(2560, 2560), (6912, 2560), (2560, 640), (2560, 6912)] {
+            let w = random_dense(in_dim, out_dim, &mut rng);
+            let packed = pack_1_58bit_4pack(&w, 1.0);
+            let act = random_act(in_dim, &mut rng);
+
+            let bpr = (in_dim + 3) / 4;
+            let dense: Vec<i32> = (0..out_dim)
+                .map(|r| {
+                    super::ternary_dot_product_pack4(&act, &packed[r * bpr..(r + 1) * bpr], in_dim)
+                })
+                .collect();
+
+            let w_i8: Vec<i8> = w.iter().map(|&v| v as i8).collect();
+            let (blob, _offs) = encode_sparse_tensor(&w_i8, in_dim, out_dim);
+            let st = SparseTernary::from_blob(blob, out_dim);
+            let sparse: Vec<i32> = (0..out_dim)
+                .map(|r| {
+                    let (m, sg) = st.blocks(r);
+                    super::ternary_dot_product_sparse(&act, m, sg, st.num_blocks, in_dim)
+                })
+                .collect();
+            let sparse_scalar: Vec<i32> = (0..out_dim)
+                .map(|r| {
+                    let (m, sg) = st.blocks(r);
+                    super::ternary_dot_product_sparse_scalar(&act, m, sg, st.num_blocks, in_dim)
+                })
+                .collect();
+
+            for r in 0..out_dim {
+                assert_eq!(
+                    dense[r], sparse_scalar[r],
+                    "SCALAR row {} mismatch in_dim={} out_dim={} (dense={}, scalar={})",
+                    r, in_dim, out_dim, dense[r], sparse_scalar[r]
+                );
+                assert_eq!(
+                    dense[r], sparse[r],
+                    "row {} mismatch in_dim={} out_dim={} (dense={}, sparse={})",
+                    r, in_dim, out_dim, dense[r], sparse[r]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn avx_block_matches_scalar() {
+        use core::arch::x86_64::*;
+        let a: Vec<i8> = (0..64).map(|i| ((i as i8) % 5) - 2).collect();
+        let avx_a = unsafe { _mm512_loadu_si512(a.as_ptr() as *const __m512i) };
+        let mask: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+        // signs in set-order
+        let mut sb = 0u64;
+        let mut si = 0u32;
+        for k in 0..64u32 {
+            if (mask >> k) & 1 != 0 {
+                if k % 3 == 0 {
+                    sb |= 1u64 << si;
+                }
+                si += 1;
+            }
+        }
+        // expand to lane-order sign mask k2 (mirrors SparseTernary::from_blob)
+        let mut k2 = 0u64;
+        let mut s2 = 0u32;
+        let mut m = mask;
+        let mut lane = 0u32;
+        while m != 0 {
+            if m & 1 != 0 {
+                if (sb >> s2) & 1 != 0 {
+                    k2 |= 1u64 << lane;
+                }
+                s2 += 1;
+            }
+            m >>= 1;
+            lane += 1;
+        }
+        let scalar = super::dot_block_sparse_scalar(&a, mask, k2);
+        let avx = unsafe { super::ternary_dot_block_avx512(avx_a, mask, k2) };
+        let mut tmp = [0i32; 16];
+        unsafe { _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, avx) };
+        let avx_sum = tmp.iter().sum::<i32>();
+        assert_eq!(avx_sum, scalar, "avx block {} != scalar {}", avx_sum, scalar);
+    }
+
+    #[test]
+    fn sparse_decode_roundtrip() {
+        let mut rng = Lcg(0xdead_beef_cafe_babe);
+        let in_dim = 2560;
+        let out_dim = 2560;
+        let w = random_dense(in_dim, out_dim, &mut rng);
+        let w_i8: Vec<i8> = w.iter().map(|&v| v as i8).collect();
+        let (blob, _offs) = encode_sparse_tensor(&w_i8, in_dim, out_dim);
+        let st = SparseTernary::from_blob(blob, out_dim);
+        for r in 0..out_dim {
+            let decoded = st.decode_row(r, in_dim);
+            for i in 0..in_dim {
+                assert_eq!(decoded[i], w_i8[r * in_dim + i], "decode mismatch r={} i={}", r, i);
+            }
+        }
+    }
+}

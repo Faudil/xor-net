@@ -8,7 +8,7 @@ fn main() -> anyhow::Result<()> {
 
     let model_id = std::env::args().nth(1).unwrap_or_else(|| "1bitLLM/bitnet_b1_58-3B".to_string());
 
-    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::F32);
+    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::F32, true);
 
     println!("Loading {} with Bit1_58(Pack4, F32)...", model_id);
     let load_start = Instant::now();

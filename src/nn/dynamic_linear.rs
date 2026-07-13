@@ -1,9 +1,9 @@
 use rayon::prelude::*;
 use crate::tensor::FastTensor;
 use crate::bit1::layers::BitLinear;
-use crate::bit1_58::layers::TernaryLinear;
+use crate::bit1_58::layers::{TernaryLinear, TernaryRep};
 use crate::bit1_58::quantization::TernaryPackType;
-use crate::loader::SafeTensorLoader;
+use crate::loader::{SafeTensorLoader, sparse_loader::SparseFile};
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
@@ -670,7 +670,7 @@ impl DynamicLinear {
     pub fn new_ternary_direct(packed_weights: Vec<u8>, in_dim: usize, out_dim: usize, pack_type: TernaryPackType, w_scales: Vec<f32>) -> Self {
         Self {
             inner: LinearKind::Ternary(TernaryLinear {
-                packed_weights,
+                rep: TernaryRep::Dense(packed_weights),
                 in_dim,
                 out_dim,
                 pack_type,
@@ -692,7 +692,31 @@ impl DynamicLinear {
         loader: &SafeTensorLoader,
         name: &str,
         config: QuantizationConfig,
+        sparse: Option<&SparseFile>,
     ) -> anyhow::Result<Self> {
+        // 1) Offline XorSparse file (used when XORNET_WEIGHT_FMT=sparse and a
+        //    `model.sparse` is present). The file addresses tensors by their
+        //    safetensors name, so the lookup key matches exactly.
+        if let Some(sf) = sparse {
+            let full = loader.full_name(name);
+            if let Ok((st, w_scale)) = sf.get_sparse(&full, in_dim, out_dim) {
+                let w_scales = vec![w_scale; out_dim];
+                let pack_type = match &config {
+                    QuantizationConfig::Bit1_58(p, _, _) => *p,
+                    _ => TernaryPackType::Pack4,
+                };
+                return Ok(Self {
+                    inner: LinearKind::Ternary(TernaryLinear {
+                        rep: TernaryRep::Sparse(st),
+                        in_dim,
+                        out_dim,
+                        pack_type,
+                        w_scales,
+                    }),
+                });
+            }
+        }
+
         match config {
             QuantizationConfig::None => {
                 let weight = loader.get(&[out_dim, in_dim], name)?;
@@ -706,11 +730,17 @@ impl DynamicLinear {
                 if let Ok((packed_weights, w_scales, p_in, p_out)) =
                     loader.get_prepacked_ternary(&[out_dim, in_dim], name, pack_type, is_inverted_scale)
                 {
+                    if sparse_requested() {
+                        let l = TernaryLinear::new_sparse_from_packed(
+                            packed_weights, p_in, p_out, pack_type, w_scales,
+                        )?;
+                        return Ok(Self { inner: LinearKind::Ternary(l) });
+                    }
                     return Ok(Self::new_ternary_direct(
                         packed_weights, p_in, p_out, pack_type, w_scales,
                     ));
                 }
-                
+
                 let weight = loader.get(&[out_dim, in_dim], name)?;
                 // Only apply lm_head quantization to the LM head layer.
                 // For transformer layers, ternarize the FP32 weights on-the-fly.
@@ -731,10 +761,35 @@ impl DynamicLinear {
                 } else {
                     let scale_name = format!("{}_scale", name);
                     let provided_scale = loader.get(&[1], &scale_name).map(|s| s.data[0]).ok();
-                    eprintln!("Loaded scale for {}: {:?}", name, provided_scale);
-                    Self::new_ternary(in_dim, out_dim, &weight.data, pack_type, provided_scale)
+                    if sparse_requested() {
+                        let l = TernaryLinear::new_sparse(
+                            in_dim,
+                            out_dim,
+                            &weight.data,
+                            pack_type,
+                            provided_scale,
+                        )?;
+                        return Ok(Self { inner: LinearKind::Ternary(l) });
+                    }
+                    return Self::new_ternary(
+                        in_dim,
+                        out_dim,
+                        &weight.data,
+                        pack_type,
+                        provided_scale,
+                    );
                 }
             }
         }
     }
 }
+
+/// Whether `XORNET_WEIGHT_FMT=sparse` was requested. When set without a
+/// pre-built `.sparse` file, the engine ternarizes and re-encodes weights as
+/// XorSparse at load time (no separate artifact needed).
+pub fn sparse_requested() -> bool {
+    std::env::var("XORNET_WEIGHT_FMT")
+        .map(|s| s.eq_ignore_ascii_case("sparse"))
+        .unwrap_or(false)
+}
+

@@ -14,7 +14,7 @@ pub mod mlp;
 use crate::tensor::FastTensor;
 use crate::nn::{DynamicLinear, QuantizationConfig, LmHeadConfig, FastRmsNorm, CpuRingCache};
 use crate::bit1_58::quantization::TernaryPackType;
-use crate::loader::SafeTensorLoader;
+use crate::loader::{SafeTensorLoader, sparse_loader::SparseFile};
 use std::f32::consts::PI;
 
 use crate::nn::dynamic_linear::LinearKind;
@@ -359,7 +359,7 @@ pub(crate) unsafe fn prefetch_weight(_ptr: *const u8) {}
 /// on the BitNet models we run, and returning 0 keeps the estimate conservative.
 fn linear_packed_bytes(lin: &DynamicLinear) -> usize {
     match &lin.inner {
-        LinearKind::Ternary(t) => t.packed_weights.len(),
+        LinearKind::Ternary(t) => t.packed_bytes(),
         LinearKind::Int8(l) => l.weight_i8.len(),
         LinearKind::Int4(l) => l.weight_i4.len(),
         _ => 0,
@@ -509,7 +509,7 @@ impl Llama {
         Ok(logits)
     }
 
-    pub fn load(loader: &SafeTensorLoader, cfg: &Config) -> anyhow::Result<Self> {
+    pub fn load(loader: &SafeTensorLoader, cfg: &Config, sparse: Option<&SparseFile>) -> anyhow::Result<Self> {
         let wte_weight = loader.get(&[cfg.vocab_size, cfg.hidden_size], "model.embed_tokens.weight")?;
         let wte = FastEmbedding::new(wte_weight);
         // When the LM head is tied to the word embedding we control its
@@ -551,12 +551,13 @@ impl Llama {
                 &loader.pp("lm_head"),
                 "weight",
                 cfg.quantization_config,
+                sparse,
             )?
         };
         let ln_f = FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("model.norm"))?;
         let blocks: Result<Vec<_>, _> = (0..cfg.num_hidden_layers)
             .into_par_iter()
-            .map(|i| Block::load(loader.pp(format!("model.layers.{i}")), cfg))
+            .map(|i| Block::load(loader.pp(format!("model.layers.{i}")), cfg, sparse))
             .collect();
         let blocks = blocks?;
 
