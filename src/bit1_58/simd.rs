@@ -205,9 +205,113 @@ pub unsafe fn ternary_dot_product_pack4_avx2(a_i8: &[i8], b_pack4: &[u8], total_
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+pub unsafe fn ternary_dot_product_pack4_avx512_vnni(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
+    let a_ptr = a_i8.as_ptr() as *const __m512i;
+    let b_ptr = b_pack4.as_ptr();
+
+    let zero = _mm512_setzero_si512();
+    // 16 independent accumulators hide the ~5-cycle dpbusd latency.
+    let mut acc = [zero; 16];
+    let ones_u8 = _mm512_set1_epi8(1);
+    let mask3 = _mm512_set1_epi32(0x03);
+    let lut = _mm512_set_epi8(
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1,
+    );
+
+    let chunks64 = total_elems / 64;
+    let step16 = chunks64 / 16 * 16;
+    let mut idx = 0usize;
+
+    while idx < step16 {
+        _mm_prefetch(b_ptr.add(idx * 16 + 256) as *const i8, _MM_HINT_T0);
+
+        macro_rules! block {
+            ($k:expr) => {{
+                let acts = _mm512_loadu_si512(a_ptr.add(idx + $k));
+                let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(b_ptr.add((idx + $k) * 16) as *const __m128i));
+                let p0 = _mm512_and_si512(w32, mask3);
+                let p1 = _mm512_and_si512(_mm512_srli_epi32(w32, 2), mask3);
+                let p2 = _mm512_and_si512(_mm512_srli_epi32(w32, 4), mask3);
+                let p3 = _mm512_and_si512(_mm512_srli_epi32(w32, 6), mask3);
+                let packed = _mm512_or_si512(
+                    _mm512_or_si512(p0, _mm512_slli_epi32(p1, 8)),
+                    _mm512_or_si512(_mm512_slli_epi32(p2, 16), _mm512_slli_epi32(p3, 24)),
+                );
+                let w = _mm512_shuffle_epi8(lut, packed);
+                let pos_mask = _mm512_cmp_epi8_mask(w, zero, 6);
+                let zero_mask = _mm512_cmp_epi8_mask(w, zero, 0);
+                let neg_a = _mm512_sub_epi8(zero, acts);
+                let blend = _mm512_mask_blend_epi8(pos_mask, neg_a, acts);
+                let sa = _mm512_mask_mov_epi8(blend, zero_mask, zero);
+                // dpbusd: acc += Σ (u8=1) * (i8=sa) = Σ sa, one i32 per 4 bytes.
+                acc[$k] = _mm512_dpbusd_epi32(acc[$k], ones_u8, sa);
+            }};
+        }
+
+        block!(0); block!(1); block!(2); block!(3);
+        block!(4); block!(5); block!(6); block!(7);
+        block!(8); block!(9); block!(10); block!(11);
+        block!(12); block!(13); block!(14); block!(15);
+
+        idx += 16;
+    }
+
+    // Merge the 16 accumulators.
+    let mut merged = acc[0];
+    for k in 1..16 {
+        merged = _mm512_add_epi32(merged, acc[k]);
+    }
+
+    // Cleanup: remaining chunks (< 16) accumulate into `merged`.
+    while idx < chunks64 {
+        _mm_prefetch(b_ptr.add(idx * 16 + 256) as *const i8, _MM_HINT_T0);
+        let acts = _mm512_loadu_si512(a_ptr.add(idx));
+        let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(b_ptr.add(idx * 16) as *const __m128i));
+        let p0 = _mm512_and_si512(w32, mask3);
+        let p1 = _mm512_and_si512(_mm512_srli_epi32(w32, 2), mask3);
+        let p2 = _mm512_and_si512(_mm512_srli_epi32(w32, 4), mask3);
+        let p3 = _mm512_and_si512(_mm512_srli_epi32(w32, 6), mask3);
+        let packed = _mm512_or_si512(
+            _mm512_or_si512(p0, _mm512_slli_epi32(p1, 8)),
+            _mm512_or_si512(_mm512_slli_epi32(p2, 16), _mm512_slli_epi32(p3, 24)),
+        );
+        let w = _mm512_shuffle_epi8(lut, packed);
+        let pos_mask = _mm512_cmp_epi8_mask(w, zero, 6);
+        let zero_mask = _mm512_cmp_epi8_mask(w, zero, 0);
+        let neg_a = _mm512_sub_epi8(zero, acts);
+        let blend = _mm512_mask_blend_epi8(pos_mask, neg_a, acts);
+        let sa = _mm512_mask_mov_epi8(blend, zero_mask, zero);
+        merged = _mm512_dpbusd_epi32(merged, ones_u8, sa);
+        idx += 1;
+    }
+
+    let mut tmp = [0i32; 16];
+    _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, merged);
+    let mut total = tmp.iter().sum::<i32>();
+
+    let remainder_start = chunks64 * 64;
+    for j in remainder_start..total_elems {
+        let byte_idx = j / 4;
+        let bit_shift = (j % 4) * 2;
+        let val = (b_pack4[byte_idx] >> bit_shift) & 0b11;
+        let w = if val == 0b00 { -1 } else if val == 0b10 { 1 } else { 0 };
+        total += a_i8[j] as i32 * w as i32;
+    }
+
+    total
+}
+
 pub fn ternary_dot_product_pack4(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        if is_x86_feature_detected!("avx512vnni") {
+            return unsafe { ternary_dot_product_pack4_avx512_vnni(a_i8, b_pack4, total_elems) };
+        }
         if is_x86_feature_detected!("avx512bw") {
             return unsafe { ternary_dot_product_pack4_avx512(a_i8, b_pack4, total_elems) };
         }

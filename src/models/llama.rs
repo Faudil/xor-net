@@ -404,25 +404,47 @@ impl Mlp {
         // Quantize the input once and run gate+up+silu+down in two rayon scopes
         // with no intermediate DynamicLinear dispatch or extra allocations.
         if b_size == 1 {
-            if let (LinearKind::Ternary(gate_lin), LinearKind::Ternary(up_lin), LinearKind::Ternary(down_lin)) =
-                (&self.c_fc1.inner, &self.c_fc2.inner, &self.c_proj.inner)
+            if let (LinearKind::Ternary(gate_lin), LinearKind::Ternary(up_lin)) =
+                (&self.c_fc1.inner, &self.c_fc2.inner)
             {
                 let in_row = &x.data[0 .. gate_lin.in_dim];
                 let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(gate_lin.in_dim);
                 let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
                 let use_silu = matches!(self.hidden_act, Activation::Silu);
-                let result = crate::bit1_58::layers::TernaryLinear::fused_mlp_all(
-                    x,
-                    &quantized_in,
-                    inv_scale,
-                    gate_lin,
-                    up_lin,
-                    down_lin,
-                    self.ffn_layernorm.as_ref(),
-                    use_silu,
-                );
-                crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
-                return result;
+
+                if let LinearKind::Ternary(down_lin) = &self.c_proj.inner {
+                    // All-ternary: fused path (VNNI-friendly in Step 4).
+                    let result = crate::bit1_58::layers::TernaryLinear::fused_mlp_all(
+                        x,
+                        &quantized_in,
+                        inv_scale,
+                        gate_lin,
+                        up_lin,
+                        down_lin,
+                        self.ffn_layernorm.as_ref(),
+                        use_silu,
+                    );
+                    crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
+                    return result;
+                }
+
+                if let LinearKind::Int8(_) = &self.c_proj.inner {
+                    // Non-ternary down (e.g. Int8): still fuse gate+up+silu and
+                    // feed the single quantized activation to down_proj, avoiding
+                    // the separate c_proj.forward re-quantization fallback.
+                    let result = crate::bit1_58::layers::TernaryLinear::fused_mlp_gate_up_down(
+                        x,
+                        &quantized_in,
+                        inv_scale,
+                        gate_lin,
+                        up_lin,
+                        &self.c_proj,
+                        self.ffn_layernorm.as_ref(),
+                        use_silu,
+                    );
+                    crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
+                    return result;
+                }
             }
         }
 
@@ -472,13 +494,32 @@ impl Mlp {
         } else {
             None
         };
-        Ok(Self {
+        let mlp = Self {
             c_fc1,
             c_fc2,
             c_proj,
             ffn_layernorm,
             hidden_act: cfg.hidden_act,
-        })
+        };
+        mlp.debug_print_kinds();
+        Ok(mlp)
+    }
+
+    /// Print the projection kinds once (when `XORNET_DEBUG` is set) so the user
+    /// can confirm whether `c_proj` is non-ternary and thus forces the
+    /// fused-MLP fallback path.
+    fn debug_print_kinds(&self) {
+        if !MLP_KIND_PRINTED.swap(true, Ordering::Relaxed)
+            && std::env::var("XORNET_DEBUG").is_ok()
+        {
+            eprintln!(
+                "[xor-net] MLP projection kinds: gate={} up={} down={} ffn_norm={}",
+                linear_kind_tag(&self.c_fc1.inner),
+                linear_kind_tag(&self.c_fc2.inner),
+                linear_kind_tag(&self.c_proj.inner),
+                if self.ffn_layernorm.is_some() { "Some" } else { "None" },
+            );
+        }
     }
 }
 
@@ -538,7 +579,7 @@ impl Block {
     }
 }
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 pub static TIME_BLOCKS: AtomicU64 = AtomicU64::new(0);
 pub static TIME_LM_HEAD: AtomicU64 = AtomicU64::new(0);
@@ -549,6 +590,25 @@ pub static TIME_ATTN_MATH: AtomicU64 = AtomicU64::new(0);  // unused, reserved
 pub static TIME_MLP_GEMV: AtomicU64 = AtomicU64::new(0);   // gate+up+silu+down total
 pub static TIME_MLP_DOWN: AtomicU64 = AtomicU64::new(0);   // just down_proj
 pub static TIME_NORM: AtomicU64 = AtomicU64::new(0);       // rms norms + residuals
+
+/// One-time debug flag so the projection-kind dump (which explains the
+/// fused-MLP fallback) is printed only once at model load.
+static MLP_KIND_PRINTED: AtomicBool = AtomicBool::new(false);
+
+fn linear_kind_tag(k: &crate::nn::dynamic_linear::LinearKind) -> &'static str {
+    use crate::nn::dynamic_linear::LinearKind;
+    match k {
+        LinearKind::Standard(_) => "F32",
+        LinearKind::Int8(_) => "Int8",
+        LinearKind::Int4(_) => "Int4",
+        LinearKind::Ternary(_) => "Ternary",
+        LinearKind::Bit(_) => "Bit",
+    }
+}
+
+pub fn get_mlp_silu_time() -> u64 {
+    crate::bit1_58::layers::TIME_SILU.load(Ordering::Relaxed)
+}
 
 pub fn get_profiling_stats() -> (u64, u64, u64) {
     (

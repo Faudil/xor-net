@@ -110,3 +110,75 @@ fn gelu_positive_stays_positive() {
         assert!(v > 0.0, "GELU(x>0) must be >0, idx {}", i);
     }
 }
+
+// The dispatched ternary GEMV (VNNI / AVX-512 / AVX2 / scalar) must match the
+// reference decode exactly.
+#[test]
+fn ternary_dot_product_pack4_matches_scalar() {
+    use xor_net::bit1_58::quantization::pack_1_58bit_4pack;
+    use xor_net::bit1_58::simd::ternary_dot_product_pack4;
+
+    let in_dim = 256;
+    let mut rng = 12345u64;
+    let mut next = || {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (rng >> 33) as f32
+    };
+
+    let weights: Vec<f32> = (0..in_dim)
+        .map(|_| {
+            let r = next();
+            if r < 0.33 { -1.0 } else if r > 0.66 { 1.0 } else { 0.0 }
+        })
+        .collect();
+    let acts_f32: Vec<f32> = (0..in_dim).map(|_| (next() - 0.5) * 40.0).collect();
+    let acts_i8: Vec<i8> = acts_f32.iter().map(|&x| x.round().max(-127.0).min(127.0) as i8).collect();
+
+    let packed = pack_1_58bit_4pack(&weights, 1.0);
+    let got = ternary_dot_product_pack4(&acts_i8, &packed, in_dim);
+
+    let expected: i32 = acts_i8
+        .iter()
+        .zip(weights.iter())
+        .map(|(&a, &w)| a as i32 * w as i32)
+        .sum();
+
+    assert_eq!(got, expected, "ternary GEMV mismatch");
+}
+
+// Vectorized SiLU (AVX-512) must match the scalar libm reference, including
+// values that exercise the exp() range clamp and the tail handling.
+#[test]
+fn silu_inplace_vectorized_matches_scalar() {
+    use xor_net::bit1_58::quantization::silu_inplace;
+
+    let gate: Vec<f32> = (-40..40)
+        .map(|i| i as f32 * 0.7)
+        .chain(std::iter::once(200.0))
+        .chain(std::iter::once(-200.0))
+        .collect();
+    let up: Vec<f32> = (0..gate.len()).map(|i| (i as f32 * 0.13 - 5.0)).collect();
+
+    // use_silu = true
+    let mut g1 = gate.clone();
+    silu_inplace(&mut g1, &up, true);
+    let expected_silu: Vec<f32> = gate
+        .iter()
+        .zip(&up)
+        .map(|(&g, &u)| g * (1.0 / (1.0 + (-g).exp())) * u)
+        .collect();
+    assert_close(&g1, &expected_silu, 1e-2, "silu_inplace vectorized (SiLU)");
+
+    // use_silu = false (ReLU²)
+    let mut g2 = gate.clone();
+    silu_inplace(&mut g2, &up, false);
+    let expected_relu2: Vec<f32> = gate
+        .iter()
+        .zip(&up)
+        .map(|(&g, &u)| {
+            let r = if g > 0.0 { g } else { 0.0 };
+            r * r * u
+        })
+        .collect();
+    assert_close(&g2, &expected_relu2, 1e-2, "silu_inplace vectorized (ReLU²)");
+}

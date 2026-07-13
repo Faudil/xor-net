@@ -531,7 +531,7 @@ impl DynamicLinear {
             LinearKind::Int8(l) => l.forward_with_quantized(xs, quantized_in, inv_scale),
             LinearKind::Int4(l) => l.forward_with_quantized(xs, quantized_in, inv_scale),
             LinearKind::Ternary(l) => l.forward_with_quantized(xs, quantized_in, inv_scale),
-            LinearKind::Bit(l) => anyhow::bail!("forward_with_quantized not supported for BitLinear"),
+            LinearKind::Bit(_) => anyhow::bail!("forward_with_quantized not supported for BitLinear"),
         }
     }
 

@@ -193,3 +193,94 @@ pub fn quantize_f32_to_i8(activations: &[f32], quantized: &mut [i8]) -> f32 {
     
     inv_scale
 }
+
+/// Compute `y = silu(gate) * up` (or `relu(gate)^2 * up` when `!use_silu`) in
+/// place, writing the result back into `gate`. The SiLU path uses a vectorized
+/// `exp` approximation (Pommier `exp_ps` port) so the activation no longer
+/// serializes through a scalar libm `expf` per element.
+pub fn silu_inplace(gate: &mut [f32], up: &[f32], use_silu: bool) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if has_avx512f() {
+            unsafe { silu_inplace_avx512(gate, up, use_silu) };
+            return;
+        }
+    }
+
+    for i in 0..gate.len() {
+        let g = gate[i];
+        let u = up[i];
+        gate[i] = if use_silu {
+            g * (1.0 / (1.0 + (-g).exp())) * u
+        } else {
+            let r = g.max(0.0);
+            r * r * u
+        };
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn silu_inplace_avx512(gate: &mut [f32], up: &[f32], use_silu: bool) {
+    use std::arch::x86_64::*;
+
+    let n = gate.len();
+    let gp: *mut f32 = gate.as_mut_ptr();
+    let up_ptr: *const f32 = up.as_ptr();
+
+    // exp(x) range constants
+    let inv_ln2 = _mm512_set1_ps(1.44269504088896341); // log2(e)
+    let ln2 = _mm512_set1_ps(std::f32::consts::LN_2);
+    let exp_hi = _mm512_set1_ps(88.3762626647949);
+    let exp_lo = _mm512_set1_ps(-88.3762626647949);
+    let one = _mm512_set1_ps(1.0);
+    let zero = _mm512_setzero_ps();
+
+    let mut i = 0;
+    while i + 16 <= n {
+        let g = _mm512_loadu_ps(gp.add(i) as *const f32);
+        let u = _mm512_loadu_ps(up_ptr.add(i));
+
+        // y = silu(g) or relu(g)^2
+        let act = if use_silu {
+            // e = exp(-g) via range reduction: exp(x) = 2^n * exp(x - n*ln2)
+            let x = _mm512_max_ps(_mm512_min_ps(_mm512_sub_ps(zero, g), exp_hi), exp_lo);
+            let fx = _mm512_mul_ps(x, inv_ln2);
+            let n_f = _mm512_roundscale_ps(fx, 0); // round to nearest integer
+            let t = _mm512_sub_ps(x, _mm512_mul_ps(n_f, ln2));
+            // 4th-order Taylor of exp(t) (|t| < 0.35 -> error ~1e-5)
+            let mut e = _mm512_set1_ps(1.0 / 24.0);
+            e = _mm512_fmadd_ps(e, t, _mm512_set1_ps(1.0 / 6.0));
+            e = _mm512_fmadd_ps(e, t, _mm512_set1_ps(0.5));
+            e = _mm512_fmadd_ps(e, t, one);
+            e = _mm512_fmadd_ps(e, t, one);
+            // 2^n
+            let ni = _mm512_cvtps_epi32(n_f);
+            let pow2n = _mm512_castsi512_ps(_mm512_slli_epi32(
+                _mm512_add_epi32(ni, _mm512_set1_epi32(0x7f)),
+                23,
+            ));
+            let exp_x = _mm512_mul_ps(e, pow2n);
+            let sig = _mm512_div_ps(one, _mm512_add_ps(one, exp_x));
+            _mm512_mul_ps(g, sig)
+        } else {
+            let r = _mm512_max_ps(g, zero);
+            _mm512_mul_ps(r, r)
+        };
+
+        let y = _mm512_mul_ps(act, u);
+        _mm512_storeu_ps(gp.add(i) as *mut f32, y);
+        i += 16;
+    }
+
+    for i in i..n {
+        let g = *gp.add(i);
+        let u = *up_ptr.add(i);
+        *gp.add(i) = if use_silu {
+            g * (1.0 / (1.0 + (-g).exp())) * u
+        } else {
+            let r = g.max(0.0);
+            r * r * u
+        };
+    }
+}

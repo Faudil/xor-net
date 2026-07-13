@@ -322,12 +322,14 @@ fn main() -> anyhow::Result<()> {
             let (attn_us, _attn_math_us, mlp_us, mlp_down_us, norm_us) =
                 xor_net::models::llama::get_detailed_stats();
             let mlp_gate_up_us = mlp_us.saturating_sub(mlp_down_us);
+            let silu_us = xor_net::models::llama::get_mlp_silu_time();
             println!(
-                " └ Attn: {:.2}ms/tok | MLP gate+up: {:.2}ms/tok | MLP down: {:.2}ms/tok | Norms: {:.2}ms/tok",
+                " └ Attn: {:.2}ms/tok | MLP gate+up: {:.2}ms/tok | MLP down: {:.2}ms/tok | Norms: {:.2}ms/tok | SiLU+quant: {:.2}ms/tok",
                 attn_us as f64 / 1000.0 / g,
                 mlp_gate_up_us as f64 / 1000.0 / g,
                 mlp_down_us as f64 / 1000.0 / g,
                 norm_us as f64 / 1000.0 / g,
+                silu_us as f64 / 1000.0 / g,
             );
         }
         println!("{}", "─".repeat(46));
