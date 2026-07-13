@@ -1,6 +1,15 @@
 //! Llama inference implementation.
 //!
 //! See ["LLaMA: Open and Efficient Foundation Language Models"](https://arxiv.org/abs/2302.13971)
+//!
+//! The transformer is split into focused submodules:
+//! - [`attention`] — `CausalSelfAttention` (QKV/O projections + KV-cache attention)
+//! - [`mlp`] — `Mlp` (gate/up/down projections, fused forward selection)
+//! - [`block`] — `Block` (pre-norm residual wrapper around attention + MLP)
+
+pub mod attention;
+pub mod block;
+pub mod mlp;
 
 use crate::tensor::FastTensor;
 use crate::nn::{DynamicLinear, QuantizationConfig, FastRmsNorm, CpuRingCache};
@@ -11,6 +20,10 @@ use crate::nn::dynamic_linear::LinearKind;
 use rayon::prelude::*;
 
 pub const DEFAULT_MAX_SEQ_LEN: usize = 4096;
+
+// ---------------------------------------------------------------------------
+// RoPE configuration
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub enum Llama3RopeType {
@@ -37,6 +50,10 @@ pub enum LlamaEosToks {
     Multiple(Vec<u32>),
 }
 
+// ---------------------------------------------------------------------------
+// Activation
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Activation {
     Silu,
@@ -55,6 +72,10 @@ impl Activation {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct LlamaConfig {
@@ -173,6 +194,10 @@ impl Config {
     }
 }
 
+// ---------------------------------------------------------------------------
+// KV-cache + RoPE tables
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
 pub struct Cache {
     pub use_kv_cache: bool,
@@ -231,13 +256,13 @@ impl Cache {
                 idx_theta_data[pos * half_dim + i] = pos as f32 * theta[i];
             }
         }
-        
+
         let cos_data = idx_theta_data.iter().map(|&x| x.cos()).collect::<Vec<_>>();
         let sin_data = idx_theta_data.iter().map(|&x| x.sin()).collect::<Vec<_>>();
-        
+
         let cos = FastTensor::new(cos_data, vec![config.max_position_embeddings, half_dim]);
         let sin = FastTensor::new(sin_data, vec![config.max_position_embeddings, half_dim]);
-        
+
         let ring_cache = if use_kv_cache {
             let num_kv_heads = config.num_key_value_heads;
             let head_dim = config.hidden_size / config.num_attention_heads;
@@ -251,7 +276,7 @@ impl Cache {
         } else {
             None
         };
-        
+
         Ok(Self {
             use_kv_cache,
             ring_cache,
@@ -260,6 +285,10 @@ impl Cache {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Token embedding
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct FastEmbedding {
@@ -270,334 +299,34 @@ impl FastEmbedding {
     pub fn new(weight: FastTensor) -> Self {
         Self { weight }
     }
-    
+
     pub fn forward(&self, x: &[u32]) -> anyhow::Result<FastTensor> {
         FastTensor::embedding(x, &self.weight)
     }
 }
 
-#[derive(Debug, Clone)]
-struct CausalSelfAttention {
-    q_proj: DynamicLinear,
-    k_proj: DynamicLinear,
-    v_proj: DynamicLinear,
-    o_proj: DynamicLinear,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
-    head_dim: usize,
-    inner_attn_ln: Option<FastRmsNorm>,
-}
+// ---------------------------------------------------------------------------
+// Per-block profiling counters (read by the chat example breakdown)
+// ---------------------------------------------------------------------------
 
-impl CausalSelfAttention {
-    fn forward(
-        &self,
-        x: &FastTensor,
-        index_pos: usize,
-        block_idx: usize,
-        cache: &mut Cache,
-    ) -> anyhow::Result<FastTensor> {
-        let rank = x.shape.len();
-        if rank == 0 {
-            anyhow::bail!("Input must have at least 1 dimension");
-        }
-        let b_size: usize = x.shape[..rank - 1].iter().product();
-
-        let (q, k, v) = match (&self.q_proj.inner, &self.k_proj.inner, &self.v_proj.inner) {
-            (LinearKind::Ternary(q_lin), LinearKind::Ternary(k_lin), LinearKind::Ternary(v_lin)) if b_size == 1 => {
-                let in_row = &x.data[0 .. q_lin.in_dim];
-                let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(q_lin.in_dim);
-                let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
-                let res = crate::bit1_58::layers::TernaryLinear::fused_forward_qkv(
-                    x, &quantized_in, inv_scale, q_lin, k_lin, v_lin,
-                );
-                crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
-                res
-            }
-            _ => {
-                let q = self.q_proj.forward(x)?;
-                let k = self.k_proj.forward(x)?;
-                let v = self.v_proj.forward(x)?;
-                (q, k, v)
-            }
-        };
-
-        let q = q.transpose_seq_to_heads(self.num_attention_heads, self.head_dim)?;
-        let k = k.transpose_seq_to_heads(self.num_key_value_heads, self.head_dim)?;
-        let v = v.transpose_seq_to_heads(self.num_key_value_heads, self.head_dim)?;
-
-        let q = q.rope_inplace(&cache.cos, &cache.sin, index_pos)?;
-        let k = k.rope_inplace(&cache.cos, &cache.sin, index_pos)?;
-
-        if let Some(ref mut ring_cache) = cache.ring_cache {
-            let y = crate::nn::fast_attention(
-                &q,
-                &k,
-                &v,
-                block_idx,
-                index_pos,
-                ring_cache,
-                self.num_attention_heads,
-                self.num_key_value_heads,
-                self.head_dim,
-            )?;
-            let y = y.transpose_heads_to_seq()?;
-            let y = match &self.inner_attn_ln { 
-                Some(ln) => ln.forward(&y)?, 
-                None => y 
-            };
-            let y = self.o_proj.forward(&y)?;
-            return Ok(y);
-        }
-
-        anyhow::bail!("KV Cache is required for FastTensor inference");
-    }
-
-    fn load(loader: SafeTensorLoader, cfg: &Config) -> anyhow::Result<Self> {
-        let size_in = cfg.hidden_size;
-        let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
-        let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
-        
-        let q_proj = DynamicLinear::load(size_in, size_q, &loader.pp("q_proj"), "weight", cfg.quantization_config)?;
-        let k_proj = DynamicLinear::load(size_in, size_kv, &loader.pp("k_proj"), "weight", cfg.quantization_config)?;
-        let v_proj = DynamicLinear::load(size_in, size_kv, &loader.pp("v_proj"), "weight", cfg.quantization_config)?;
-        let o_proj = DynamicLinear::load(size_q, size_in, &loader.pp("o_proj"), "weight", cfg.quantization_config)?;
-        
-        let inner_attn_ln = if loader.pp("inner_attn_ln").has_tensor("weight") {
-            Some(FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("inner_attn_ln"))?)
-        } else if loader.pp("attn_sub_norm").has_tensor("weight") {
-            Some(FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("attn_sub_norm"))?)
-        } else {
-            None
-        };
-        
-        Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            num_attention_heads: cfg.num_attention_heads,
-            num_key_value_heads: cfg.num_key_value_heads,
-            head_dim: cfg.hidden_size / cfg.num_attention_heads,
-            inner_attn_ln,
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Mlp {
-    c_fc1: DynamicLinear,
-    c_fc2: DynamicLinear,
-    c_proj: DynamicLinear,
-    ffn_layernorm: Option<FastRmsNorm>,
-    hidden_act: Activation,
-}
-
-impl Mlp {
-    fn forward(&self, x: &FastTensor) -> anyhow::Result<FastTensor> {
-        let rank = x.shape.len();
-        if rank == 0 {
-            anyhow::bail!("Input must have at least 1 dimension");
-        }
-        let b_size: usize = x.shape[..rank - 1].iter().product();
-
-        // Fast path: all three projections are ternary and batch size is 1.
-        // Quantize the input once and run gate+up+silu+down in two rayon scopes
-        // with no intermediate DynamicLinear dispatch or extra allocations.
-        if b_size == 1 {
-            if let (LinearKind::Ternary(gate_lin), LinearKind::Ternary(up_lin)) =
-                (&self.c_fc1.inner, &self.c_fc2.inner)
-            {
-                let in_row = &x.data[0 .. gate_lin.in_dim];
-                let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(gate_lin.in_dim);
-                let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
-                let use_silu = matches!(self.hidden_act, Activation::Silu);
-
-                if let LinearKind::Ternary(down_lin) = &self.c_proj.inner {
-                    // All-ternary: fused path (VNNI-friendly in Step 4).
-                    let result = crate::bit1_58::layers::TernaryLinear::fused_mlp_all(
-                        x,
-                        &quantized_in,
-                        inv_scale,
-                        gate_lin,
-                        up_lin,
-                        down_lin,
-                        self.ffn_layernorm.as_ref(),
-                        use_silu,
-                    );
-                    crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
-                    return result;
-                }
-
-                if let LinearKind::Int8(_) = &self.c_proj.inner {
-                    // Non-ternary down (e.g. Int8): still fuse gate+up+silu and
-                    // feed the single quantized activation to down_proj, avoiding
-                    // the separate c_proj.forward re-quantization fallback.
-                    let result = crate::bit1_58::layers::TernaryLinear::fused_mlp_gate_up_down(
-                        x,
-                        &quantized_in,
-                        inv_scale,
-                        gate_lin,
-                        up_lin,
-                        &self.c_proj,
-                        self.ffn_layernorm.as_ref(),
-                        use_silu,
-                    );
-                    crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
-                    return result;
-                }
-            }
-        }
-
-        // Fallback: non-ternary or batched path
-        let (h1, h2) = match (&self.c_fc1.inner, &self.c_fc2.inner) {
-            (LinearKind::Ternary(fc1_lin), LinearKind::Ternary(fc2_lin)) if b_size == 1 => {
-                let in_row = &x.data[0 .. fc1_lin.in_dim];
-                let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(fc1_lin.in_dim);
-                let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
-                let res = crate::bit1_58::layers::TernaryLinear::fused_forward_mlp(
-                    x, &quantized_in, inv_scale, fc1_lin, fc2_lin,
-                );
-                crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
-                res
-            }
-            _ => {
-                let h1 = self.c_fc1.forward(x)?;
-                let h2 = self.c_fc2.forward(x)?;
-                (h1, h2)
-            }
-        };
-
-        let x_mul = match self.hidden_act {
-            Activation::Relu2 => h1.relu2_mul_inplace(&h2)?,
-            Activation::Silu => h1.silu_mul_inplace(&h2)?,
-        };
-        let x_norm = match &self.ffn_layernorm {
-            Some(ln) => ln.forward(&x_mul)?,
-            None => x_mul
-        };
-        let t_down = std::time::Instant::now();
-        let result = self.c_proj.forward(&x_norm);
-        TIME_MLP_DOWN.fetch_add(t_down.elapsed().as_micros() as u64, Ordering::Relaxed);
-        result
-    }
-
-    fn load(loader: SafeTensorLoader, cfg: &Config) -> anyhow::Result<Self> {
-        let h_size = cfg.hidden_size;
-        let i_size = cfg.intermediate_size;
-        let c_fc1 = DynamicLinear::load(h_size, i_size, &loader.pp("gate_proj"), "weight", cfg.quantization_config)?;
-        let c_fc2 = DynamicLinear::load(h_size, i_size, &loader.pp("up_proj"), "weight", cfg.quantization_config)?;
-        let c_proj = DynamicLinear::load(i_size, h_size, &loader.pp("down_proj"), "weight", cfg.quantization_config)?;
-        let ffn_layernorm = if loader.pp("ffn_layernorm").has_tensor("weight") {
-            Some(FastRmsNorm::load(i_size, cfg.rms_norm_eps as f32, &loader.pp("ffn_layernorm"))?)
-        } else if loader.pp("ffn_sub_norm").has_tensor("weight") {
-            Some(FastRmsNorm::load(i_size, cfg.rms_norm_eps as f32, &loader.pp("ffn_sub_norm"))?)
-        } else {
-            None
-        };
-        let mlp = Self {
-            c_fc1,
-            c_fc2,
-            c_proj,
-            ffn_layernorm,
-            hidden_act: cfg.hidden_act,
-        };
-        mlp.debug_print_kinds();
-        Ok(mlp)
-    }
-
-    /// When `XORNET_DEBUG` is set, print this block's MLP projection kinds so
-    /// the user can see exactly which blocks are non-ternary (and therefore
-    /// force the fused-MLP fallback path).
-    fn debug_print_kinds(&self) {
-        if std::env::var("XORNET_DEBUG").is_err() {
-            return;
-        }
-        let idx = MLP_DBG_IDX.fetch_add(1, Ordering::Relaxed);
-        eprintln!(
-            "[xor-net] MLP[{}] gate={} up={} down={} ffn_norm={}",
-            idx,
-            linear_kind_tag(&self.c_fc1.inner),
-            linear_kind_tag(&self.c_fc2.inner),
-            linear_kind_tag(&self.c_proj.inner),
-            if self.ffn_layernorm.is_some() { "Some" } else { "None" },
-        );
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Block {
-    rms_1: FastRmsNorm,
-    attn: CausalSelfAttention,
-    rms_2: FastRmsNorm,
-    mlp: Mlp,
-}
-
-impl Block {
-    fn forward(
-        &self,
-        x: &FastTensor,
-        index_pos: usize,
-        block_idx: usize,
-        cache: &mut Cache,
-    ) -> anyhow::Result<FastTensor> {
-        let t0 = std::time::Instant::now();
-        let x_norm1 = self.rms_1.forward(x)?;
-        TIME_NORM.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-
-        let t1 = std::time::Instant::now();
-        let attn_out = self.attn.forward(&x_norm1, index_pos, block_idx, cache)?;
-        TIME_ATTN_GEMV.fetch_add(t1.elapsed().as_micros() as u64, Ordering::Relaxed);
-
-        let t2 = std::time::Instant::now();
-        let x_add = attn_out.add_inplace(x)?;
-        TIME_NORM.fetch_add(t2.elapsed().as_micros() as u64, Ordering::Relaxed);
-
-        let t3 = std::time::Instant::now();
-        let x_norm2 = self.rms_2.forward(&x_add)?;
-        TIME_NORM.fetch_add(t3.elapsed().as_micros() as u64, Ordering::Relaxed);
-
-        let t4 = std::time::Instant::now();
-        let mlp_out = self.mlp.forward(&x_norm2)?;
-        TIME_MLP_GEMV.fetch_add(t4.elapsed().as_micros() as u64, Ordering::Relaxed);
-
-        let t5 = std::time::Instant::now();
-        let result = x_add.add_inplace(&mlp_out);
-        TIME_NORM.fetch_add(t5.elapsed().as_micros() as u64, Ordering::Relaxed);
-        result
-    }
-
-    fn load(loader: SafeTensorLoader, cfg: &Config) -> anyhow::Result<Self> {
-        let attn = CausalSelfAttention::load(loader.pp("self_attn"), cfg)?;
-        let mlp = Mlp::load(loader.pp("mlp"), cfg)?;
-        let rms_1 = FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("input_layernorm"))?;
-        let rms_2 = FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("post_attention_layernorm"))?;
-        Ok(Self {
-            rms_1,
-            attn,
-            rms_2,
-            mlp,
-        })
-    }
-}
-
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub static TIME_BLOCKS: AtomicU64 = AtomicU64::new(0);
 pub static TIME_LM_HEAD: AtomicU64 = AtomicU64::new(0);
 pub static TIME_OTHER: AtomicU64 = AtomicU64::new(0);
-// Fine-grained breakdown inside a block
-pub static TIME_ATTN_GEMV: AtomicU64 = AtomicU64::new(0);  // full CausalSelfAttention::forward
-pub static TIME_ATTN_MATH: AtomicU64 = AtomicU64::new(0);  // unused, reserved
-pub static TIME_MLP_GEMV: AtomicU64 = AtomicU64::new(0);   // gate+up+silu+down total
-pub static TIME_MLP_DOWN: AtomicU64 = AtomicU64::new(0);   // just down_proj
-pub static TIME_NORM: AtomicU64 = AtomicU64::new(0);       // rms norms + residuals
+/// Full `CausalSelfAttention::forward` time.
+pub static TIME_ATTN_GEMV: AtomicU64 = AtomicU64::new(0);
+/// Reserved (unused) — kept for API stability.
+pub static TIME_ATTN_MATH: AtomicU64 = AtomicU64::new(0);
+/// `gate+up+silu+down` total (fused path).
+pub static TIME_MLP_GEMV: AtomicU64 = AtomicU64::new(0);
+/// Just `down_proj` (the prefill / non-fused fallback path).
+pub static TIME_MLP_DOWN: AtomicU64 = AtomicU64::new(0);
+/// RMS norms + residual additions.
+pub static TIME_NORM: AtomicU64 = AtomicU64::new(0);
 
-/// Debug block counter so each block's projection kinds can be dumped when
-/// `XORNET_DEBUG` is set (which explains the fused-MLP fallback).
-static MLP_DBG_IDX: AtomicUsize = AtomicUsize::new(0);
-
-fn linear_kind_tag(k: &crate::nn::dynamic_linear::LinearKind) -> &'static str {
-    use crate::nn::dynamic_linear::LinearKind;
+/// Human-readable tag for a `LinearKind`, used by the `XORNET_DEBUG` diagnostic.
+pub(crate) fn linear_kind_tag(k: &LinearKind) -> &'static str {
     match k {
         LinearKind::Standard(_) => "F32",
         LinearKind::Int8(_) => "Int8",
@@ -628,6 +357,12 @@ pub fn get_detailed_stats() -> (u64, u64, u64, u64, u64) {
         TIME_NORM.load(Ordering::Relaxed),
     )
 }
+
+// ---------------------------------------------------------------------------
+// Top-level model
+// ---------------------------------------------------------------------------
+
+use self::block::Block;
 
 #[derive(Debug, Clone)]
 pub struct Llama {
@@ -688,6 +423,10 @@ impl Llama {
     /// Layer-skipping draft forward for self-speculative decoding. Runs only the
     /// specified transformer blocks (e.g. every other layer) and returns logits
     /// for the last token. Cheaper than a full forward; used to propose tokens.
+    ///
+    /// NOTE: experimental / gated behind `XORNET_SPEC` in the chat example. On a
+    /// bandwidth-bound engine the verify pass dominates, so this is slower than
+    /// plain greedy decoding (see OPTIMISATION.md).
     pub fn forward_layers(
         &self,
         x: &[u32],

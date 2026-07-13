@@ -1,3 +1,22 @@
+//! Vectorised dot products over 1.58-bit ternary weights.
+//!
+//! BitNet stores each weight as a 2-bit code in `{-1, 0, +1}`, packed 4 per
+//! byte (`pack4`): within one `u32` weight word the codes are the little-endian
+//! 2-bit fields `p0 | p1<<2 | p2<<4 | p3<<6`. Because the activation side is
+//! quantised to `i8`, the whole matmul reduces to a per-row dot product
+//! `Σ a_i * w_i` where each `w_i ∈ {-1,0,+1}`.
+//!
+//! The hot loop decodes 16 packed bytes (= 64 weights) per 512-bit lane by
+//! splatting the word into four 2-bit fields, looking each up in an 8-bit LUT
+//! (0→-1, 1→0, 2→+1, 3→0) to get signed activation weights `w`, then doing the
+//! dot product with the i8 activations:
+//! - pre-VNNI: `_mm512_maddubs_epi16` (u8=1 × i8, horizontally summed to i16)
+//!   followed by `_mm512_madd_epi16` (i16 pairs summed to i32);
+//! - VNNI: a single `_mm512_dpbusd_epi32` does `acc += Σ (u8=1)·(i8)` directly.
+//!
+//! Multiple independent accumulators are kept live so the ~5-cycle multiply
+//! latency is hidden by instruction-level parallelism.
+
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]

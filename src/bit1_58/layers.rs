@@ -5,6 +5,15 @@ use super::simd::{ternary_dot_product_pack4, ternary_dot_product_pack5};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Dispatches the vectorized ternary dot product according to the packing scheme.
+#[inline]
+fn ternary_dot(pack_type: TernaryPackType, input: &[i8], weights: &[u8], n: usize) -> i32 {
+    match pack_type {
+        TernaryPackType::Pack4 => ternary_dot_product_pack4(input, weights, n),
+        TernaryPackType::Pack5 => ternary_dot_product_pack5(input, weights, n),
+    }
+}
+
 /// Time spent in the MLP activation (SiLU/ReLU2) + the silu->i8 quantization
 /// pass, across all tokens. Used to confirm how much of the MLP budget the
 /// scalar `exp()` loop accounts for (and to verify the vectorized replacement).
@@ -193,6 +202,9 @@ impl TernaryLinear {
         let num_threads = crate::util::get_num_threads();
         let chunk_size = ((total_rows + num_threads - 1) / num_threads).max(128);
 
+        // Each output row index is claimed exactly once via the atomic counter,
+        // so the parallel workers below can write to disjoint f32 slots through
+        // raw pointers without any lock.
         let q_ptr: usize = q_out.as_mut_ptr() as usize;
         let k_ptr: usize = k_out.as_mut_ptr() as usize;
         let v_ptr: usize = v_out.as_mut_ptr() as usize;
@@ -202,74 +214,44 @@ impl TernaryLinear {
         let q_w = &q_lin.w_scales;
         let k_w = &k_lin.w_scales;
         let v_w = &v_lin.w_scales;
-
-        let next_row = AtomicU64::new(0);
-        let num_threads = rayon::current_num_threads();
         let pack_type = q_lin.pack_type;
+
+        let compute_row = |row_idx: usize| {
+            if row_idx < q_out_dim {
+                let w_row = &q_packed[row_idx * bytes_per_row..(row_idx + 1) * bytes_per_row];
+                let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                unsafe { *(q_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * q_w[row_idx]; }
+            } else if row_idx < q_out_dim + k_out_dim {
+                let kr = row_idx - q_out_dim;
+                let w_row = &k_packed[kr * bytes_per_row..(kr + 1) * bytes_per_row];
+                let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                unsafe { *(k_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * k_w[kr]; }
+            } else {
+                let vr = row_idx - q_out_dim - k_out_dim;
+                let w_row = &v_packed[vr * bytes_per_row..(vr + 1) * bytes_per_row];
+                let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                unsafe { *(v_ptr as *mut f32).add(vr) = dot as f32 * inv_scale * v_w[vr]; }
+            }
+        };
+
+        // Split the combined QKV row range across threads; the calling thread
+        // also joins the pool once the scope closure returns, so we spawn one
+        // work-stealing task per thread.
+        let next_row = AtomicU64::new(0);
         rayon::scope(|s| {
-            for _ in 1..num_threads {
-                s.spawn(|_| loop {
-                    let start = next_row.fetch_add(chunk_size as u64, Ordering::Relaxed) as usize;
-                    if start >= total_rows { break; }
-                    let end = (start + chunk_size).min(total_rows);
-                    for row_idx in start..end {
-                        if row_idx < q_out_dim {
-                            let w_row = &q_packed[row_idx * bytes_per_row .. (row_idx + 1) * bytes_per_row];
-                            let dot = match pack_type {
-                                TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                            };
-                            unsafe { *(q_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * q_w[row_idx]; }
-                        } else if row_idx < q_out_dim + k_out_dim {
-                            let kr = row_idx - q_out_dim;
-                            let w_row = &k_packed[kr * bytes_per_row .. (kr + 1) * bytes_per_row];
-                            let dot = match pack_type {
-                                TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                            };
-                            unsafe { *(k_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * k_w[kr]; }
-                        } else {
-                            let vr = row_idx - q_out_dim - k_out_dim;
-                            let w_row = &v_packed[vr * bytes_per_row .. (vr + 1) * bytes_per_row];
-                            let dot = match pack_type {
-                                TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                            };
-                            unsafe { *(v_ptr as *mut f32).add(vr) = dot as f32 * inv_scale * v_w[vr]; }
+            for _ in 0..num_threads {
+                s.spawn(|_| {
+                    loop {
+                        let start = next_row.fetch_add(chunk_size as u64, Ordering::Relaxed) as usize;
+                        if start >= total_rows {
+                            break;
+                        }
+                        let end = (start + chunk_size).min(total_rows);
+                        for row_idx in start..end {
+                            compute_row(row_idx);
                         }
                     }
                 });
-            }
-            loop {
-                let start = next_row.fetch_add(chunk_size as u64, Ordering::Relaxed) as usize;
-                if start >= total_rows { break; }
-                let end = (start + chunk_size).min(total_rows);
-                for row_idx in start..end {
-                    if row_idx < q_out_dim {
-                        let w_row = &q_packed[row_idx * bytes_per_row .. (row_idx + 1) * bytes_per_row];
-                        let dot = match pack_type {
-                            TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                            TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                        };
-                        unsafe { *(q_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * q_w[row_idx]; }
-                    } else if row_idx < q_out_dim + k_out_dim {
-                        let kr = row_idx - q_out_dim;
-                        let w_row = &k_packed[kr * bytes_per_row .. (kr + 1) * bytes_per_row];
-                        let dot = match pack_type {
-                            TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                            TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                        };
-                        unsafe { *(k_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * k_w[kr]; }
-                    } else {
-                        let vr = row_idx - q_out_dim - k_out_dim;
-                        let w_row = &v_packed[vr * bytes_per_row .. (vr + 1) * bytes_per_row];
-                        let dot = match pack_type {
-                            TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                            TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                        };
-                        unsafe { *(v_ptr as *mut f32).add(vr) = dot as f32 * inv_scale * v_w[vr]; }
-                    }
-                }
             }
         });
 
@@ -314,58 +296,36 @@ impl TernaryLinear {
         let fc2_packed = &fc2_lin.packed_weights;
         let fc1_w = &fc1_lin.w_scales;
         let fc2_w = &fc2_lin.w_scales;
+        let pack_type = fc1_lin.pack_type;
+
+        let compute_row = |row_idx: usize| {
+            if row_idx < fc1_out_dim {
+                let w_row = &fc1_packed[row_idx * bytes_per_row..(row_idx + 1) * bytes_per_row];
+                let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                unsafe { *(fc1_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * fc1_w[row_idx]; }
+            } else {
+                let kr = row_idx - fc1_out_dim;
+                let w_row = &fc2_packed[kr * bytes_per_row..(kr + 1) * bytes_per_row];
+                let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                unsafe { *(fc2_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * fc2_w[kr]; }
+            }
+        };
 
         let next_row = AtomicU64::new(0);
-        let num_threads = rayon::current_num_threads();
-        let pack_type = fc1_lin.pack_type;
         rayon::scope(|s| {
-            for _ in 1..num_threads {
-                s.spawn(|_| loop {
-                    let start = next_row.fetch_add(chunk_size as u64, Ordering::Relaxed) as usize;
-                    if start >= total_rows { break; }
-                    let end = (start + chunk_size).min(total_rows);
-                    for row_idx in start..end {
-                        if row_idx < fc1_out_dim {
-                            let w_row = &fc1_packed[row_idx * bytes_per_row .. (row_idx + 1) * bytes_per_row];
-                            let dot = match pack_type {
-                                TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                            };
-                            unsafe { *(fc1_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * fc1_w[row_idx]; }
-                        } else {
-                            let kr = row_idx - fc1_out_dim;
-                            let w_row = &fc2_packed[kr * bytes_per_row .. (kr + 1) * bytes_per_row];
-                            let dot = match pack_type {
-                                TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                            };
-                            unsafe { *(fc2_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * fc2_w[kr]; }
+            for _ in 0..num_threads {
+                s.spawn(|_| {
+                    loop {
+                        let start = next_row.fetch_add(chunk_size as u64, Ordering::Relaxed) as usize;
+                        if start >= total_rows {
+                            break;
+                        }
+                        let end = (start + chunk_size).min(total_rows);
+                        for row_idx in start..end {
+                            compute_row(row_idx);
                         }
                     }
                 });
-            }
-            loop {
-                let start = next_row.fetch_add(chunk_size as u64, Ordering::Relaxed) as usize;
-                if start >= total_rows { break; }
-                let end = (start + chunk_size).min(total_rows);
-                for row_idx in start..end {
-                    if row_idx < fc1_out_dim {
-                        let w_row = &fc1_packed[row_idx * bytes_per_row .. (row_idx + 1) * bytes_per_row];
-                        let dot = match pack_type {
-                            TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                            TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                        };
-                        unsafe { *(fc1_ptr as *mut f32).add(row_idx) = dot as f32 * inv_scale * fc1_w[row_idx]; }
-                    } else {
-                        let kr = row_idx - fc1_out_dim;
-                        let w_row = &fc2_packed[kr * bytes_per_row .. (kr + 1) * bytes_per_row];
-                        let dot = match pack_type {
-                            TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                            TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                        };
-                        unsafe { *(fc2_ptr as *mut f32).add(kr) = dot as f32 * inv_scale * fc2_w[kr]; }
-                    }
-                }
             }
         });
 
@@ -429,55 +389,33 @@ impl TernaryLinear {
         let pack_type   = gate_lin.pack_type;
 
         {
+            let compute12 = |r: usize| {
+                if r < inter {
+                    let w_row = &gate_packed[r * bytes_gate..(r + 1) * bytes_gate];
+                    let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                    unsafe { *(gate_ptr as *mut f32).add(r) = dot as f32 * inv_scale_in * gate_w[r]; }
+                } else {
+                    let ur = r - inter;
+                    let w_row = &up_packed[ur * bytes_gate..(ur + 1) * bytes_gate];
+                    let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                    unsafe { *(up_ptr as *mut f32).add(ur) = dot as f32 * inv_scale_in * up_w[ur]; }
+                }
+            };
             let next_row = AtomicU64::new(0);
             rayon::scope(|s| {
-                for _ in 1..num_threads {
-                    s.spawn(|_| loop {
-                        let start = next_row.fetch_add(chunk12 as u64, Ordering::Relaxed) as usize;
-                        if start >= total_rows12 { break; }
-                        let end = (start + chunk12).min(total_rows12);
-                        for r in start..end {
-                            if r < inter {
-                                let w_row = &gate_packed[r * bytes_gate .. (r + 1) * bytes_gate];
-                                let dot = match pack_type {
-                                    TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                    TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                                };
-                                unsafe { *(gate_ptr as *mut f32).add(r) = dot as f32 * inv_scale_in * gate_w[r]; }
-                            } else {
-                                let ur = r - inter;
-                                let w_row = &up_packed[ur * bytes_gate .. (ur + 1) * bytes_gate];
-                                let dot = match pack_type {
-                                    TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                    TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                                };
-                                unsafe { *(up_ptr as *mut f32).add(ur) = dot as f32 * inv_scale_in * up_w[ur]; }
+                for _ in 0..num_threads {
+                    s.spawn(|_| {
+                        loop {
+                            let start = next_row.fetch_add(chunk12 as u64, Ordering::Relaxed) as usize;
+                            if start >= total_rows12 {
+                                break;
+                            }
+                            let end = (start + chunk12).min(total_rows12);
+                            for r in start..end {
+                                compute12(r);
                             }
                         }
                     });
-                }
-                loop {
-                    let start = next_row.fetch_add(chunk12 as u64, Ordering::Relaxed) as usize;
-                    if start >= total_rows12 { break; }
-                    let end = (start + chunk12).min(total_rows12);
-                    for r in start..end {
-                        if r < inter {
-                            let w_row = &gate_packed[r * bytes_gate .. (r + 1) * bytes_gate];
-                            let dot = match pack_type {
-                                TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                            };
-                            unsafe { *(gate_ptr as *mut f32).add(r) = dot as f32 * inv_scale_in * gate_w[r]; }
-                        } else {
-                            let ur = r - inter;
-                            let w_row = &up_packed[ur * bytes_gate .. (ur + 1) * bytes_gate];
-                            let dot = match pack_type {
-                                TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                            };
-                            unsafe { *(up_ptr as *mut f32).add(ur) = dot as f32 * inv_scale_in * up_w[ur]; }
-                        }
-                    }
                 }
             });
         }
@@ -504,35 +442,26 @@ impl TernaryLinear {
             let down_packed = &down_lin.packed_weights;
             let down_w = &down_lin.w_scales;
             {
+                let compute_down = |r: usize| {
+                    let w_row = &down_packed[r * bytes_down..(r + 1) * bytes_down];
+                    let dot = ternary_dot(pack_type, &quantized_mid, w_row, inter);
+                    unsafe { *(down_ptr as *mut f32).add(r) = dot as f32 * inv_scale_mid * down_w[r]; }
+                };
                 let next_row3 = AtomicU64::new(0);
                 rayon::scope(|s| {
-                    for _ in 1..num_threads {
-                        s.spawn(|_| loop {
-                            let start = next_row3.fetch_add(chunk3 as u64, Ordering::Relaxed) as usize;
-                            if start >= out_dim { break; }
-                            let end = (start + chunk3).min(out_dim);
-                            for r in start..end {
-                                let w_row = &down_packed[r * bytes_down .. (r + 1) * bytes_down];
-                                let dot = match pack_type {
-                                    TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_mid, w_row, inter),
-                                    TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_mid, w_row, inter),
-                                };
-                                unsafe { *(down_ptr as *mut f32).add(r) = dot as f32 * inv_scale_mid * down_w[r]; }
+                    for _ in 0..num_threads {
+                        s.spawn(|_| {
+                            loop {
+                                let start = next_row3.fetch_add(chunk3 as u64, Ordering::Relaxed) as usize;
+                                if start >= out_dim {
+                                    break;
+                                }
+                                let end = (start + chunk3).min(out_dim);
+                                for r in start..end {
+                                    compute_down(r);
+                                }
                             }
                         });
-                    }
-                    loop {
-                        let start = next_row3.fetch_add(chunk3 as u64, Ordering::Relaxed) as usize;
-                        if start >= out_dim { break; }
-                        let end = (start + chunk3).min(out_dim);
-                        for r in start..end {
-                            let w_row = &down_packed[r * bytes_down .. (r + 1) * bytes_down];
-                            let dot = match pack_type {
-                                TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_mid, w_row, inter),
-                                TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_mid, w_row, inter),
-                            };
-                            unsafe { *(down_ptr as *mut f32).add(r) = dot as f32 * inv_scale_mid * down_w[r]; }
-                        }
                     }
                 });
             }
@@ -556,35 +485,26 @@ impl TernaryLinear {
         let down_packed = &down_lin.packed_weights;
         let down_w      = &down_lin.w_scales;
         {
+            let compute_down = |r: usize| {
+                let w_row = &down_packed[r * bytes_down..(r + 1) * bytes_down];
+                let dot = ternary_dot(pack_type, &quantized_mid, w_row, inter);
+                unsafe { *(down_ptr as *mut f32).add(r) = dot as f32 * inv_scale_mid * down_w[r]; }
+            };
             let next_row3 = AtomicU64::new(0);
             rayon::scope(|s| {
-                for _ in 1..num_threads {
-                    s.spawn(|_| loop {
-                        let start = next_row3.fetch_add(chunk3 as u64, Ordering::Relaxed) as usize;
-                        if start >= out_dim { break; }
-                        let end = (start + chunk3).min(out_dim);
-                        for r in start..end {
-                            let w_row = &down_packed[r * bytes_down .. (r + 1) * bytes_down];
-                            let dot = match pack_type {
-                                TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_mid, w_row, inter),
-                                TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_mid, w_row, inter),
-                            };
-                            unsafe { *(down_ptr as *mut f32).add(r) = dot as f32 * inv_scale_mid * down_w[r]; }
+                for _ in 0..num_threads {
+                    s.spawn(|_| {
+                        loop {
+                            let start = next_row3.fetch_add(chunk3 as u64, Ordering::Relaxed) as usize;
+                            if start >= out_dim {
+                                break;
+                            }
+                            let end = (start + chunk3).min(out_dim);
+                            for r in start..end {
+                                compute_down(r);
+                            }
                         }
                     });
-                }
-                loop {
-                    let start = next_row3.fetch_add(chunk3 as u64, Ordering::Relaxed) as usize;
-                    if start >= out_dim { break; }
-                    let end = (start + chunk3).min(out_dim);
-                    for r in start..end {
-                        let w_row = &down_packed[r * bytes_down .. (r + 1) * bytes_down];
-                        let dot = match pack_type {
-                            TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_mid, w_row, inter),
-                            TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_mid, w_row, inter),
-                        };
-                        unsafe { *(down_ptr as *mut f32).add(r) = dot as f32 * inv_scale_mid * down_w[r]; }
-                    }
                 }
             });
         }
@@ -640,55 +560,33 @@ impl TernaryLinear {
         let pack_type   = gate_lin.pack_type;
 
         {
+            let compute12 = |r: usize| {
+                if r < inter {
+                    let w_row = &gate_packed[r * bytes_gate..(r + 1) * bytes_gate];
+                    let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                    unsafe { *(gate_ptr as *mut f32).add(r) = dot as f32 * inv_scale_in * gate_w[r]; }
+                } else {
+                    let ur = r - inter;
+                    let w_row = &up_packed[ur * bytes_gate..(ur + 1) * bytes_gate];
+                    let dot = ternary_dot(pack_type, quantized_in, w_row, in_dim);
+                    unsafe { *(up_ptr as *mut f32).add(ur) = dot as f32 * inv_scale_in * up_w[ur]; }
+                }
+            };
             let next_row = AtomicU64::new(0);
             rayon::scope(|s| {
-                for _ in 1..num_threads {
-                    s.spawn(|_| loop {
-                        let start = next_row.fetch_add(chunk12 as u64, Ordering::Relaxed) as usize;
-                        if start >= total_rows12 { break; }
-                        let end = (start + chunk12).min(total_rows12);
-                        for r in start..end {
-                            if r < inter {
-                                let w_row = &gate_packed[r * bytes_gate .. (r + 1) * bytes_gate];
-                                let dot = match pack_type {
-                                    TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                    TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                                };
-                                unsafe { *(gate_ptr as *mut f32).add(r) = dot as f32 * inv_scale_in * gate_w[r]; }
-                            } else {
-                                let ur = r - inter;
-                                let w_row = &up_packed[ur * bytes_gate .. (ur + 1) * bytes_gate];
-                                let dot = match pack_type {
-                                    TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                    TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                                };
-                                unsafe { *(up_ptr as *mut f32).add(ur) = dot as f32 * inv_scale_in * up_w[ur]; }
+                for _ in 0..num_threads {
+                    s.spawn(|_| {
+                        loop {
+                            let start = next_row.fetch_add(chunk12 as u64, Ordering::Relaxed) as usize;
+                            if start >= total_rows12 {
+                                break;
+                            }
+                            let end = (start + chunk12).min(total_rows12);
+                            for r in start..end {
+                                compute12(r);
                             }
                         }
                     });
-                }
-                loop {
-                    let start = next_row.fetch_add(chunk12 as u64, Ordering::Relaxed) as usize;
-                    if start >= total_rows12 { break; }
-                    let end = (start + chunk12).min(total_rows12);
-                    for r in start..end {
-                        if r < inter {
-                            let w_row = &gate_packed[r * bytes_gate .. (r + 1) * bytes_gate];
-                            let dot = match pack_type {
-                                TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                            };
-                            unsafe { *(gate_ptr as *mut f32).add(r) = dot as f32 * inv_scale_in * gate_w[r]; }
-                        } else {
-                            let ur = r - inter;
-                            let w_row = &up_packed[ur * bytes_gate .. (ur + 1) * bytes_gate];
-                            let dot = match pack_type {
-                                TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
-                                TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
-                            };
-                            unsafe { *(up_ptr as *mut f32).add(ur) = dot as f32 * inv_scale_in * up_w[ur]; }
-                        }
-                    }
                 }
             });
         }
