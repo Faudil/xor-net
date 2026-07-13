@@ -79,8 +79,8 @@ impl TernaryLinear {
         
         if b_size == 1 {
             let in_row = &input_slice[0 .. in_dim];
-            let (quantized_in, inv_scale) = quantize_f32_to_i8(in_row);
-            
+            let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(in_dim);
+            let inv_scale = quantize_f32_to_i8(in_row, &mut quantized_in);
             
             let num_threads = crate::util::get_num_threads();
             let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
@@ -97,11 +97,12 @@ impl TernaryLinear {
                     *out_val = dot_i32 as f32 * inv_scale * self.w_scales[o];
                 }
             });
+            crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
         } else {
             out_data.par_chunks_mut(out_dim).enumerate().for_each(|(b, out_row)| {
+                let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(in_dim);
                 let in_row = &input_slice[b * in_dim .. (b + 1) * in_dim];
-                let (quantized_in, inv_scale) = quantize_f32_to_i8(in_row);
-                
+                let inv_scale = quantize_f32_to_i8(in_row, &mut quantized_in);
                 
                 for o in 0..out_dim {
                     let w_row = &self.packed_weights[o * bytes_per_row .. (o + 1) * bytes_per_row];
@@ -111,6 +112,7 @@ impl TernaryLinear {
                     };
                     out_row[o] = dot_i32 as f32 * inv_scale * self.w_scales[o];
                 }
+                crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
             });
         }
         
@@ -368,5 +370,231 @@ impl TernaryLinear {
         let fc2_tensor = FastTensor::new(fc2_out, out_shape);
 
         (fc1_tensor, fc2_tensor)
+    }
+
+    /// Fused gate+up+silu+down in two tightly-coupled rayon scopes.
+    ///
+    /// Saves vs. the old path:
+    ///  - 1 fewer `DynamicLinear::forward` dispatch (no virtual call + shape boxing)
+    ///  - 1 fewer `get_pooled_buffer` / `return_pooled_buffer` round-trip for the down output
+    ///  - 1 fewer standalone `quantize_f32_to_i8` pool acquire for the silu → i8 buffer
+    ///  - Tighter spatial locality: silu buffer is quantized immediately while still L3-warm
+    ///
+    /// `use_silu`: true = SiLU activation (gate * σ(gate) * up), false = ReLU² (max(gate,0)² * up)
+    pub fn fused_mlp_all(
+        xs: &FastTensor,
+        quantized_in: &[i8],      // pre-quantized input (hidden_size i8 values)
+        inv_scale_in: f32,        // inverse scale for the input quantization
+        gate_lin: &TernaryLinear, // gate_proj: hidden→intermediate
+        up_lin: &TernaryLinear,   // up_proj:   hidden→intermediate
+        down_lin: &TernaryLinear, // down_proj: intermediate→hidden
+        ffn_norm: Option<&crate::nn::FastRmsNorm>,
+        use_silu: bool,
+    ) -> anyhow::Result<FastTensor> {
+        let rank = xs.shape.len();
+        let in_dim   = gate_lin.in_dim;    // hidden_size   e.g. 2048
+        let inter    = gate_lin.out_dim;   // intermediate  e.g. 5504
+        let out_dim  = down_lin.out_dim;   // hidden_size   e.g. 2048
+
+        // ── Phase 1: gate + up in parallel ──────────────────────────────────
+        let mut gate_buf = crate::tensor::workspace::get_pooled_buffer(inter);
+        let mut up_buf   = crate::tensor::workspace::get_pooled_buffer(inter);
+
+        let bytes_gate = match gate_lin.pack_type {
+            TernaryPackType::Pack4 => (in_dim + 3) / 4,
+            TernaryPackType::Pack5 => (in_dim + 4) / 5,
+        };
+        let bytes_down = match down_lin.pack_type {
+            TernaryPackType::Pack4 => (inter + 3) / 4,
+            TernaryPackType::Pack5 => (inter + 4) / 5,
+        };
+
+        let total_rows12 = inter + inter; // gate rows + up rows
+        let num_threads  = rayon::current_num_threads();
+        let chunk12      = ((total_rows12 + num_threads - 1) / num_threads).max(128);
+
+        let gate_ptr: usize = gate_buf.as_mut_ptr() as usize;
+        let up_ptr:   usize = up_buf.as_mut_ptr() as usize;
+
+        let gate_packed = &gate_lin.packed_weights;
+        let up_packed   = &up_lin.packed_weights;
+        let gate_w      = &gate_lin.w_scales;
+        let up_w        = &up_lin.w_scales;
+        let pack_type   = gate_lin.pack_type;
+
+        {
+            let next_row = AtomicU64::new(0);
+            rayon::scope(|s| {
+                for _ in 1..num_threads {
+                    s.spawn(|_| loop {
+                        let start = next_row.fetch_add(chunk12 as u64, Ordering::Relaxed) as usize;
+                        if start >= total_rows12 { break; }
+                        let end = (start + chunk12).min(total_rows12);
+                        for r in start..end {
+                            if r < inter {
+                                let w_row = &gate_packed[r * bytes_gate .. (r + 1) * bytes_gate];
+                                let dot = match pack_type {
+                                    TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
+                                    TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
+                                };
+                                unsafe { *(gate_ptr as *mut f32).add(r) = dot as f32 * inv_scale_in * gate_w[r]; }
+                            } else {
+                                let ur = r - inter;
+                                let w_row = &up_packed[ur * bytes_gate .. (ur + 1) * bytes_gate];
+                                let dot = match pack_type {
+                                    TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
+                                    TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
+                                };
+                                unsafe { *(up_ptr as *mut f32).add(ur) = dot as f32 * inv_scale_in * up_w[ur]; }
+                            }
+                        }
+                    });
+                }
+                loop {
+                    let start = next_row.fetch_add(chunk12 as u64, Ordering::Relaxed) as usize;
+                    if start >= total_rows12 { break; }
+                    let end = (start + chunk12).min(total_rows12);
+                    for r in start..end {
+                        if r < inter {
+                            let w_row = &gate_packed[r * bytes_gate .. (r + 1) * bytes_gate];
+                            let dot = match pack_type {
+                                TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
+                                TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
+                            };
+                            unsafe { *(gate_ptr as *mut f32).add(r) = dot as f32 * inv_scale_in * gate_w[r]; }
+                        } else {
+                            let ur = r - inter;
+                            let w_row = &up_packed[ur * bytes_gate .. (ur + 1) * bytes_gate];
+                            let dot = match pack_type {
+                                TernaryPackType::Pack4 => ternary_dot_product_pack4(quantized_in, w_row, in_dim),
+                                TernaryPackType::Pack5 => ternary_dot_product_pack5(quantized_in, w_row, in_dim),
+                            };
+                            unsafe { *(up_ptr as *mut f32).add(ur) = dot as f32 * inv_scale_in * up_w[ur]; }
+                        }
+                    }
+                }
+            });
+        }
+
+        // ── Phase 2: activation element-wise (main thread, fast) ────────────
+        if use_silu {
+            for i in 0..inter {
+                let g = gate_buf[i];
+                let u = up_buf[i];
+                gate_buf[i] = g * (1.0 / (1.0 + (-g).exp())) * u;
+            }
+        } else {
+            // ReLU²
+            for i in 0..inter {
+                let g = gate_buf[i].max(0.0);
+                gate_buf[i] = g * g * up_buf[i];
+            }
+        }
+        crate::tensor::workspace::return_pooled_buffer(up_buf);
+
+        // ── Phase 2b: optional ffn layernorm ────────────────────────────────
+        if let Some(ln) = ffn_norm {
+            let mut norm_shape = xs.shape.clone();
+            norm_shape[rank - 1] = inter;
+            let mid_tensor = FastTensor::new(gate_buf, norm_shape);
+            let normed = ln.forward(&mid_tensor)?;
+            // quantize the normed output
+            let mut quantized_mid = crate::tensor::workspace::get_pooled_buffer_i8(inter);
+            let inv_scale_mid = crate::bit1_58::quantization::quantize_f32_to_i8(&normed.data, &mut quantized_mid);
+
+            // Phase 3 with normed data
+            let mut down_buf = crate::tensor::workspace::get_pooled_buffer(out_dim);
+            let chunk3 = ((out_dim + num_threads - 1) / num_threads).max(128);
+            let down_ptr: usize = down_buf.as_mut_ptr() as usize;
+            let down_packed = &down_lin.packed_weights;
+            let down_w = &down_lin.w_scales;
+            {
+                let next_row3 = AtomicU64::new(0);
+                rayon::scope(|s| {
+                    for _ in 1..num_threads {
+                        s.spawn(|_| loop {
+                            let start = next_row3.fetch_add(chunk3 as u64, Ordering::Relaxed) as usize;
+                            if start >= out_dim { break; }
+                            let end = (start + chunk3).min(out_dim);
+                            for r in start..end {
+                                let w_row = &down_packed[r * bytes_down .. (r + 1) * bytes_down];
+                                let dot = match pack_type {
+                                    TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_mid, w_row, inter),
+                                    TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_mid, w_row, inter),
+                                };
+                                unsafe { *(down_ptr as *mut f32).add(r) = dot as f32 * inv_scale_mid * down_w[r]; }
+                            }
+                        });
+                    }
+                    loop {
+                        let start = next_row3.fetch_add(chunk3 as u64, Ordering::Relaxed) as usize;
+                        if start >= out_dim { break; }
+                        let end = (start + chunk3).min(out_dim);
+                        for r in start..end {
+                            let w_row = &down_packed[r * bytes_down .. (r + 1) * bytes_down];
+                            let dot = match pack_type {
+                                TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_mid, w_row, inter),
+                                TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_mid, w_row, inter),
+                            };
+                            unsafe { *(down_ptr as *mut f32).add(r) = dot as f32 * inv_scale_mid * down_w[r]; }
+                        }
+                    }
+                });
+            }
+            crate::tensor::workspace::return_pooled_buffer_i8(quantized_mid);
+            let mut out_shape = xs.shape.clone();
+            out_shape[rank - 1] = out_dim;
+            return Ok(FastTensor::new(down_buf, out_shape));
+        }
+
+        // ── Phase 2c: quantize silu output (gate_buf is now silu result) ────
+        let mut quantized_mid = crate::tensor::workspace::get_pooled_buffer_i8(inter);
+        let inv_scale_mid = crate::bit1_58::quantization::quantize_f32_to_i8(&gate_buf, &mut quantized_mid);
+        crate::tensor::workspace::return_pooled_buffer(gate_buf);
+
+        // ── Phase 3: down_proj ───────────────────────────────────────────────
+        let mut down_buf = crate::tensor::workspace::get_pooled_buffer(out_dim);
+        let chunk3    = ((out_dim + num_threads - 1) / num_threads).max(128);
+        let down_ptr: usize = down_buf.as_mut_ptr() as usize;
+        let down_packed = &down_lin.packed_weights;
+        let down_w      = &down_lin.w_scales;
+        {
+            let next_row3 = AtomicU64::new(0);
+            rayon::scope(|s| {
+                for _ in 1..num_threads {
+                    s.spawn(|_| loop {
+                        let start = next_row3.fetch_add(chunk3 as u64, Ordering::Relaxed) as usize;
+                        if start >= out_dim { break; }
+                        let end = (start + chunk3).min(out_dim);
+                        for r in start..end {
+                            let w_row = &down_packed[r * bytes_down .. (r + 1) * bytes_down];
+                            let dot = match pack_type {
+                                TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_mid, w_row, inter),
+                                TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_mid, w_row, inter),
+                            };
+                            unsafe { *(down_ptr as *mut f32).add(r) = dot as f32 * inv_scale_mid * down_w[r]; }
+                        }
+                    });
+                }
+                loop {
+                    let start = next_row3.fetch_add(chunk3 as u64, Ordering::Relaxed) as usize;
+                    if start >= out_dim { break; }
+                    let end = (start + chunk3).min(out_dim);
+                    for r in start..end {
+                        let w_row = &down_packed[r * bytes_down .. (r + 1) * bytes_down];
+                        let dot = match pack_type {
+                            TernaryPackType::Pack4 => ternary_dot_product_pack4(&quantized_mid, w_row, inter),
+                            TernaryPackType::Pack5 => ternary_dot_product_pack5(&quantized_mid, w_row, inter),
+                        };
+                        unsafe { *(down_ptr as *mut f32).add(r) = dot as f32 * inv_scale_mid * down_w[r]; }
+                    }
+                }
+            });
+        }
+        crate::tensor::workspace::return_pooled_buffer_i8(quantized_mid);
+
+        let mut out_shape = xs.shape.clone();
+        out_shape[rank - 1] = out_dim;
+        Ok(FastTensor::new(down_buf, out_shape))
     }
 }

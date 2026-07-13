@@ -16,7 +16,7 @@ use jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 const SYSTEM_PROMPT: &str = "You are a helpful, knowledgeable, and friendly AI assistant. You provide clear, concise, and accurate responses.";
-const MAX_NEW_TOKENS: usize = 1024;
+const MAX_NEW_TOKENS: usize = 2048;
 
 fn load_hf_model(
     repo_id: &str,
@@ -44,7 +44,7 @@ fn load_hf_model(
 fn load_local_model(model_dir: &Path) -> anyhow::Result<(Llama, Config, Tokenizer)> {
     eprintln!("Loading model from: {}...", model_dir.display());
     let load_start = Instant::now();
-    let (model, config) = AutoModelForCausalLM::from_local(model_dir, QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4))?;
+    let (model, config) = AutoModelForCausalLM::from_local(model_dir, QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, false))?;
     eprintln!("Model loaded in {:.2?}", load_start.elapsed());
 
     let tokenizer_path = model_dir.join("tokenizer.json");
@@ -112,23 +112,23 @@ fn main() -> anyhow::Result<()> {
         "2b" => load_hf_model(
             "microsoft/bitnet-b1.58-2B-4T",
             "main",
-            QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8),
+            QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8, false),
         )?,
         "3b" => load_hf_model(
             "1bitLLM/bitnet_b1_58-3B",
             "main",
-            QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4),
+            QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, false),
         )?,
         "8b" => load_hf_model(
             "HF1BitLLM/Llama3-8B-1.58-100B-tokens",
             "main",
-            QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8),
+            QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8, true),
         )?,
         _ => load_local_model(Path::new(model_arg))?,
     };
 
     let mut cache = Cache::new(true, &config)?;
-    let mut sampler = Sampler::new(42, Some(0.8), Some(0.95), 1.1);
+    let mut sampler = Sampler::new(42, Some(0.8), Some(0.95), 1.2);
 
     println!("\n╔══════════════════════════════════════╗");
     println!("║        XorNet Chat v0.1              ║");
@@ -157,6 +157,10 @@ fn main() -> anyhow::Result<()> {
 
         let use_llama3 = uses_llama3_template(&config);
         let is_llama3_base = !use_llama3 && is_llama3_tokenizer(&config);
+        let is_general_base = model_arg == "3b" || model_arg == "8b";
+
+        // Force general base logic for undertrained models
+        let use_llama3 = use_llama3 && !is_general_base;
 
         if use_llama3 {
             let user_prompt = if context_tokens.is_empty() {
@@ -182,6 +186,21 @@ fn main() -> anyhow::Result<()> {
                 format!("System: {}\nUser: {}<|eot_id|>\nAssistant: ", SYSTEM_PROMPT, input)
             } else {
                 format!("User: {}<|eot_id|>\nAssistant: ", input)
+            };
+
+            let add_special = context_tokens.is_empty();
+            let user_ids = tokenizer
+                .encode(user_prompt.as_str(), add_special)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                .get_ids()
+                .to_vec();
+
+            context_tokens.extend(&user_ids);
+        } else if is_general_base {
+            let user_prompt = if context_tokens.is_empty() {
+                format!("Question: {}\nAnswer: ", input)
+            } else {
+                format!("\nQuestion: {}\nAnswer: ", input)
             };
 
             let add_special = context_tokens.is_empty();
@@ -293,11 +312,22 @@ fn main() -> anyhow::Result<()> {
         );
         println!(" Forward: {total_forward:.2?} | Sample: {total_sample:.2?}");
         if generated > 0 {
+            let g = generated as f64;
             println!(
                 " Blocks: {:.2}ms/tok | LM Head: {:.2}ms/tok | Other: {:.2}ms/tok",
-                blocks_ms / generated as f64,
-                lm_head_ms / generated as f64,
-                other_ms / generated as f64,
+                blocks_ms / g,
+                lm_head_ms / g,
+                other_ms / g,
+            );
+            let (attn_us, _attn_math_us, mlp_us, mlp_down_us, norm_us) =
+                xor_net::models::llama::get_detailed_stats();
+            let mlp_gate_up_us = mlp_us.saturating_sub(mlp_down_us);
+            println!(
+                " └ Attn: {:.2}ms/tok | MLP gate+up: {:.2}ms/tok | MLP down: {:.2}ms/tok | Norms: {:.2}ms/tok",
+                attn_us as f64 / 1000.0 / g,
+                mlp_gate_up_us as f64 / 1000.0 / g,
+                mlp_down_us as f64 / 1000.0 / g,
+                norm_us as f64 / 1000.0 / g,
             );
         }
         println!("{}", "─".repeat(46));

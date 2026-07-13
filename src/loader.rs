@@ -290,6 +290,7 @@ impl<'a> SafeTensorLoader<'a> {
         expected_shape: &[usize],
         name: &str,
         pack_type: TernaryPackType,
+        is_inverted_scale: bool,
     ) -> anyhow::Result<(Vec<u8>, Vec<f32>, usize, usize)> {
         let key = if self.prefix.is_empty() {
             name.to_string()
@@ -324,8 +325,13 @@ impl<'a> SafeTensorLoader<'a> {
             .ok_or_else(|| anyhow::anyhow!("Packed weight '{}' has no companion weight_scale '{}'", key, scale_key))?;
         let sbytes = &self.repo.buffers[sinfo.file_idx][sinfo.start..sinfo.end];
         let scale_data = convert_to_f32_vec(sbytes, sinfo.dtype)?;
-        // The stored weight_scale is the actual multiplier (γ).
-        let w_scale = scale_data[0];
+        // The stored weight_scale is the actual multiplier (γ) for official checkpoints,
+        // but inverted (1 / γ) for HF1BitLLM checkpoints. We configure this externally.
+        let w_scale = if is_inverted_scale {
+            1.0 / scale_data[0]
+        } else {
+            scale_data[0]
+        };
 
         let out_dim = expected_out;
         let in_dim = expected_in;

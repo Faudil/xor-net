@@ -53,9 +53,10 @@ impl CustomOp1 for TernaryMatMulOp {
         use rayon::prelude::*;
         
         out_data.par_chunks_mut(self.out_dim).enumerate().for_each(|(b, out_row)| {
+            let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(self.in_dim);
             let in_row = &input_slice[b * self.in_dim .. (b + 1) * self.in_dim];
             
-            let (quantized_in, inv_scale) = quantize_f32_to_i8(in_row);
+            let inv_scale = quantize_f32_to_i8(in_row, &mut quantized_in);
             
             
             let chunk_size = (self.out_dim / rayon::current_num_threads().max(1)).max(128);
@@ -73,6 +74,7 @@ impl CustomOp1 for TernaryMatMulOp {
                     *out_val = dot_i32 as f32 * inv_scale * self.w_scales[o];
                 }
             });
+            crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
         });
         
         Ok((CpuStorage::F32(out_data), out_shape))

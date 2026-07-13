@@ -305,10 +305,13 @@ impl CausalSelfAttention {
         let (q, k, v) = match (&self.q_proj.inner, &self.k_proj.inner, &self.v_proj.inner) {
             (LinearKind::Ternary(q_lin), LinearKind::Ternary(k_lin), LinearKind::Ternary(v_lin)) if b_size == 1 => {
                 let in_row = &x.data[0 .. q_lin.in_dim];
-                let (quantized_in, inv_scale) = crate::bit1_58::quantization::quantize_f32_to_i8(in_row);
-                crate::bit1_58::layers::TernaryLinear::fused_forward_qkv(
+                let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(q_lin.in_dim);
+                let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
+                let res = crate::bit1_58::layers::TernaryLinear::fused_forward_qkv(
                     x, &quantized_in, inv_scale, q_lin, k_lin, v_lin,
-                )
+                );
+                crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
+                res
             }
             _ => {
                 let q = self.q_proj.forward(x)?;
@@ -397,13 +400,43 @@ impl Mlp {
         }
         let b_size: usize = x.shape[..rank - 1].iter().product();
 
+        // Fast path: all three projections are ternary and batch size is 1.
+        // Quantize the input once and run gate+up+silu+down in two rayon scopes
+        // with no intermediate DynamicLinear dispatch or extra allocations.
+        if b_size == 1 {
+            if let (LinearKind::Ternary(gate_lin), LinearKind::Ternary(up_lin), LinearKind::Ternary(down_lin)) =
+                (&self.c_fc1.inner, &self.c_fc2.inner, &self.c_proj.inner)
+            {
+                let in_row = &x.data[0 .. gate_lin.in_dim];
+                let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(gate_lin.in_dim);
+                let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
+                let use_silu = matches!(self.hidden_act, Activation::Silu);
+                let result = crate::bit1_58::layers::TernaryLinear::fused_mlp_all(
+                    x,
+                    &quantized_in,
+                    inv_scale,
+                    gate_lin,
+                    up_lin,
+                    down_lin,
+                    self.ffn_layernorm.as_ref(),
+                    use_silu,
+                );
+                crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
+                return result;
+            }
+        }
+
+        // Fallback: non-ternary or batched path
         let (h1, h2) = match (&self.c_fc1.inner, &self.c_fc2.inner) {
             (LinearKind::Ternary(fc1_lin), LinearKind::Ternary(fc2_lin)) if b_size == 1 => {
                 let in_row = &x.data[0 .. fc1_lin.in_dim];
-                let (quantized_in, inv_scale) = crate::bit1_58::quantization::quantize_f32_to_i8(in_row);
-                crate::bit1_58::layers::TernaryLinear::fused_forward_mlp(
+                let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(fc1_lin.in_dim);
+                let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
+                let res = crate::bit1_58::layers::TernaryLinear::fused_forward_mlp(
                     x, &quantized_in, inv_scale, fc1_lin, fc2_lin,
-                )
+                );
+                crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
+                res
             }
             _ => {
                 let h1 = self.c_fc1.forward(x)?;
@@ -416,11 +449,14 @@ impl Mlp {
             Activation::Relu2 => h1.relu2_mul_inplace(&h2)?,
             Activation::Silu => h1.silu_mul_inplace(&h2)?,
         };
-        let x_norm = match &self.ffn_layernorm { 
-            Some(ln) => ln.forward(&x_mul)?, 
-            None => x_mul 
+        let x_norm = match &self.ffn_layernorm {
+            Some(ln) => ln.forward(&x_mul)?,
+            None => x_mul
         };
-        self.c_proj.forward(&x_norm)
+        let t_down = std::time::Instant::now();
+        let result = self.c_proj.forward(&x_norm);
+        TIME_MLP_DOWN.fetch_add(t_down.elapsed().as_micros() as u64, Ordering::Relaxed);
+        result
     }
 
     fn load(loader: SafeTensorLoader, cfg: &Config) -> anyhow::Result<Self> {
@@ -462,13 +498,30 @@ impl Block {
         block_idx: usize,
         cache: &mut Cache,
     ) -> anyhow::Result<FastTensor> {
+        let t0 = std::time::Instant::now();
         let x_norm1 = self.rms_1.forward(x)?;
+        TIME_NORM.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t1 = std::time::Instant::now();
         let attn_out = self.attn.forward(&x_norm1, index_pos, block_idx, cache)?;
+        TIME_ATTN_GEMV.fetch_add(t1.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t2 = std::time::Instant::now();
         let x_add = attn_out.add_inplace(x)?;
-        
+        TIME_NORM.fetch_add(t2.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t3 = std::time::Instant::now();
         let x_norm2 = self.rms_2.forward(&x_add)?;
+        TIME_NORM.fetch_add(t3.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t4 = std::time::Instant::now();
         let mlp_out = self.mlp.forward(&x_norm2)?;
-        x_add.add_inplace(&mlp_out)
+        TIME_MLP_GEMV.fetch_add(t4.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t5 = std::time::Instant::now();
+        let result = x_add.add_inplace(&mlp_out);
+        TIME_NORM.fetch_add(t5.elapsed().as_micros() as u64, Ordering::Relaxed);
+        result
     }
 
     fn load(loader: SafeTensorLoader, cfg: &Config) -> anyhow::Result<Self> {
@@ -490,12 +543,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub static TIME_BLOCKS: AtomicU64 = AtomicU64::new(0);
 pub static TIME_LM_HEAD: AtomicU64 = AtomicU64::new(0);
 pub static TIME_OTHER: AtomicU64 = AtomicU64::new(0);
+// Fine-grained breakdown inside a block
+pub static TIME_ATTN_GEMV: AtomicU64 = AtomicU64::new(0);  // full CausalSelfAttention::forward
+pub static TIME_ATTN_MATH: AtomicU64 = AtomicU64::new(0);  // unused, reserved
+pub static TIME_MLP_GEMV: AtomicU64 = AtomicU64::new(0);   // gate+up+silu+down total
+pub static TIME_MLP_DOWN: AtomicU64 = AtomicU64::new(0);   // just down_proj
+pub static TIME_NORM: AtomicU64 = AtomicU64::new(0);       // rms norms + residuals
 
 pub fn get_profiling_stats() -> (u64, u64, u64) {
     (
         TIME_BLOCKS.load(Ordering::Relaxed),
         TIME_LM_HEAD.load(Ordering::Relaxed),
         TIME_OTHER.load(Ordering::Relaxed),
+    )
+}
+
+pub fn get_detailed_stats() -> (u64, u64, u64, u64, u64) {
+    (
+        TIME_ATTN_GEMV.load(Ordering::Relaxed),
+        TIME_ATTN_MATH.load(Ordering::Relaxed),
+        TIME_MLP_GEMV.load(Ordering::Relaxed),
+        TIME_MLP_DOWN.load(Ordering::Relaxed),
+        TIME_NORM.load(Ordering::Relaxed),
     )
 }
 

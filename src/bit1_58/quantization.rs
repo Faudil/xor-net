@@ -167,14 +167,12 @@ fn has_avx512f() -> bool {
     detected
 }
 
-pub fn quantize_f32_to_i8(activations: &[f32]) -> (Vec<i8>, f32) {
-    let mut quantized = crate::util::uninit_vec(activations.len());
-    
+pub fn quantize_f32_to_i8(activations: &[f32], quantized: &mut [i8]) -> f32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if has_avx512f() {
-            let inv_scale = unsafe { quantize_f32_to_i8_avx512(activations, &mut quantized) };
-            return (quantized, inv_scale);
+            let inv_scale = unsafe { quantize_f32_to_i8_avx512(activations, quantized) };
+            return inv_scale;
         }
     }
 
@@ -188,11 +186,10 @@ pub fn quantize_f32_to_i8(activations: &[f32]) -> (Vec<i8>, f32) {
     let scale = if max_abs > 0.0 { 127.0 / max_abs } else { 1.0 };
     let inv_scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
     
-    for i in 0..activations.len() {
-        let q = (activations[i] * scale).round();
-        let q_clamped = q.max(-127.0).min(127.0) as i8;
-        quantized[i] = q_clamped;
+    for (q_out, &x) in quantized.iter_mut().zip(activations.iter()) {
+        let q = (x * scale).round();
+        *q_out = q.max(-127.0).min(127.0) as i8;
     }
     
-    (quantized, inv_scale)
+    inv_scale
 }

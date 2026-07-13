@@ -10,7 +10,11 @@ pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], tota
     let b_ptr = b_pack4.as_ptr();
 
     let zero = _mm512_setzero_si512();
-    let mut acc = zero;
+    // 4 independent accumulators hide the ~5-cycle add_epi32 latency
+    let mut acc0 = zero;
+    let mut acc1 = zero;
+    let mut acc2 = zero;
+    let mut acc3 = zero;
     let ones_u8 = _mm512_set1_epi8(1);
     let ones_i16 = _mm512_set1_epi16(1);
     let mask3 = _mm512_set1_epi32(0x03);
@@ -22,36 +26,70 @@ pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], tota
     );
 
     let chunks64 = total_elems / 64;
+    let step4 = chunks64 / 4 * 4;
     let mut idx = 0usize;
+
+    while idx < step4 {
+        _mm_prefetch(b_ptr.add(idx * 16 + 64) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(b_ptr.add(idx * 16 + 128) as *const i8, _MM_HINT_T0);
+
+        macro_rules! block {
+            ($acc:expr, $i:expr) => {{
+                let acts = _mm512_loadu_si512(a_ptr.add(idx + $i));
+                let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(b_ptr.add((idx + $i) * 16) as *const __m128i));
+                let p0 = _mm512_and_si512(w32, mask3);
+                let p1 = _mm512_and_si512(_mm512_srli_epi32(w32, 2), mask3);
+                let p2 = _mm512_and_si512(_mm512_srli_epi32(w32, 4), mask3);
+                let p3 = _mm512_and_si512(_mm512_srli_epi32(w32, 6), mask3);
+                let packed = _mm512_or_si512(
+                    _mm512_or_si512(p0, _mm512_slli_epi32(p1, 8)),
+                    _mm512_or_si512(_mm512_slli_epi32(p2, 16), _mm512_slli_epi32(p3, 24)),
+                );
+                let w = _mm512_shuffle_epi8(lut, packed);
+                let pos_mask = _mm512_cmp_epi8_mask(w, zero, 6);
+                let zero_mask = _mm512_cmp_epi8_mask(w, zero, 0);
+                let neg_a = _mm512_sub_epi8(zero, acts);
+                let blend = _mm512_mask_blend_epi8(pos_mask, neg_a, acts);
+                let sa = _mm512_mask_mov_epi8(blend, zero_mask, zero);
+                $acc = _mm512_add_epi32($acc, _mm512_madd_epi16(_mm512_maddubs_epi16(ones_u8, sa), ones_i16));
+            }};
+        }
+
+        block!(acc0, 0);
+        block!(acc1, 1);
+        block!(acc2, 2);
+        block!(acc3, 3);
+
+        idx += 4;
+    }
+
+    // Merge 4 accumulators
+    let mut acc = _mm512_add_epi32(
+        _mm512_add_epi32(acc0, acc1),
+        _mm512_add_epi32(acc2, acc3),
+    );
+
+    // Cleanup: remaining chunks (< 4)
     while idx < chunks64 {
         _mm_prefetch(b_ptr.add(idx * 16 + 256) as *const i8, _MM_HINT_T0);
-
         let acts = _mm512_loadu_si512(a_ptr.add(idx));
         let packed_w = _mm_loadu_si128(b_ptr.add(idx * 16) as *const __m128i);
         let w32 = _mm512_cvtepu8_epi32(packed_w);
-
         let p0 = _mm512_and_si512(w32, mask3);
         let p1 = _mm512_and_si512(_mm512_srli_epi32(w32, 2), mask3);
         let p2 = _mm512_and_si512(_mm512_srli_epi32(w32, 4), mask3);
         let p3 = _mm512_and_si512(_mm512_srli_epi32(w32, 6), mask3);
-
         let packed = _mm512_or_si512(
             _mm512_or_si512(p0, _mm512_slli_epi32(p1, 8)),
-            _mm512_or_si512(_mm512_slli_epi32(p2, 16), _mm512_slli_epi32(p3, 24))
+            _mm512_or_si512(_mm512_slli_epi32(p2, 16), _mm512_slli_epi32(p3, 24)),
         );
-
         let w = _mm512_shuffle_epi8(lut, packed);
-
         let pos_mask = _mm512_cmp_epi8_mask(w, zero, 6);
         let zero_mask = _mm512_cmp_epi8_mask(w, zero, 0);
         let neg_a = _mm512_sub_epi8(zero, acts);
         let blend = _mm512_mask_blend_epi8(pos_mask, neg_a, acts);
         let signed_acts = _mm512_mask_mov_epi8(blend, zero_mask, zero);
-
-        let sums_i16 = _mm512_maddubs_epi16(ones_u8, signed_acts);
-        let sums_i32 = _mm512_madd_epi16(sums_i16, ones_i16);
-        acc = _mm512_add_epi32(acc, sums_i32);
-
+        acc = _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(ones_u8, signed_acts), ones_i16));
         idx += 1;
     }
 
@@ -70,6 +108,7 @@ pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], tota
 
     total
 }
+
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
@@ -173,7 +212,7 @@ pub fn ternary_dot_product_pack4(a_i8: &[i8], b_pack4: &[u8], total_elems: usize
             return unsafe { ternary_dot_product_pack4_avx512(a_i8, b_pack4, total_elems) };
         }
         if is_x86_feature_detected!("avx2") {
-            return unsafe { ternary_dot_product_pack4_avx2(a_i8, b_pack4, total_elems) };
+            return unsafe { crate::bit1_58::lut::ternary_dot_product_pack4_avx2_hybrid(a_i8, b_pack4, total_elems) };
         }
     }
     
