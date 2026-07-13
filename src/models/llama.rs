@@ -685,6 +685,43 @@ impl Llama {
         Ok(logits)
     }
 
+    /// Layer-skipping draft forward for self-speculative decoding. Runs only the
+    /// specified transformer blocks (e.g. every other layer) and returns logits
+    /// for the last token. Cheaper than a full forward; used to propose tokens.
+    pub fn forward_layers(
+        &self,
+        x: &[u32],
+        index_pos: usize,
+        cache: &mut Cache,
+        layers: &[usize],
+    ) -> anyhow::Result<FastTensor> {
+        let mut x = self.wte.forward(x)?;
+        for &bi in layers {
+            x = self.blocks[bi].forward(&x, index_pos, bi, cache)?;
+        }
+        let x = self.ln_f.forward(&x)?;
+        let last = x.slice_last_token()?;
+        let logits = self.lm_head.forward(&last)?;
+        Ok(logits)
+    }
+
+    /// Full forward returning logits for ALL input positions, shape `[seq, vocab]`.
+    /// Used by speculative decoding to verify a drafted sequence in one pass.
+    pub fn forward_all(
+        &self,
+        x: &[u32],
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> anyhow::Result<FastTensor> {
+        let mut x = self.wte.forward(x)?;
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+            x = block.forward(&x, index_pos, block_idx, cache)?;
+        }
+        let x = self.ln_f.forward(&x)?;
+        let logits = self.lm_head.forward(&x)?;
+        Ok(logits)
+    }
+
     pub fn load(loader: &SafeTensorLoader, cfg: &Config) -> anyhow::Result<Self> {
         let wte_weight = loader.get(&[cfg.vocab_size, cfg.hidden_size], "model.embed_tokens.weight")?;
         let wte = FastEmbedding::new(wte_weight);

@@ -98,6 +98,18 @@ fn is_llama3_tokenizer(config: &Config) -> bool {
     config.bos_token_id == Some(128000)
 }
 
+fn argmax(logits: &[f32]) -> u32 {
+    let mut m = f32::NEG_INFINITY;
+    let mut mi = 0usize;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > m {
+            m = v;
+            mi = i;
+        }
+    }
+    mi as u32
+}
+
 fn main() -> anyhow::Result<()> {
     let num_threads = std::env::var("XORNET_THREADS")
         .ok()
@@ -129,6 +141,17 @@ fn main() -> anyhow::Result<()> {
 
     let mut cache = Cache::new(true, &config)?;
     let mut sampler = Sampler::new(42, Some(0.8), Some(0.95), 1.2);
+
+    // Self-speculative decoding (exploration): draft N tokens with a layer-
+    // skipping subset, verify in one batched pass, accept the matching prefix.
+    // Greedy verification. Set XORNET_SPEC=N (e.g. 4) to enable.
+    let spec_n: usize = std::env::var("XORNET_SPEC")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let skip_layers: Vec<usize> = (0..config.num_hidden_layers).step_by(2).collect();
+    let mut spec_accepted = 0usize;
+    let mut spec_drafted = 0usize;
 
     println!("\n╔══════════════════════════════════════╗");
     println!("║        XorNet Chat v0.1              ║");
@@ -255,6 +278,78 @@ fn main() -> anyhow::Result<()> {
             };
             let start_pos = index_pos;
 
+            // ── Self-speculative greedy step ───────────────────────────────
+            if spec_n > 0 && context_size == 1 {
+                // Draft N tokens with the layer-skipping subset.
+                let mut drafts: Vec<u32> = Vec::with_capacity(spec_n);
+                let mut dpos = index_pos;
+                let mut dctx = tokens.clone();
+                for _ in 0..spec_n {
+                    let logits = model.forward_layers(
+                        &[dctx[dctx.len() - 1]],
+                        dpos,
+                        &mut cache,
+                        &skip_layers,
+                    )?;
+                    let ld = logits.into_data();
+                    drafts.push(argmax(&ld));
+                    dctx.push(*drafts.last().unwrap());
+                    dpos += 1;
+                }
+                // Verify the drafted sequence (current token + N drafts) in one
+                // batched pass. dctx already contains the drafts appended.
+                let verify = model.forward_all(
+                    &dctx[index_pos..index_pos + spec_n + 1],
+                    index_pos,
+                    &mut cache,
+                )?;
+                let vd = verify.into_data();
+                let vocab = config.vocab_size;
+                let mut advanced = 0usize;
+                for k in 0..spec_n {
+                    let tgt = argmax(&vd[k * vocab..(k + 1) * vocab]);
+                    if drafts[k] == tgt {
+                        tokens.push(drafts[k]);
+                        response_tokens.push(drafts[k]);
+                        index_pos += 1;
+                        generated += 1;
+                        advanced += 1;
+                    } else {
+                        tokens.push(tgt);
+                        response_tokens.push(tgt);
+                        index_pos += 1;
+                        generated += 1;
+                        advanced += 1;
+                        break;
+                    }
+                }
+                spec_drafted += spec_n;
+                spec_accepted += advanced;
+
+                if let Ok(text) = tokenizer.decode(&response_tokens, true) {
+                    if text.len() > prev_text.len() {
+                        let new_part = &text[prev_text.len()..];
+                        if new_part.is_char_boundary(new_part.len()) {
+                            print!("{new_part}");
+                            io::stdout().flush()?;
+                            prev_text = text.clone();
+                        }
+                    }
+                    if text.ends_with("[User]") || text.ends_with("\nUser:") {
+                        break;
+                    }
+                }
+                if advanced > 0 {
+                    let last = *response_tokens.last().unwrap();
+                    if is_eos_token(last, &config) {
+                        response_tokens.pop();
+                        generated -= 1;
+                        break;
+                    }
+                }
+                continue;
+            }
+
             let t0 = Instant::now();
             let logits = model.forward(&tokens[start_pos..start_pos + context_size], index_pos, &mut cache)?;
             total_forward += t0.elapsed();
@@ -331,6 +426,14 @@ fn main() -> anyhow::Result<()> {
                 norm_us as f64 / 1000.0 / g,
                 silu_us as f64 / 1000.0 / g,
             );
+            if spec_drafted > 0 {
+                let rate = spec_accepted as f64 / spec_drafted as f64;
+                println!(
+                    " └ Speculative: drafted={} accepted={} acceptance={:.1}% (~{:.2} tok/step)",
+                    spec_drafted, spec_accepted, rate * 100.0,
+                    (spec_accepted as f64 / generated.max(1) as f64) * spec_n as f64,
+                );
+            }
         }
         println!("{}", "─".repeat(46));
     }

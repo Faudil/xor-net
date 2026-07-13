@@ -170,6 +170,7 @@ Activations are contiguous memory, but each trit position k needs values at offs
 | Thread scaling | 4, 6, 8, 12 threads | **12 threads best post-VNNI** (memory-bound → SMT helps overlap RAM latency). Old "8 best" was pre-VNNI. |
 | VNNI prefetch distance | `XORNET_VNNI_PREFETCH` swept 256→4096 bytes | **Flat (41.2–41.6 tok/s)** — HW prefetcher already hides DDR5 latency; 256 is optimal |
 | Cache-block / tile GEMV | Tiled micro-kernel for activation reuse | **No-op**: activation is 3.2 KB (already in L1); weights (620 MB/token) ≫ 32 MB L3 must come from RAM every token |
+| Speculative decoding | Self-speculation, layer-skipping draft (every-other layer), `XORNET_SPEC=4` (greedy verify) | **Slower: 13.1 tok/s vs 41.3 baseline** (42.7% acceptance). Verify forward over N tokens costs ≈N× weight traffic — no amortization for a per-token bandwidth-bound GEMV.❌ |
 
 ---
 
@@ -186,7 +187,7 @@ Activations are contiguous memory, but each trit position k needs values at offs
 - **Tile-based matmul**: ❌ No-op for this shape (see experiments table). Activation is 3.2 KB (L1-resident); weight traffic is irreducible.
 - **Quantization fusion**: Fuse activation quantization with the preceding RMSNorm to reduce temporary allocations.
 - **Fused prefill (b_size>1)**: The prefill forward still uses the non-fused `b_size>1` fallback (re-quantizes per row, `down` via `c_proj.forward`). Extending `fused_mlp_all` to `b_size>1` would remove the prefill-only `MLP down` cost and speed up long-context / many-short-exchange chat. One-time per prompt, so low priority for generation-bound workloads.
-- **Speculative decoding**: The dominant cost is weight *traffic* per decode step (RAM-bandwidth-bound). Generating N tokens per step via a draft model (or layer-skipping self-speculation) amortizes that traffic and is the only lever that meaningfully raises tok/s for this algorithm on this hardware.
+- **Speculative decoding**: ❌ **No win on this hardware** (measured: 13.1 tok/s vs 41.3 baseline at N=4). The verify pass over N tokens re-streams the full weight matrices N times — each token's GEMV independently reads all weights from DDR5, so there is **no weight-traffic amortization** (unlike a GPU where weights are cached in HBM). The verify cost therefore scales with N, and even 100% acceptance would still be slower (~27 tok/s). Speculative decoding only helps engines that are compute- or fixed-overhead-bound, not bandwidth-bound ones. The `Llama::forward_layers` / `forward_all` entry points and the `XORNET_SPEC` chat mode remain as experimental infra.
 
 ---
 
