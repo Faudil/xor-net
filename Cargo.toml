@@ -66,9 +66,17 @@ path = "examples/dump_logits_for_compare.rs"
 name = "check_8b_accuracy"
 path = "examples/check_8b_accuracy.rs"
 
+[[example]]
+name = "batch_bench"
+path = "examples/batch_bench.rs"
+
 [[bin]]
 name = "convert_sparse"
 path = "src/bin/convert_sparse.rs"
+
+[[bin]]
+name = "xor-net-server"
+path = "server/main.rs"
 
 [dependencies]
 anyhow = "1.0.103"

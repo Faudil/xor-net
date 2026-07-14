@@ -90,5 +90,21 @@ fn main() -> anyhow::Result<()> {
         tps
     );
 
+    // ── Detailed stage profiling (accumulated across the whole run) ──────────
+    let (attn_gemv, attn_math, mlp_gemv, mlp_down, norm) =
+        xor_net::models::llama::get_detailed_stats();
+    let silu = xor_net::models::llama::get_mlp_silu_time();
+    let (blocks, lm_head, other) = xor_net::models::llama::get_profiling_stats();
+    let total_us = elapsed.as_micros() as u64;
+    println!("--- stage timings (us, whole run) ---");
+    println!(
+        "ATTN_GEMV={}  ATTN_MATH={}  MLP_GEMV={}  MLP_DOWN={}  NORM={}  SILU={}",
+        attn_gemv, attn_math, mlp_gemv, mlp_down, norm, silu
+    );
+    println!(
+        "BLOCKS={}  LM_HEAD={}  OTHER={}  TOTAL={}",
+        blocks, lm_head, other, total_us
+    );
+
     Ok(())
 }
