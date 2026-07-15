@@ -1,4 +1,4 @@
-# XorSparse — lossless sparse ternary weight format
+# XorSparse  lossless sparse ternary weight format
 
 XorSparse stores BitNet 1.58-bit (`{-1,0,+1}`) weights keeping **only the
 non-zero positions and their signs**. It is *lossless*: decoding a row and
@@ -60,7 +60,7 @@ only the non-zero weights.
 Scans every U8 packed-ternary weight that has a companion `*_scale` tensor,
 unpacks it to ternary `{-1,0,+1}`, re-encodes only the non-zero signs, and
 writes the XorSparse file. The scale is inverted by default (to match
-HF1BitLLM checkpoints) — exactly like `get_prepacked_ternary`.
+HF1BitLLM checkpoints)  exactly like `get_prepacked_ternary`.
 
 ## Engine wiring
 
@@ -75,7 +75,7 @@ The decode path is verified lossless by `xor_net::bit1_58::sparse` unit tests
 (`sparse_decode_roundtrip`, `dense_and_sparse_dot_match`) which assert the
 sparse dot product equals the dense `pack4` dot product **exactly**.
 
-## Runtime note — performance is parity, not faster
+## Runtime note  performance is parity, not faster
 
 The engine is **compute/decode-bound, not bandwidth-bound**. The dense `pack4`
 path already uses the AVX-512 VNNI `vpdpbusd` kernel with 16 accumulators, and
@@ -96,7 +96,7 @@ Two practical consequences:
   still ~18% smaller.
 
 Reaching the 80 tok/s target needs an architectural change (e.g. **batched
-GEMV** — computing all output rows of a matrix in one call so the activation is
+GEMV**  computing all output rows of a matrix in one call so the activation is
 loaded once and the weight stream stays sequential across rows, keeping the
 accumulators saturated), not weight compression. XorSparse is delivered as a
 lossless, on-disk-smaller alternative to `pack4`.

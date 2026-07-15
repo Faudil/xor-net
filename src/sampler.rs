@@ -6,6 +6,8 @@ pub struct Sampler {
     pub top_p: Option<f32>,
     pub repetition_penalty: f32,
     rng_state: u64,
+    // Reused index scratch buffer so we don't reallocate ~1 MB every token.
+    idx: Vec<usize>,
 }
 
 impl Sampler {
@@ -26,6 +28,7 @@ impl Sampler {
             top_p,
             repetition_penalty,
             rng_state,
+            idx: Vec::new(),
         }
     }
 
@@ -67,51 +70,103 @@ impl Sampler {
             return Ok(max_idx as u32);
         }
 
-        // Apply temperature
-        let mut scaled_logits: Vec<(usize, f32)> = logits
-            .iter()
-            .enumerate()
-            .map(|(i, &l)| (i, l / temp))
-            .collect();
-
-        // Sort descending
-        scaled_logits.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Softmax & Top-P
-        let max_l = scaled_logits[0].1;
-        let mut sum_exp = 0.0;
-        for i in 0..scaled_logits.len() {
-            sum_exp += (scaled_logits[i].1 - max_l).exp();
+        // Apply temperature in place.
+        let inv_temp = 1.0 / temp;
+        for v in logits.iter_mut() {
+            *v *= inv_temp;
         }
 
-        let mut probabilities = Vec::with_capacity(scaled_logits.len());
+        // Numerical-stability max (also the greedy candidate).
+        let mut max_l = f32::NEG_INFINITY;
+        let mut max_idx = 0usize;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > max_l {
+                max_l = v;
+                max_idx = i;
+            }
+        }
+
         let top_p = self.top_p.unwrap_or(1.0);
-        let mut cumulative_prob = 0.0;
-        
-        for (i, l) in scaled_logits {
-            let p = (l - max_l).exp() / sum_exp;
-            probabilities.push((i, p));
-            cumulative_prob += p;
-            if cumulative_prob >= top_p {
-                break;
+
+        if top_p >= 1.0 {
+            // Full softmax over the whole distribution.
+            let mut sum_exp = 0.0;
+            for &v in logits.iter() {
+                sum_exp += (v - max_l).exp();
             }
-        }
-
-        // Renormalize probabilities after top-p filtering
-        let mut final_sum = 0.0;
-        for &(_, p) in &probabilities {
-            final_sum += p;
-        }
-
-        let r = self.random_f32() * final_sum;
-        let mut acc = 0.0;
-        for &(i, p) in &probabilities {
-            acc += p;
-            if r <= acc {
-                return Ok(i as u32);
+            let r = self.random_f32() * sum_exp;
+            let mut acc = 0.0;
+            for (i, &v) in logits.iter().enumerate() {
+                acc += (v - max_l).exp();
+                if r <= acc {
+                    return Ok(i as u32);
+                }
             }
+            return Ok(max_idx as u32);
         }
 
-        Ok(probabilities.last().unwrap().0 as u32)
+        // Top-p: keep only the smallest set of top tokens whose cumulative
+        // probability reaches `top_p`. Use a partial selection (O(n)) instead
+        // of sorting all `vocab` logits every token.
+        let vocab = logits.len();
+        let mut cand = 1024usize.min(vocab);
+        loop {
+            // Reused index buffer; `select_nth_unstable_by` partitions so the
+            // largest `cand` indices land in the tail.
+            self.idx.clear();
+            for i in 0..vocab {
+                self.idx.push(i);
+            }
+            let split = vocab - cand;
+            self.idx.select_nth_unstable_by(split, |&a, &b| {
+                logits[a]
+                    .partial_cmp(&logits[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            // Sort the top-`cand` tail descending by logit value.
+            let tail = &mut self.idx[split..];
+            tail.sort_unstable_by(|&a, &b| {
+                logits[b]
+                    .partial_cmp(&logits[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let mut sum_exp = 0.0;
+            for &i in tail.iter() {
+                sum_exp += (logits[i] - max_l).exp();
+            }
+            let mut cumulative = 0.0;
+            let mut covered = false;
+            for &i in tail.iter() {
+                cumulative += (logits[i] - max_l).exp() / sum_exp;
+                if cumulative >= top_p {
+                    covered = true;
+                    break;
+                }
+            }
+
+            if covered || cand == vocab {
+                // Collect (index, prob) locally so we can drop the `tail`
+                // borrow before calling `random_f32` (which also needs `&mut self`).
+                let mut chosen: Vec<(usize, f32)> = Vec::with_capacity(tail.len());
+                let mut final_sum = 0.0;
+                for &i in tail.iter() {
+                    let p = (logits[i] - max_l).exp();
+                    final_sum += p;
+                    chosen.push((i, p));
+                }
+                let r = self.random_f32() * final_sum;
+                let mut acc = 0.0;
+                for (i, p) in &chosen {
+                    acc += p;
+                    if r <= acc {
+                        return Ok(*i as u32);
+                    }
+                }
+                return Ok(chosen.last().unwrap().0 as u32);
+            }
+            // Distribution too flat for `cand` tokens; widen and retry.
+            cand = (cand * 2).min(vocab);
+        }
     }
 }

@@ -1,1 +1,3 @@
 /target
+/bench_logs
+*.sparse

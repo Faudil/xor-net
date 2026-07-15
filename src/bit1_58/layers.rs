@@ -647,7 +647,7 @@ impl TernaryLinear {
     /// Fused MLP that always uses a single quantization of the activation, then
     /// runs `down` via its `forward_with_quantized` path. Unlike `fused_mlp_all`
     /// this does not require `down` to be ternary, so the fused path is taken
-    /// even when `down_proj` is Int8/F32 — eliminating the separate
+    /// even when `down_proj` is Int8/F32  eliminating the separate
     /// `c_proj.forward` re-quantization fallback.
     ///
     /// `down` must be `Ternary` or `Int8` (both implement `forward_with_quantized`

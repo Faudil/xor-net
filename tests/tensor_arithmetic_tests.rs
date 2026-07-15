@@ -8,7 +8,7 @@ const EPS: f32 = 1e-6;
 fn assert_close(actual: &[f32], expected: &[f32], tol: f32, msg: &str) {
     assert_eq!(actual.len(), expected.len(), "{}: length mismatch", msg);
     for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
-        assert!((a - e).abs() < tol, "{}: idx {} — got {}, expected {}", msg, i, a, e);
+        assert!((a - e).abs() < tol, "{}: idx {}  got {}, expected {}", msg, i, a, e);
     }
 }
 

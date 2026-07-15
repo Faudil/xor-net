@@ -1,4 +1,4 @@
-//! `xor-net-server` — a small OpenAI / llama.cpp-compatible HTTP
+//! `xor-net-server`  a small OpenAI / llama.cpp-compatible HTTP
 //! inference server for the BitNet engine.
 //!
 //! Design goals:
@@ -9,7 +9,7 @@
 //!     decode GEMV is memory/cache-bound, so the lever is *physical cores*:
 //!     we run `XORNET_SLOTS` worker threads (default = logical/2 = 6), each
 //!     pinned to a dedicated core via its own 1-thread rayon pool. Up to
-//!     `SLOTS` decodes run concurrently -> ~110 tok/s aggregate (vs ~67
+//!     `SLOTS` decodes run concurrently -> ~110 tok/s aggregate (vs ~59
 //!     single-stream). See `OPTIMISATION.md`.
 //!   * Hand-rolled HTTP/1.1 (no async framework) because the engine is
 //!     synchronous/blocking; a thread-per-connection front-end feeds a shared

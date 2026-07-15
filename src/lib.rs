@@ -24,7 +24,7 @@ pub use sampler::Sampler;
 
 pub fn init_threads(num_threads: usize) -> Result<(), Box<dyn std::error::Error>> {
     // Auto ("0"): cap the pool. The BitNet decode GEMV is memory/cache
-    // bound, not core-bound — beyond ~8 threads on a 2-channel DDR5 box we
+    // bound, not core-bound  beyond ~8 threads on a 2-channel DDR5 box we
     // only add L2/L3 thrash + pool-contention and *regress*
     // (measured: 22/40/57/65 tok/s at 1/2/3/4 threads, then flat or
     // slower at 6/8/12). This single change lifts single-stream decode

@@ -19,7 +19,7 @@
 //! `nnz = popcount(mask)`. With block size 64 the mask is exactly one `u64` and
 //! the sign stream is `nnz` single bits. Row byte cost at density `d` is
 //! `in_dim/8 * (1 + d)`. Compared to `pack4` (`in_dim/4`) that is a
-//! `(1 - (1+d)/2)` saving — ~25% smaller at `d = 0.5`, ~35% at `d = 0.3`.
+//! `(1 - (1+d)/2)` saving  ~25% smaller at `d = 0.5`, ~35% at `d = 0.3`.
 //!
 //! The activation vector is *not* sparse: every block maps to `BLOCK_SIZE`
 //! contiguous activations, so the dot product reads the full (quantised) input
@@ -32,8 +32,8 @@ pub const BLOCK_SIZE: usize = 64;
 ///
 /// `blob`/`row_offsets` keep the on-disk XorSparse layout (set-order signs, so
 /// it serialises losslessly and compactly). At load time we *also* expand each
-/// block into two lane-order `u64`s — `masks` (non-zero positions) and `signs`
-/// (sign of lane *k*, not of the k-th non-zero) — so the per-token AVX-512
+/// block into two lane-order `u64`s  `masks` (non-zero positions) and `signs`
+/// (sign of lane *k*, not of the k-th non-zero)  so the per-token AVX-512
 /// kernel can build the weight vector with zero scalar work. This decoded form
 /// lives only in RAM (≈8 bytes/block extra) and is what `dot_row` actually uses.
 ///

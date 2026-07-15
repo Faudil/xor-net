@@ -1,4 +1,4 @@
-//! `convert_sparse` — convert a 1.58-bit BitNet checkpoint's ternary weights
+//! `convert_sparse`  convert a 1.58-bit BitNet checkpoint's ternary weights
 //! into the XorSparse (`.sparse`) container.
 //!
 //! Usage:

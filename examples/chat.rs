@@ -141,7 +141,7 @@ fn main() -> anyhow::Result<()> {
             "main",
             QuantizationConfig::Bit1_58(
                 TernaryPackType::Pack4,
-                lmhead_cfg(LmHeadConfig::Int8),
+                lmhead_cfg(LmHeadConfig::Int4),
                 false,
             ),
         )?,

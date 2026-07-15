@@ -3,9 +3,9 @@
 //! See ["LLaMA: Open and Efficient Foundation Language Models"](https://arxiv.org/abs/2302.13971)
 //!
 //! The transformer is split into focused submodules:
-//! - [`attention`] — `CausalSelfAttention` (QKV/O projections + KV-cache attention)
-//! - [`mlp`] — `Mlp` (gate/up/down projections, fused forward selection)
-//! - [`block`] — `Block` (pre-norm residual wrapper around attention + MLP)
+//! - [`attention`]  `CausalSelfAttention` (QKV/O projections + KV-cache attention)
+//! - [`mlp`]  `Mlp` (gate/up/down projections, fused forward selection)
+//! - [`block`]  `Block` (pre-norm residual wrapper around attention + MLP)
 
 pub mod attention;
 pub mod block;
@@ -317,7 +317,7 @@ pub static TIME_LM_HEAD: AtomicU64 = AtomicU64::new(0);
 pub static TIME_OTHER: AtomicU64 = AtomicU64::new(0);
 /// Full `CausalSelfAttention::forward` time.
 pub static TIME_ATTN_GEMV: AtomicU64 = AtomicU64::new(0);
-/// Reserved (unused) — kept for API stability.
+/// Reserved (unused)  kept for API stability.
 pub static TIME_ATTN_MATH: AtomicU64 = AtomicU64::new(0);
 /// `gate+up+silu+down` total (fused path).
 pub static TIME_MLP_GEMV: AtomicU64 = AtomicU64::new(0);
@@ -355,7 +355,7 @@ pub(crate) unsafe fn prefetch_weight(ptr: *const u8) {
 pub(crate) unsafe fn prefetch_weight(_ptr: *const u8) {}
 
 /// Bytes of packed weight memory a linear streams from RAM per token (used for
-/// the bandwidth estimate). `Standard` f32 is treated as 0 — it does not occur
+/// the bandwidth estimate). `Standard` f32 is treated as 0  it does not occur
 /// on the BitNet models we run, and returning 0 keeps the estimate conservative.
 fn linear_packed_bytes(lin: &DynamicLinear) -> usize {
     match &lin.inner {
