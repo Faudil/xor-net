@@ -12,6 +12,7 @@ fn to_candle(ft: &FastTensor, dev: &Device) -> Result<Tensor> {
 }
 
 // Helper to compute standard Candle attention with KV cache
+#[allow(clippy::too_many_arguments)]
 fn candle_standard_attention(
     q: &Tensor,
     k: &Tensor,
@@ -277,15 +278,10 @@ fn test_ring_wrapping_correctness() -> Result<()> {
     let cache_k = &cache.k_buffers[0];
     for d in 0..head_dim {
         assert_eq!(
-            cache_k[0 * head_dim + d],
-            0.0,
+            cache_k[d], 0.0,
             "Index 0 should have wrapped and been overwritten with 0"
         );
-        assert_eq!(
-            cache_k[1 * head_dim + d],
-            1.0,
-            "Index 1 should still be 1.0"
-        );
+        assert_eq!(cache_k[head_dim + d], 1.0, "Index 1 should still be 1.0");
     }
 
     Ok(())

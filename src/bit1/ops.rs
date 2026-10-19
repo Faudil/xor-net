@@ -49,7 +49,7 @@ impl CustomOp1 for BitMatMulOp {
             .iter()
             .product();
         let mut out_data = vec![0.0; b_size * self.out_dim];
-        let bytes_per_row = (self.in_dim + 7) / 8;
+        let bytes_per_row = self.in_dim.div_ceil(8);
 
         use rayon::prelude::*;
 

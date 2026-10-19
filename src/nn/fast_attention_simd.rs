@@ -1,8 +1,25 @@
+//! SIMD kernels for attention and normalisation (f32).
+//!
+//! Every operation has a portable scalar implementation (`*_scalar`), and the
+//! safe dispatchers validate slice lengths once per call before entering an
+//! `unsafe` x86_64 kernel. The kernels are only compiled on `x86_64`.
+
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
+use crate::util::cpu_features;
+
+// ───────────────────────────── dot product ─────────────────────────────
+
+/// AVX2+FMA f32 dot product (4 accumulators).
+///
+/// # Safety
+/// The CPU must support `avx2` and `fma`, and `b.len() >= a.len()`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn dot_product_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert!(b.len() >= a.len());
     let n = a.len();
     let mut sum0 = _mm256_setzero_ps();
     let mut sum1 = _mm256_setzero_ps();
@@ -37,21 +54,22 @@ pub unsafe fn dot_product_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
         i += 8;
     }
 
-    let mut temp = [0.0f32; 8];
-    _mm256_storeu_ps(temp.as_mut_ptr(), sum8);
-    let mut total = temp[0] + temp[1] + temp[2] + temp[3] + temp[4] + temp[5] + temp[6] + temp[7];
-
+    let mut total = hsum256(sum8);
     while i < n {
         total += a[i] * b[i];
         i += 1;
     }
-
     total
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx512f,avx512bw")]
+/// AVX-512F f32 dot product.
+///
+/// # Safety
+/// The CPU must support `avx512f`, and `b.len() >= a.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
 pub unsafe fn dot_product_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert!(b.len() >= a.len());
     let n = a.len();
     let mut acc = _mm512_setzero_ps();
     let mut i = 0;
@@ -64,36 +82,97 @@ pub unsafe fn dot_product_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
     }
 
     let mut sum = _mm512_reduce_add_ps(acc);
-
     while i < n {
         sum += a[i] * b[i];
         i += 1;
     }
-
     sum
 }
 
+/// Reference scalar f32 dot product. Panics if `a.len() != b.len()`.
+pub fn dot_product_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "dot_product_f32: length mismatch");
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// f32 dot product. Panics if `a.len() != b.len()`.
 #[inline(always)]
 pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    assert_eq!(a.len(), b.len(), "dot_product_f32: length mismatch");
+    #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        let f = cpu_features();
+        // SAFETY: features detected; lengths checked above.
+        if f.avx512f {
             return unsafe { dot_product_f32_avx512(a, b) };
         }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if f.avx2_fma() {
             return unsafe { dot_product_f32_avx2(a, b) };
         }
     }
-
-    let mut sum = 0.0f32;
-    for i in 0..a.len() {
-        sum += a[i] * b[i];
-    }
-    sum
+    dot_product_f32_scalar(a, b)
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
+/// Horizontal sum of an `__m256`.
+///
+/// # Safety
+/// The CPU must support `avx`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx")]
+unsafe fn hsum256(v: __m256) -> f32 {
+    let mut t = [0.0f32; 8];
+    _mm256_storeu_ps(t.as_mut_ptr(), v);
+    t[0] + t[1] + t[2] + t[3] + t[4] + t[5] + t[6] + t[7]
+}
+
+// ───────────────────────────── weighted sum ─────────────────────────────
+
+/// Validates the ring-buffer V access pattern of [`weighted_sum`]: rows
+/// `h_kv * max_seq_len + (t % max_seq_len)` for `t < total_kv_len`, each
+/// `head_dim` long.
+#[inline(always)]
+fn check_weighted_sum_args(
+    out: &[f32],
+    scores: &[f32],
+    v_buf: &[f32],
+    h_kv: usize,
+    max_seq_len: usize,
+    head_dim: usize,
+    total_kv_len: usize,
+) {
+    assert!(
+        out.len() >= head_dim,
+        "weighted_sum: out shorter than head_dim"
+    );
+    assert!(
+        scores.len() >= total_kv_len,
+        "weighted_sum: scores shorter than total_kv_len"
+    );
+    if total_kv_len > 0 && head_dim > 0 {
+        assert!(max_seq_len > 0, "weighted_sum: max_seq_len is 0");
+        let need = (h_kv + 1)
+            .checked_mul(max_seq_len)
+            .and_then(|x| x.checked_mul(head_dim))
+            .expect("weighted_sum: V buffer extent overflows usize");
+        assert!(
+            v_buf.len() >= need,
+            "weighted_sum: v_buf too short ({} < {})",
+            v_buf.len(),
+            need
+        );
+    }
+}
+
+/// AVX2+FMA `out[i] = Σ_t scores[t] · V[t][i]`.
+///
+/// # Safety
+/// The CPU must support `avx2` and `fma`, and the arguments must satisfy the
+/// length checks done by [`weighted_sum`] (`out.len() >= head_dim`,
+/// `scores.len() >= total_kv_len`, `v_buf.len() >= (h_kv+1)·max_seq_len·head_dim`
+/// whenever `total_kv_len > 0`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 pub unsafe fn weighted_sum_avx2(
     out: &mut [f32],
     scores: &[f32],
@@ -106,28 +185,32 @@ pub unsafe fn weighted_sum_avx2(
     let mut i = 0;
     while i + 8 <= head_dim {
         let mut sum = _mm256_setzero_ps();
-        for t_k in 0..total_kv_len {
+        for (t_k, &s) in scores[..total_kv_len].iter().enumerate() {
             let v_offset = h_kv * (max_seq_len * head_dim) + (t_k % max_seq_len) * head_dim + i;
             let v_vec = _mm256_loadu_ps(v_buf.as_ptr().add(v_offset));
-            let w = _mm256_set1_ps(scores[t_k]);
-            sum = _mm256_fmadd_ps(w, v_vec, sum);
+            sum = _mm256_fmadd_ps(_mm256_set1_ps(s), v_vec, sum);
         }
         _mm256_storeu_ps(out.as_mut_ptr().add(i), sum);
         i += 8;
     }
-
-    while i < head_dim {
-        let mut s = 0.0f32;
-        for t_k in 0..total_kv_len {
-            let v_offset = h_kv * (max_seq_len * head_dim) + (t_k % max_seq_len) * head_dim + i;
-            s += scores[t_k] * v_buf[v_offset];
-        }
-        out[i] = s;
-        i += 1;
-    }
+    weighted_sum_cols(
+        out,
+        scores,
+        v_buf,
+        h_kv,
+        max_seq_len,
+        head_dim,
+        total_kv_len,
+        i,
+    );
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// AVX-512F `out[i] = Σ_t scores[t] · V[t][i]`.
+///
+/// # Safety
+/// The CPU must support `avx512f`; same length requirements as
+/// [`weighted_sum_avx2`].
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub unsafe fn weighted_sum_avx512(
     out: &mut [f32],
@@ -141,27 +224,86 @@ pub unsafe fn weighted_sum_avx512(
     let mut i = 0;
     while i + 16 <= head_dim {
         let mut sum = _mm512_setzero_ps();
-        for t_k in 0..total_kv_len {
+        for (t_k, &s) in scores[..total_kv_len].iter().enumerate() {
             let v_offset = h_kv * (max_seq_len * head_dim) + (t_k % max_seq_len) * head_dim + i;
             let v_vec = _mm512_loadu_ps(v_buf.as_ptr().add(v_offset));
-            let w = _mm512_set1_ps(scores[t_k]);
-            sum = _mm512_fmadd_ps(w, v_vec, sum);
+            sum = _mm512_fmadd_ps(_mm512_set1_ps(s), v_vec, sum);
         }
         _mm512_storeu_ps(out.as_mut_ptr().add(i), sum);
         i += 16;
     }
+    weighted_sum_cols(
+        out,
+        scores,
+        v_buf,
+        h_kv,
+        max_seq_len,
+        head_dim,
+        total_kv_len,
+        i,
+    );
+}
 
-    while i < head_dim {
+/// Scalar weighted sum for columns `from..head_dim` (bounds-checked).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn weighted_sum_cols(
+    out: &mut [f32],
+    scores: &[f32],
+    v_buf: &[f32],
+    h_kv: usize,
+    max_seq_len: usize,
+    head_dim: usize,
+    total_kv_len: usize,
+    from: usize,
+) {
+    for (i, o) in out[..head_dim].iter_mut().enumerate().skip(from) {
         let mut s = 0.0f32;
-        for t_k in 0..total_kv_len {
+        for (t_k, &w) in scores[..total_kv_len].iter().enumerate() {
             let v_offset = h_kv * (max_seq_len * head_dim) + (t_k % max_seq_len) * head_dim + i;
-            s += scores[t_k] * v_buf[v_offset];
+            s += w * v_buf[v_offset];
         }
-        out[i] = s;
-        i += 1;
+        *o = s;
     }
 }
 
+/// Reference scalar implementation of [`weighted_sum`].
+pub fn weighted_sum_scalar(
+    out: &mut [f32],
+    scores: &[f32],
+    v_buf: &[f32],
+    h_kv: usize,
+    max_seq_len: usize,
+    head_dim: usize,
+    total_kv_len: usize,
+) {
+    check_weighted_sum_args(
+        out,
+        scores,
+        v_buf,
+        h_kv,
+        max_seq_len,
+        head_dim,
+        total_kv_len,
+    );
+    weighted_sum_cols(
+        out,
+        scores,
+        v_buf,
+        h_kv,
+        max_seq_len,
+        head_dim,
+        total_kv_len,
+        0,
+    );
+}
+
+/// `out[i] = Σ_{t < total_kv_len} scores[t] · V[h_kv][t % max_seq_len][i]` for
+/// `i < head_dim`, where `v_buf` is a `[kv_heads][max_seq_len][head_dim]` ring
+/// buffer.
+///
+/// Panics if `out.len() < head_dim`, `scores.len() < total_kv_len`, or (when
+/// `total_kv_len > 0`) `v_buf.len() < (h_kv + 1) · max_seq_len · head_dim`.
 #[inline(always)]
 pub fn weighted_sum(
     out: &mut [f32],
@@ -172,9 +314,20 @@ pub fn weighted_sum(
     head_dim: usize,
     total_kv_len: usize,
 ) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    check_weighted_sum_args(
+        out,
+        scores,
+        v_buf,
+        h_kv,
+        max_seq_len,
+        head_dim,
+        total_kv_len,
+    );
+    #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512f") {
+        let f = cpu_features();
+        // SAFETY: features detected; lengths checked above.
+        if f.avx512f {
             return unsafe {
                 weighted_sum_avx512(
                     out,
@@ -187,7 +340,7 @@ pub fn weighted_sum(
                 )
             };
         }
-        if is_x86_feature_detected!("avx2") {
+        if f.avx2_fma() {
             return unsafe {
                 weighted_sum_avx2(
                     out,
@@ -201,183 +354,106 @@ pub fn weighted_sum(
             };
         }
     }
-
-    for i in 0..head_dim {
-        let mut s = 0.0f32;
-        for t_k in 0..total_kv_len {
-            let v_offset = h_kv * (max_seq_len * head_dim) + (t_k % max_seq_len) * head_dim + i;
-            s += scores[t_k] * v_buf[v_offset];
-        }
-        out[i] = s;
-    }
+    weighted_sum_cols(
+        out,
+        scores,
+        v_buf,
+        h_kv,
+        max_seq_len,
+        head_dim,
+        total_kv_len,
+        0,
+    );
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+// ─────────────────────────────── softmax ───────────────────────────────
+
+/// AVX2 softmax (vector max/sum, libm `exp`).
+///
+/// # Safety
+/// The CPU must support `avx2`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn softmax_avx2(scores: &mut [f32]) {
     let len = scores.len();
-    let mut max_val = f32::NEG_INFINITY;
     let mut i = 0;
 
+    let mut max_vec = _mm256_set1_ps(f32::NEG_INFINITY);
     while i + 8 <= len {
-        let v = _mm256_loadu_ps(scores.as_ptr().add(i));
-        let mut max_vec = v;
-        if i == 0 {
-            max_vec = _mm256_set1_ps(max_val);
-        }
-        max_vec = _mm256_max_ps(max_vec, v);
-        let mut tmp = [0.0f32; 8];
-        _mm256_storeu_ps(tmp.as_mut_ptr(), max_vec);
-        for &t in &tmp {
-            if t > max_val {
-                max_val = t;
-            }
-        }
+        max_vec = _mm256_max_ps(max_vec, _mm256_loadu_ps(scores.as_ptr().add(i)));
         i += 8;
     }
-
-    while i < len {
-        if scores[i] > max_val {
-            max_val = scores[i];
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), max_vec);
+    let mut max_val = f32::NEG_INFINITY;
+    for &t in lanes.iter().chain(&scores[i..]) {
+        if t > max_val {
+            max_val = t;
         }
-        i += 1;
     }
 
-    let max_vec = _mm256_set1_ps(max_val);
     let mut sum_exp = 0.0f32;
-    i = 0;
-
-    while i + 8 <= len {
-        let v = _mm256_loadu_ps(scores.as_ptr().add(i));
-        let exp_v = _mm256_exp_ps_fallback(_mm256_sub_ps(v, max_vec));
-        _mm256_storeu_ps(scores.as_mut_ptr().add(i), exp_v);
-
-        let mut tmp = [0.0f32; 8];
-        _mm256_storeu_ps(tmp.as_mut_ptr(), exp_v);
-        for &t in &tmp {
-            sum_exp += t;
-        }
-        i += 8;
+    for s in scores.iter_mut() {
+        *s = (*s - max_val).exp();
+        sum_exp += *s;
     }
 
-    while i < len {
-        scores[i] = (scores[i] - max_val).exp();
-        sum_exp += scores[i];
-        i += 1;
-    }
-
-    let inv_sum = _mm256_set1_ps(1.0 / sum_exp);
+    let inv = 1.0 / sum_exp;
+    let inv_sum = _mm256_set1_ps(inv);
     i = 0;
     while i + 8 <= len {
         let v = _mm256_loadu_ps(scores.as_ptr().add(i));
-        let scaled = _mm256_mul_ps(v, inv_sum);
-        _mm256_storeu_ps(scores.as_mut_ptr().add(i), scaled);
+        _mm256_storeu_ps(scores.as_mut_ptr().add(i), _mm256_mul_ps(v, inv_sum));
         i += 8;
     }
-
-    while i < len {
-        scores[i] *= 1.0 / sum_exp;
-        i += 1;
+    for s in &mut scores[i..] {
+        *s *= inv;
     }
 }
 
-#[inline(always)]
-unsafe fn _mm256_exp_ps_fallback(v: __m256) -> __m256 {
-    let mut arr = [0.0f32; 8];
-    _mm256_storeu_ps(arr.as_mut_ptr(), v);
-    for i in 0..8 {
-        arr[i] = arr[i].exp();
-    }
-    _mm256_loadu_ps(arr.as_ptr())
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// AVX-512F softmax (vector max/sum, libm `exp`).
+///
+/// # Safety
+/// The CPU must support `avx512f`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub unsafe fn softmax_avx512(scores: &mut [f32]) {
     let len = scores.len();
-    let mut max_val = f32::NEG_INFINITY;
     let mut i = 0;
 
+    let mut max_vec = _mm512_set1_ps(f32::NEG_INFINITY);
     while i + 16 <= len {
-        let v = _mm512_loadu_ps(scores.as_ptr().add(i));
-        let max_vec = _mm512_max_ps(_mm512_set1_ps(max_val), v);
-        let mut tmp = [0.0f32; 16];
-        _mm512_storeu_ps(tmp.as_mut_ptr(), max_vec);
-        for &t in &tmp {
-            if t > max_val {
-                max_val = t;
-            }
-        }
+        max_vec = _mm512_max_ps(max_vec, _mm512_loadu_ps(scores.as_ptr().add(i)));
         i += 16;
     }
-
-    while i < len {
-        if scores[i] > max_val {
-            max_val = scores[i];
+    let mut max_val = _mm512_reduce_max_ps(max_vec);
+    for &t in &scores[i..] {
+        if t > max_val {
+            max_val = t;
         }
-        i += 1;
     }
 
-    let max_vec = _mm512_set1_ps(max_val);
     let mut sum_exp = 0.0f32;
-    i = 0;
-
-    while i + 16 <= len {
-        let v = _mm512_loadu_ps(scores.as_ptr().add(i));
-        let exp_v = _mm512_exp_ps_fallback(_mm512_sub_ps(v, max_vec));
-        _mm512_storeu_ps(scores.as_mut_ptr().add(i), exp_v);
-
-        let mut tmp = [0.0f32; 16];
-        _mm512_storeu_ps(tmp.as_mut_ptr(), exp_v);
-        for &t in &tmp {
-            sum_exp += t;
-        }
-        i += 16;
+    for s in scores.iter_mut() {
+        *s = (*s - max_val).exp();
+        sum_exp += *s;
     }
 
-    while i < len {
-        scores[i] = (scores[i] - max_val).exp();
-        sum_exp += scores[i];
-        i += 1;
-    }
-
-    let inv_sum = _mm512_set1_ps(1.0 / sum_exp);
+    let inv = 1.0 / sum_exp;
+    let inv_sum = _mm512_set1_ps(inv);
     i = 0;
     while i + 16 <= len {
         let v = _mm512_loadu_ps(scores.as_ptr().add(i));
-        let scaled = _mm512_mul_ps(v, inv_sum);
-        _mm512_storeu_ps(scores.as_mut_ptr().add(i), scaled);
+        _mm512_storeu_ps(scores.as_mut_ptr().add(i), _mm512_mul_ps(v, inv_sum));
         i += 16;
     }
-
-    while i < len {
-        scores[i] *= 1.0 / sum_exp;
-        i += 1;
+    for s in &mut scores[i..] {
+        *s *= inv;
     }
 }
 
-#[inline(always)]
-unsafe fn _mm512_exp_ps_fallback(v: __m512) -> __m512 {
-    let mut arr = [0.0f32; 16];
-    _mm512_storeu_ps(arr.as_mut_ptr(), v);
-    for i in 0..16 {
-        arr[i] = arr[i].exp();
-    }
-    _mm512_loadu_ps(arr.as_ptr())
-}
-
-#[inline(always)]
-pub fn softmax_inplace(scores: &mut [f32]) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx512f") {
-            return unsafe { softmax_avx512(scores) };
-        }
-        if is_x86_feature_detected!("avx2") {
-            return unsafe { softmax_avx2(scores) };
-        }
-    }
-
+/// Reference scalar softmax.
+pub fn softmax_scalar(scores: &mut [f32]) {
     let mut max_val = f32::NEG_INFINITY;
     for &s in scores.iter() {
         if s > max_val {
@@ -397,7 +473,48 @@ pub fn softmax_inplace(scores: &mut [f32]) {
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// In-place numerically stable softmax.
+#[inline(always)]
+pub fn softmax_inplace(scores: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let f = cpu_features();
+        // SAFETY: features detected; the kernels only touch `scores`.
+        if f.avx512f {
+            return unsafe { softmax_avx512(scores) };
+        }
+        if f.avx2 {
+            return unsafe { softmax_avx2(scores) };
+        }
+    }
+    softmax_scalar(scores)
+}
+
+// ──────────────────────────────── RoPE ────────────────────────────────
+
+/// Rotary embedding on one head vector (`x[..2·half_dim]`), "rotate half"
+/// layout. Bounds-checked scalar code; the compiler auto-vectorises it.
+#[inline(always)]
+fn rope_scalar(x: &mut [f32], cos: &[f32], sin: &[f32], half_dim: usize) {
+    let (lo, hi) = x.split_at_mut(half_dim);
+    for (((x1, x2), &c), &s) in lo
+        .iter_mut()
+        .zip(hi[..half_dim].iter_mut())
+        .zip(&cos[..half_dim])
+        .zip(&sin[..half_dim])
+    {
+        let (a, b) = (*x1, *x2);
+        *x1 = a * c - b * s;
+        *x2 = a * s + b * c;
+    }
+}
+
+/// RoPE compiled with AVX2 enabled (the body is bounds-checked scalar code
+/// that the compiler vectorises).
+///
+/// # Safety
+/// The CPU must support `avx2`. Slice bounds are checked (panics on misuse).
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn rope_avx2(
     x: &mut [f32],
@@ -407,146 +524,203 @@ pub unsafe fn rope_avx2(
     _head_dim: usize,
     half_dim: usize,
 ) {
-    for i in 0..half_dim {
-        let cos_val = cos[i];
-        let sin_val = sin[i];
-        let x1 = x[i];
-        let x2 = x[i + half_dim];
-        x[i] = x1 * cos_val - x2 * sin_val;
-        x[i + half_dim] = x1 * sin_val + x2 * cos_val;
-    }
+    rope_scalar(x, cos, sin, half_dim)
 }
 
+/// Apply rotary embedding to one `head_dim` vector.
+///
+/// Panics if `x.len() < head_dim` or `cos`/`sin` are shorter than `head_dim / 2`.
 pub fn rope_inplace(x: &mut [f32], cos: &[f32], sin: &[f32], index_pos: usize, head_dim: usize) {
     let half_dim = head_dim / 2;
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if cpu_features().avx2 {
+            // SAFETY: avx2 detected; the body is bounds-checked.
             return unsafe { rope_avx2(x, cos, sin, index_pos, head_dim, half_dim) };
         }
     }
-
-    for i in 0..half_dim {
-        let cos_val = cos[i];
-        let sin_val = sin[i];
-        let x1 = x[i];
-        let x2 = x[i + half_dim];
-        x[i] = x1 * cos_val - x2 * sin_val;
-        x[i + half_dim] = x1 * sin_val + x2 * cos_val;
-    }
+    let _ = index_pos;
+    rope_scalar(x, cos, sin, half_dim)
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+// ────────────────────────────── RMS norm ──────────────────────────────
+
+#[inline(always)]
+fn check_rms_args(x: &[f32], weight: &[f32]) {
+    assert!(
+        weight.len() >= x.len(),
+        "rms_norm: weight shorter than x ({} < {})",
+        weight.len(),
+        x.len()
+    );
+}
+
+/// AVX2 RMS norm: `x = x / sqrt(mean(x²) + eps) * weight`.
+///
+/// # Safety
+/// The CPU must support `avx2`, and `weight.len() >= x.len()`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn rms_norm_avx2(x: &mut [f32], weight: &[f32], eps: f32) {
+    debug_assert!(weight.len() >= x.len());
     let n = x.len();
-    let mut sum_sq = 0.0f32;
     let mut i = 0;
 
-    while i + 8 <= n {
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    while i + 16 <= n {
+        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
+        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(v0, v0));
+        acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(v1, v1));
+        i += 16;
+    }
+    if i + 8 <= n {
         let v = _mm256_loadu_ps(x.as_ptr().add(i));
-        let sq = _mm256_mul_ps(v, v);
-        let mut tmp = [0.0f32; 8];
-        _mm256_storeu_ps(tmp.as_mut_ptr(), sq);
-        for &t in &tmp {
-            sum_sq += t;
-        }
+        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(v, v));
         i += 8;
     }
-
-    while i < n {
-        sum_sq += x[i] * x[i];
-        i += 1;
+    let mut sum_sq = hsum256(_mm256_add_ps(acc0, acc1));
+    for &v in &x[i..] {
+        sum_sq += v * v;
     }
 
-    let rms = (sum_sq / n as f32 + eps).sqrt();
-    let inv_rms = 1.0 / rms;
+    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
     let inv_rms_vec = _mm256_set1_ps(inv_rms);
     i = 0;
-
     while i + 8 <= n {
         let x_vec = _mm256_loadu_ps(x.as_ptr().add(i));
         let w_vec = _mm256_loadu_ps(weight.as_ptr().add(i));
-        let normalized = _mm256_mul_ps(x_vec, inv_rms_vec);
-        let out = _mm256_mul_ps(normalized, w_vec);
+        let out = _mm256_mul_ps(_mm256_mul_ps(x_vec, inv_rms_vec), w_vec);
         _mm256_storeu_ps(x.as_mut_ptr().add(i), out);
         i += 8;
     }
-
     while i < n {
         x[i] = x[i] * inv_rms * weight[i];
         i += 1;
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// AVX-512F RMS norm: `x = x / sqrt(mean(x²) + eps) * weight`.
+///
+/// # Safety
+/// The CPU must support `avx512f`, and `weight.len() >= x.len()`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub unsafe fn rms_norm_avx512(x: &mut [f32], weight: &[f32], eps: f32) {
+    debug_assert!(weight.len() >= x.len());
     let n = x.len();
-    let mut sum_sq = 0.0f32;
     let mut i = 0;
 
-    while i + 16 <= n {
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    while i + 32 <= n {
+        let v0 = _mm512_loadu_ps(x.as_ptr().add(i));
+        let v1 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
+        acc0 = _mm512_fmadd_ps(v0, v0, acc0);
+        acc1 = _mm512_fmadd_ps(v1, v1, acc1);
+        i += 32;
+    }
+    if i + 16 <= n {
         let v = _mm512_loadu_ps(x.as_ptr().add(i));
-        let sq = _mm512_mul_ps(v, v);
-        let mut tmp = [0.0f32; 16];
-        _mm512_storeu_ps(tmp.as_mut_ptr(), sq);
-        for &t in &tmp {
-            sum_sq += t;
-        }
+        acc0 = _mm512_fmadd_ps(v, v, acc0);
         i += 16;
     }
-
-    while i < n {
-        sum_sq += x[i] * x[i];
-        i += 1;
+    let mut sum_sq = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+    for &v in &x[i..] {
+        sum_sq += v * v;
     }
 
-    let rms = (sum_sq / n as f32 + eps).sqrt();
-    let inv_rms = 1.0 / rms;
+    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
     let inv_rms_vec = _mm512_set1_ps(inv_rms);
     i = 0;
-
     while i + 16 <= n {
         let x_vec = _mm512_loadu_ps(x.as_ptr().add(i));
         let w_vec = _mm512_loadu_ps(weight.as_ptr().add(i));
-        let normalized = _mm512_mul_ps(x_vec, inv_rms_vec);
-        let out = _mm512_mul_ps(normalized, w_vec);
+        let out = _mm512_mul_ps(_mm512_mul_ps(x_vec, inv_rms_vec), w_vec);
         _mm512_storeu_ps(x.as_mut_ptr().add(i), out);
         i += 16;
     }
-
     while i < n {
         x[i] = x[i] * inv_rms * weight[i];
         i += 1;
     }
 }
 
-#[inline(always)]
-pub fn rms_norm(x: &mut [f32], weight: &[f32], eps: f32) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx512f") {
-            return unsafe { rms_norm_avx512(x, weight, eps) };
-        }
-        if is_x86_feature_detected!("avx2") {
-            return unsafe { rms_norm_avx2(x, weight, eps) };
-        }
-    }
-
+/// Reference scalar RMS norm. Panics if `weight.len() < x.len()`.
+pub fn rms_norm_scalar(x: &mut [f32], weight: &[f32], eps: f32) {
+    check_rms_args(x, weight);
     let n = x.len();
-    let mut sum_sq = 0.0f32;
-    for i in 0..n {
-        sum_sq += x[i] * x[i];
-    }
-    let rms = (sum_sq / n as f32 + eps).sqrt();
-    let inv_rms = 1.0 / rms;
-    for i in 0..n {
-        x[i] = x[i] * inv_rms * weight[i];
+    let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+    for (v, &w) in x.iter_mut().zip(weight) {
+        *v = *v * inv_rms * w;
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// In-place RMS norm `x = x / sqrt(mean(x²) + eps) * weight`.
+///
+/// Panics if `weight.len() < x.len()`.
+#[inline(always)]
+pub fn rms_norm(x: &mut [f32], weight: &[f32], eps: f32) {
+    check_rms_args(x, weight);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let f = cpu_features();
+        // SAFETY: features detected; lengths checked above.
+        if f.avx512f {
+            return unsafe { rms_norm_avx512(x, weight, eps) };
+        }
+        if f.avx2 {
+            return unsafe { rms_norm_avx2(x, weight, eps) };
+        }
+    }
+    rms_norm_scalar(x, weight, eps)
+}
+
+// ───────────────────────── batched Q·K dot products ─────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn check_batched_args(
+    q: &[f32],
+    k_buf: &[f32],
+    h_kv: usize,
+    max_seq_len: usize,
+    head_dim: usize,
+    t_k_start: usize,
+    t_k_end: usize,
+    out: &[f32],
+) {
+    assert!(
+        t_k_end >= t_k_start,
+        "batched_dot_product: t_k_end < t_k_start"
+    );
+    assert!(
+        q.len() >= head_dim,
+        "batched_dot_product: q shorter than head_dim"
+    );
+    assert!(
+        out.len() >= t_k_end - t_k_start,
+        "batched_dot_product: out shorter than the t_k range"
+    );
+    if t_k_end > t_k_start && head_dim > 0 {
+        assert!(max_seq_len > 0, "batched_dot_product: max_seq_len is 0");
+        let need = (h_kv + 1)
+            .checked_mul(max_seq_len)
+            .and_then(|x| x.checked_mul(head_dim))
+            .expect("batched_dot_product: K buffer extent overflows usize");
+        assert!(k_buf.len() >= need, "batched_dot_product: k_buf too short");
+    }
+}
+
+/// AVX2+FMA batched `q · K[t]` for `t in t_k_start..t_k_end`.
+///
+/// # Safety
+/// The CPU must support `avx2` and `fma`; `q.len() >= head_dim` and
+/// `t_k_end >= t_k_start` (K rows and `out` are bounds-checked).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn batched_dot_product_avx2(
     q: &[f32],
@@ -564,56 +738,18 @@ pub unsafe fn batched_dot_product_avx2(
     for t_k in t_k_start..t_k_end {
         let k_offset = h_offset + (t_k % max_seq_len) * head_dim;
         let k_vec = &k_buf[k_offset..k_offset + head_dim];
-
-        let mut sum0 = _mm256_setzero_ps();
-        let mut sum1 = _mm256_setzero_ps();
-        let mut sum2 = _mm256_setzero_ps();
-        let mut sum3 = _mm256_setzero_ps();
-        let mut i = 0;
-
-        while i + 32 <= head_dim {
-            let vq0 = _mm256_loadu_ps(q.as_ptr().add(i));
-            let vk0 = _mm256_loadu_ps(k_vec.as_ptr().add(i));
-            let vq1 = _mm256_loadu_ps(q.as_ptr().add(i + 8));
-            let vk1 = _mm256_loadu_ps(k_vec.as_ptr().add(i + 8));
-            let vq2 = _mm256_loadu_ps(q.as_ptr().add(i + 16));
-            let vk2 = _mm256_loadu_ps(k_vec.as_ptr().add(i + 16));
-            let vq3 = _mm256_loadu_ps(q.as_ptr().add(i + 24));
-            let vk3 = _mm256_loadu_ps(k_vec.as_ptr().add(i + 24));
-
-            sum0 = _mm256_fmadd_ps(vq0, vk0, sum0);
-            sum1 = _mm256_fmadd_ps(vq1, vk1, sum1);
-            sum2 = _mm256_fmadd_ps(vq2, vk2, sum2);
-            sum3 = _mm256_fmadd_ps(vq3, vk3, sum3);
-
-            i += 32;
-        }
-
-        let mut sum8 = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
-
-        while i + 8 <= head_dim {
-            let vq = _mm256_loadu_ps(q.as_ptr().add(i));
-            let vk = _mm256_loadu_ps(k_vec.as_ptr().add(i));
-            sum8 = _mm256_fmadd_ps(vq, vk, sum8);
-            i += 8;
-        }
-
-        let mut temp = [0.0f32; 8];
-        _mm256_storeu_ps(temp.as_mut_ptr(), sum8);
-        let mut total =
-            temp[0] + temp[1] + temp[2] + temp[3] + temp[4] + temp[5] + temp[6] + temp[7];
-
-        while i < head_dim {
-            total += q[i] * k_vec[i];
-            i += 1;
-        }
-
-        out[t_k - t_k_start] = total;
+        out[t_k - t_k_start] = dot_product_f32_avx2(&q[..head_dim], k_vec);
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx512f,avx512bw")]
+/// AVX-512F batched `q · K[t]` for `t in t_k_start..t_k_end`.
+///
+/// # Safety
+/// The CPU must support `avx512f`; `q.len() >= head_dim` and
+/// `t_k_end >= t_k_start` (K rows and `out` are bounds-checked).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f")]
 pub unsafe fn batched_dot_product_avx512(
     q: &[f32],
     k_buf: &[f32],
@@ -630,28 +766,48 @@ pub unsafe fn batched_dot_product_avx512(
     for t_k in t_k_start..t_k_end {
         let k_offset = h_offset + (t_k % max_seq_len) * head_dim;
         let k_vec = &k_buf[k_offset..k_offset + head_dim];
-
-        let mut acc = _mm512_setzero_ps();
-        let mut i = 0;
-
-        while i + 16 <= head_dim {
-            let vq = _mm512_loadu_ps(q.as_ptr().add(i));
-            let vk = _mm512_loadu_ps(k_vec.as_ptr().add(i));
-            acc = _mm512_fmadd_ps(vq, vk, acc);
-            i += 16;
-        }
-
-        let mut sum = _mm512_reduce_add_ps(acc);
-
-        while i < head_dim {
-            sum += q[i] * k_vec[i];
-            i += 1;
-        }
-
-        out[t_k - t_k_start] = sum;
+        out[t_k - t_k_start] = dot_product_f32_avx512(&q[..head_dim], k_vec);
     }
 }
 
+/// Reference scalar implementation of [`batched_dot_product`].
+#[allow(clippy::too_many_arguments)]
+pub fn batched_dot_product_scalar(
+    q: &[f32],
+    k_buf: &[f32],
+    h_kv: usize,
+    max_seq_len: usize,
+    head_dim: usize,
+    t_k_start: usize,
+    t_k_end: usize,
+    out: &mut [f32],
+) {
+    check_batched_args(
+        q,
+        k_buf,
+        h_kv,
+        max_seq_len,
+        head_dim,
+        t_k_start,
+        t_k_end,
+        out,
+    );
+    let k_stride = max_seq_len * head_dim;
+    let h_offset = h_kv * k_stride;
+    for t_k in t_k_start..t_k_end {
+        let k_offset = h_offset + (t_k % max_seq_len) * head_dim;
+        let k_vec = &k_buf[k_offset..k_offset + head_dim];
+        out[t_k - t_k_start] = q[..head_dim].iter().zip(k_vec).map(|(a, b)| a * b).sum();
+    }
+}
+
+/// `out[t - t_k_start] = q · K[h_kv][t % max_seq_len]` for
+/// `t in t_k_start..t_k_end`, with `k_buf` a `[kv_heads][max_seq_len][head_dim]`
+/// ring buffer.
+///
+/// Panics if `t_k_end < t_k_start`, `q.len() < head_dim`,
+/// `out.len() < t_k_end - t_k_start`, or `k_buf` is too short.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub fn batched_dot_product(
     q: &[f32],
@@ -663,9 +819,21 @@ pub fn batched_dot_product(
     t_k_end: usize,
     out: &mut [f32],
 ) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    check_batched_args(
+        q,
+        k_buf,
+        h_kv,
+        max_seq_len,
+        head_dim,
+        t_k_start,
+        t_k_end,
+        out,
+    );
+    #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        let f = cpu_features();
+        // SAFETY: features detected; lengths checked above.
+        if f.avx512f {
             return unsafe {
                 batched_dot_product_avx512(
                     q,
@@ -679,7 +847,7 @@ pub fn batched_dot_product(
                 )
             };
         }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if f.avx2_fma() {
             return unsafe {
                 batched_dot_product_avx2(
                     q,
@@ -694,16 +862,14 @@ pub fn batched_dot_product(
             };
         }
     }
-
-    let k_stride = max_seq_len * head_dim;
-    let h_offset = h_kv * k_stride;
-    for t_k in t_k_start..t_k_end {
-        let k_offset = h_offset + (t_k % max_seq_len) * head_dim;
-        let k_vec = &k_buf[k_offset..k_offset + head_dim];
-        let mut sum = 0.0f32;
-        for i in 0..head_dim {
-            sum += q[i] * k_vec[i];
-        }
-        out[t_k - t_k_start] = sum;
-    }
+    batched_dot_product_scalar(
+        q,
+        k_buf,
+        h_kv,
+        max_seq_len,
+        head_dim,
+        t_k_start,
+        t_k_end,
+        out,
+    )
 }

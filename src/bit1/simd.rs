@@ -1,12 +1,45 @@
-#[cfg(target_arch = "x86")]
-use core::arch::x86::*;
+//! XNOR-popcount dot product for 1-bit (`{-1,+1}`) vectors packed 8 per byte.
+//!
+//! Bit `i` of byte `j` holds element `8*j + i` (`1` => `+1`, `0` => `-1`).
+//! `Σ a_i·b_i = matches - mismatches = 2·matches - total_bits`, where
+//! `matches = popcount(!(a ^ b))` over the `total_bits` valid bits.
+
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// Number of XNOR matches in the padding bits of the final byte (bits at
+/// positions `>= total_bits`), which the full-byte popcount over-counts.
+#[inline(always)]
+fn padding_matches(a: &[u8], b: &[u8], total_bits: usize) -> u64 {
+    let rem = total_bits % 8;
+    if rem == 0 {
+        return 0;
+    }
+    let last = total_bits / 8;
+    let pad_mask: u8 = !((1u8 << rem) - 1);
+    ((!(a[last] ^ b[last])) & pad_mask).count_ones() as u64
+}
+
+#[inline(always)]
+fn check_xnor_args(a: &[u8], b: &[u8], total_bits: usize) {
+    assert_eq!(a.len(), b.len(), "xnor_dot_product: a/b length mismatch");
+    assert_eq!(
+        a.len(),
+        total_bits.div_ceil(8),
+        "xnor_dot_product: slices must hold exactly ceil(total_bits/8) bytes"
+    );
+}
+
+/// AVX2 XNOR-popcount kernel (nibble-LUT popcount + `vpsadbw`).
+///
+/// # Safety
+/// The CPU must support `avx2`, and `a.len() == b.len()`. Passing
+/// `a.len() == total_bits.div_ceil(8)` gives the exact result; prefer the safe
+/// [`xnor_dot_product`], which checks both.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[target_feature(enable = "popcnt")]
 pub unsafe fn xnor_dot_product_avx2(a: &[u8], b: &[u8], total_bits: usize) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
     let mut matches = 0;
     let chunks = a.len() / 32;
     let a_ptr = a.as_ptr() as *const __m256i;
@@ -47,60 +80,53 @@ pub unsafe fn xnor_dot_product_avx2(a: &[u8], b: &[u8], total_bits: usize) -> f3
         matches += (!(a[i] ^ b[i])).count_ones() as u64;
     }
 
-    let padding_bits = (a.len() * 8) - total_bits;
-    let valid_matches = matches as usize - padding_bits;
-    (2.0 * valid_matches as f32) - total_bits as f32
+    finish(matches, a, b, total_bits)
 }
 
-use std::sync::atomic::{AtomicU8, Ordering};
-static HAS_AVX2: AtomicU8 = AtomicU8::new(0); // 0: uninitialized, 1: no, 2: yes
-
+/// Turn the full-byte match count into the signed dot product.
 #[inline(always)]
-fn has_avx2() -> bool {
-    let val = HAS_AVX2.load(Ordering::Relaxed);
-    if val != 0 {
-        return val == 2;
-    }
-    let detected = {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            is_x86_feature_detected!("avx2")
-        }
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        {
-            false
-        }
+fn finish(matches: u64, a: &[u8], b: &[u8], total_bits: usize) -> f32 {
+    // Exact when the slices hold ceil(total_bits/8) bytes (the safe API
+    // enforces it); otherwise the result is meaningless but never panics or
+    // wraps around.
+    let pad = if a.len() == b.len() && a.len() == total_bits.div_ceil(8) {
+        padding_matches(a, b, total_bits)
+    } else {
+        0
     };
-    HAS_AVX2.store(if detected { 2 } else { 1 }, Ordering::Relaxed);
-    detected
+    let valid = matches.saturating_sub(pad);
+    (2.0 * valid as f32) - total_bits as f32
 }
 
+/// Portable scalar XNOR-popcount (8 bytes at a time).
+pub fn xnor_dot_product_scalar(a: &[u8], b: &[u8], total_bits: usize) -> f32 {
+    check_xnor_args(a, b, total_bits);
+    let mut matches = 0u64;
+    let mut ca = a.chunks_exact(8);
+    let mut cb = b.chunks_exact(8);
+    for (x, y) in (&mut ca).zip(&mut cb) {
+        let va = u64::from_le_bytes(x.try_into().unwrap());
+        let vb = u64::from_le_bytes(y.try_into().unwrap());
+        matches += (!(va ^ vb)).count_ones() as u64;
+    }
+    for (&x, &y) in ca.remainder().iter().zip(cb.remainder()) {
+        matches += (!(x ^ y)).count_ones() as u64;
+    }
+    finish(matches, a, b, total_bits)
+}
+
+/// Signed dot product of two packed 1-bit vectors of `total_bits` elements.
+///
+/// Panics unless `a.len() == b.len() == total_bits.div_ceil(8)`. Padding bits
+/// in the final byte are ignored whatever their value.
 pub fn xnor_dot_product(a: &[u8], b: &[u8], total_bits: usize) -> f32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    check_xnor_args(a, b, total_bits);
+    #[cfg(target_arch = "x86_64")]
     {
-        if has_avx2() {
+        if crate::util::cpu_features().avx2 {
+            // SAFETY: avx2 detected; lengths checked above.
             return unsafe { xnor_dot_product_avx2(a, b, total_bits) };
         }
     }
-
-    let mut matches = 0;
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
-    let chunks = a.len() / 8;
-    for i in 0..chunks {
-        unsafe {
-            let va = std::ptr::read_unaligned(a_ptr.add(i * 8) as *const u64);
-            let vb = std::ptr::read_unaligned(b_ptr.add(i * 8) as *const u64);
-            matches += (!(va ^ vb)).count_ones() as u64;
-        }
-    }
-
-    let remainder_start = chunks * 8;
-    for i in remainder_start..a.len() {
-        matches += (!(a[i] ^ b[i])).count_ones() as u64;
-    }
-
-    let padding_bits = (a.len() * 8) - total_bits;
-    let valid_matches = matches as usize - padding_bits;
-    (2.0 * valid_matches as f32) - total_bits as f32
+    xnor_dot_product_scalar(a, b, total_bits)
 }

@@ -17,14 +17,85 @@
 //! Multiple independent accumulators are kept live so the ~5-cycle multiply
 //! latency is hidden by instruction-level parallelism.
 
-#[cfg(target_arch = "x86")]
-use core::arch::x86::*;
+//!
+//! # Activation range precondition
+//!
+//! All SIMD kernels form `±a` with a wrapping 8-bit negate (`0 - a` or
+//! `sign_epi8`), so an activation of `-128` paired with a `-1` weight yields
+//! `-128` instead of `+128`. Activations must therefore lie in `[-127, 127]`,
+//! which is exactly what [`quantize_f32_to_i8`] produces (it clamps
+//! symmetrically). The safe entry points `debug_assert!` this; within that
+//! range every kernel is bit-exact with [`ternary_dot_product_pack4_scalar`].
+//!
+//! [`quantize_f32_to_i8`]: crate::bit1_58::quantization::quantize_f32_to_i8
+//!
+//! # Weight codes
+//!
+//! pack4 codes are `0b00 => -1`, `0b01 => 0`, `0b10 => +1`; the unused code
+//! `0b11` decodes to `0` in every kernel.
+
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+#[cfg(target_arch = "x86_64")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// Decode one 2-bit pack4 code (`0b00 => -1`, `0b10 => +1`, else `0`).
+#[inline(always)]
+pub(crate) fn decode_pack4_code(code: u8) -> i32 {
+    match code & 0b11 {
+        0b00 => -1,
+        0b10 => 1,
+        _ => 0,
+    }
+}
+
+/// Scalar tail shared by the SIMD kernels: elements `start..total_elems`.
+#[inline(always)]
+pub(crate) fn pack4_tail(a_i8: &[i8], b_pack4: &[u8], start: usize, total_elems: usize) -> i32 {
+    let mut total = 0i32;
+    for j in start..total_elems {
+        let code = b_pack4[j / 4] >> ((j % 4) * 2);
+        total += a_i8[j] as i32 * decode_pack4_code(code);
+    }
+    total
+}
+
+#[inline(always)]
+fn check_pack4_args(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) {
+    assert!(
+        a_i8.len() >= total_elems,
+        "ternary pack4: activation slice too short ({} < {})",
+        a_i8.len(),
+        total_elems
+    );
+    assert!(
+        b_pack4.len() >= total_elems.div_ceil(4),
+        "ternary pack4: weight slice too short ({} < {})",
+        b_pack4.len(),
+        total_elems.div_ceil(4)
+    );
+    debug_assert!(
+        a_i8[..total_elems].iter().all(|&x| x != i8::MIN),
+        "ternary pack4: activations must be in [-127, 127]"
+    );
+}
+
+/// Reference scalar pack4 dot product `Σ a_i · w_i` (exact for any `i8`).
+///
+/// Panics if `a_i8.len() < total_elems` or `b_pack4.len() < total_elems.div_ceil(4)`.
+pub fn ternary_dot_product_pack4_scalar(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
+    assert!(a_i8.len() >= total_elems && b_pack4.len() >= total_elems.div_ceil(4));
+    pack4_tail(a_i8, b_pack4, 0, total_elems)
+}
+
+/// AVX-512BW pack4 kernel (pre-VNNI: `maddubs` + `madd`).
+///
+/// # Safety
+/// The CPU must support `avx512f` and `avx512bw`; `a_i8.len() >= total_elems`
+/// and `b_pack4.len() >= total_elems.div_ceil(4)`. Activations should be in
+/// `[-127, 127]` (see the module docs) for an exact result.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 pub unsafe fn ternary_dot_product_pack4_avx512(
     a_i8: &[i8],
@@ -54,8 +125,13 @@ pub unsafe fn ternary_dot_product_pack4_avx512(
     let mut idx = 0usize;
 
     while idx < step4 {
-        _mm_prefetch(b_ptr.add(idx * 16 + 64) as *const i8, _MM_HINT_NTA);
-        _mm_prefetch(b_ptr.add(idx * 16 + 128) as *const i8, _MM_HINT_NTA);
+        // Prefetch addresses may run past the end of the weights; a prefetch
+        // never faults, but `add` past the allocation would be UB, so wrap.
+        _mm_prefetch(b_ptr.wrapping_add(idx * 16 + 64) as *const i8, _MM_HINT_NTA);
+        _mm_prefetch(
+            b_ptr.wrapping_add(idx * 16 + 128) as *const i8,
+            _MM_HINT_NTA,
+        );
 
         macro_rules! block {
             ($acc:expr, $i:expr) => {{
@@ -97,7 +173,10 @@ pub unsafe fn ternary_dot_product_pack4_avx512(
 
     // Cleanup: remaining chunks (< 4)
     while idx < chunks64 {
-        _mm_prefetch(b_ptr.add(idx * 16 + 256) as *const i8, _MM_HINT_NTA);
+        _mm_prefetch(
+            b_ptr.wrapping_add(idx * 16 + 256) as *const i8,
+            _MM_HINT_NTA,
+        );
         let acts = _mm512_loadu_si512(a_ptr.add(idx));
         let packed_w = _mm_loadu_si128(b_ptr.add(idx * 16) as *const __m128i);
         let w32 = _mm512_cvtepu8_epi32(packed_w);
@@ -125,26 +204,17 @@ pub unsafe fn ternary_dot_product_pack4_avx512(
     let mut tmp = [0i32; 16];
     _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, acc);
     let mut total = tmp.iter().sum::<i32>();
-
-    let remainder_start = chunks64 * 64;
-    for j in remainder_start..total_elems {
-        let byte_idx = j / 4;
-        let bit_shift = (j % 4) * 2;
-        let val = (b_pack4[byte_idx] >> bit_shift) & 0b11;
-        let w = if val == 0b00 {
-            -1
-        } else if val == 0b10 {
-            1
-        } else {
-            0
-        };
-        total += a_i8[j] as i32 * w as i32;
-    }
-
+    total += pack4_tail(a_i8, b_pack4, chunks64 * 64, total_elems);
     total
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// AVX2 pack4 kernel (`cvtepu8` + shift decode, `sign_epi8` + `maddubs`).
+///
+/// # Safety
+/// The CPU must support `avx2`; `a_i8.len() >= total_elems` and
+/// `b_pack4.len() >= total_elems.div_ceil(4)`. Activations should be in
+/// `[-127, 127]` (see the module docs) for an exact result.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn ternary_dot_product_pack4_avx2(
     a_i8: &[i8],
@@ -169,7 +239,7 @@ pub unsafe fn ternary_dot_product_pack4_avx2(
         let step = chunks32 / 2 * 2;
         let mut i = 0;
         while i < step {
-            _mm_prefetch(b_ptr.add(i * 8 + 16) as *const i8, _MM_HINT_NTA);
+            _mm_prefetch(b_ptr.wrapping_add(i * 8 + 16) as *const i8, _MM_HINT_NTA);
 
             let acts0 = _mm256_loadu_si256(a_ptr.add(i));
             let packed_w0 = _mm_loadl_epi64(b_ptr.add(i * 8) as *const __m128i);
@@ -248,21 +318,7 @@ pub unsafe fn ternary_dot_product_pack4_avx2(
         _mm256_storeu_si256(sums.as_mut_ptr() as *mut __m256i, acc32);
         let mut total_sum = sums.iter().sum::<i32>();
 
-        let remainder_start = chunks32 * 32;
-        for i in remainder_start..total_elems {
-            let byte_idx = i / 4;
-            let bit_shift = (i % 4) * 2;
-            let val = (b_pack4[byte_idx] >> bit_shift) & 0b11;
-            let w = if val == 0b00 {
-                -1
-            } else if val == 0b10 {
-                1
-            } else {
-                0
-            };
-            total_sum += a_i8[i] as i32 * w as i32;
-        }
-
+        total_sum += pack4_tail(a_i8, b_pack4, chunks32 * 32, total_elems);
         total_sum
     }
 }
@@ -278,8 +334,10 @@ pub unsafe fn ternary_dot_product_pack4_avx2(
 /// reused activation vector and RoPE tables, so we keep the weights out of the
 /// low-level caches. (A true streaming `vmovntdqa` load would need 16-byte
 /// aligned weight buffers, which the current `Vec<u8>` does not guarantee.)
+#[cfg(target_arch = "x86_64")]
 static VNNI_PREFETCH_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn vnni_prefetch_bytes() -> usize {
     let mut v = VNNI_PREFETCH_BYTES.load(Ordering::Relaxed);
@@ -294,7 +352,15 @@ fn vnni_prefetch_bytes() -> usize {
     v
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// AVX-512 VNNI pack4 kernel (`vpdpbusd`, 16 accumulators). The decode GEMV
+/// hot loop on Zen 4/5 and Ice Lake+.
+///
+/// # Safety
+/// The CPU must support `avx512f`, `avx512bw` and `avx512vnni`;
+/// `a_i8.len() >= total_elems` and `b_pack4.len() >= total_elems.div_ceil(4)`.
+/// Activations should be in `[-127, 127]` (see the module docs) for an exact
+/// result.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 pub unsafe fn ternary_dot_product_pack4_avx512_vnni(
     a_i8: &[i8],
@@ -321,7 +387,7 @@ pub unsafe fn ternary_dot_product_pack4_avx512_vnni(
     let mut idx = 0usize;
 
     while idx < step16 {
-        _mm_prefetch(b_ptr.add(idx * 16 + pf) as *const i8, _MM_HINT_NTA);
+        _mm_prefetch(b_ptr.wrapping_add(idx * 16 + pf) as *const i8, _MM_HINT_NTA);
 
         macro_rules! block {
             ($k:expr) => {{
@@ -370,13 +436,13 @@ pub unsafe fn ternary_dot_product_pack4_avx512_vnni(
 
     // Merge the 16 accumulators.
     let mut merged = acc[0];
-    for k in 1..16 {
-        merged = _mm512_add_epi32(merged, acc[k]);
+    for v in &acc[1..] {
+        merged = _mm512_add_epi32(merged, *v);
     }
 
     // Cleanup: remaining chunks (< 16) accumulate into `merged`.
     while idx < chunks64 {
-        _mm_prefetch(b_ptr.add(idx * 16 + pf) as *const i8, _MM_HINT_NTA);
+        _mm_prefetch(b_ptr.wrapping_add(idx * 16 + pf) as *const i8, _MM_HINT_NTA);
         let acts = _mm512_loadu_si512(a_ptr.add(idx));
         let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(b_ptr.add(idx * 16) as *const __m128i));
         let p0 = _mm512_and_si512(w32, mask3);
@@ -400,35 +466,31 @@ pub unsafe fn ternary_dot_product_pack4_avx512_vnni(
     let mut tmp = [0i32; 16];
     _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, merged);
     let mut total = tmp.iter().sum::<i32>();
-
-    let remainder_start = chunks64 * 64;
-    for j in remainder_start..total_elems {
-        let byte_idx = j / 4;
-        let bit_shift = (j % 4) * 2;
-        let val = (b_pack4[byte_idx] >> bit_shift) & 0b11;
-        let w = if val == 0b00 {
-            -1
-        } else if val == 0b10 {
-            1
-        } else {
-            0
-        };
-        total += a_i8[j] as i32 * w as i32;
-    }
-
+    total += pack4_tail(a_i8, b_pack4, chunks64 * 64, total_elems);
     total
 }
 
+/// Ternary pack4 dot product `Σ a_i · w_i` over the first `total_elems`
+/// elements, dispatched to the best kernel for this CPU.
+///
+/// Panics if `a_i8.len() < total_elems` or
+/// `b_pack4.len() < total_elems.div_ceil(4)`. Activations must be in
+/// `[-127, 127]` (checked in debug builds; see the module docs).
+#[inline]
 pub fn ternary_dot_product_pack4(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    check_pack4_args(a_i8, b_pack4, total_elems);
+    #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512vnni") {
+        let f = crate::util::cpu_features();
+        // SAFETY (all three): the required CPU features were detected and
+        // the slice lengths were checked by `check_pack4_args`.
+        if f.avx512_vnni() {
             return unsafe { ternary_dot_product_pack4_avx512_vnni(a_i8, b_pack4, total_elems) };
         }
-        if is_x86_feature_detected!("avx512bw") {
+        if f.avx512bw() {
             return unsafe { ternary_dot_product_pack4_avx512(a_i8, b_pack4, total_elems) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if f.avx2 {
             return unsafe {
                 crate::bit1_58::lut::ternary_dot_product_pack4_avx2_hybrid(
                     a_i8,
@@ -438,23 +500,7 @@ pub fn ternary_dot_product_pack4(a_i8: &[i8], b_pack4: &[u8], total_elems: usize
             };
         }
     }
-
-    let mut total_sum = 0i32;
-    for i in 0..total_elems {
-        let byte_idx = i / 4;
-        let bit_shift = (i % 4) * 2;
-        let val = (b_pack4[byte_idx] >> bit_shift) & 0b11;
-        let w = if val == 0b00 {
-            -1
-        } else if val == 0b10 {
-            1
-        } else {
-            0
-        };
-        total_sum += a_i8[i] as i32 * w as i32;
-    }
-
-    total_sum
+    pack4_tail(a_i8, b_pack4, 0, total_elems)
 }
 
 pub fn ternary_dot_product_pack5(a_i8: &[i8], b_pack5: &[u8], total_elems: usize) -> i32 {
@@ -477,7 +523,7 @@ pub fn ternary_dot_product_pack5_scalar(a_i8: &[i8], b_pack5: &[u8], total_elems
             } else {
                 0
             };
-            total_sum += a_i8[i * 5 + j] as i32 * w as i32;
+            total_sum += a_i8[i * 5 + j] as i32 * w;
         }
     }
 
@@ -494,7 +540,7 @@ pub fn ternary_dot_product_pack5_scalar(a_i8: &[i8], b_pack5: &[u8], total_elems
             } else {
                 0
             };
-            total_sum += a_i8[remainder_start + j] as i32 * w as i32;
+            total_sum += a_i8[remainder_start + j] as i32 * w;
         }
     }
 
@@ -505,11 +551,35 @@ pub fn ternary_dot_product_pack5_scalar(a_i8: &[i8], b_pack5: &[u8], total_elems
 // XorSparse lossless sparse ternary dot product
 // ===========================================================================
 
-/// Dot product of one block of 64 activations against the ternary weight signs
-/// described by `mask` (non-zero positions) and `sb` (sign bits: 1 => -1).
-/// `a` holds the 64 activations (i8); only the low `a.len()` lanes are valid
+#[inline(always)]
+fn check_sparse_args(a_i8: &[i8], masks: &[u64], signs: &[u64], num_blocks: usize, in_dim: usize) {
+    assert_eq!(
+        num_blocks,
+        in_dim.div_ceil(64),
+        "ternary sparse: num_blocks must be ceil(in_dim / 64)"
+    );
+    assert!(
+        masks.len() >= num_blocks && signs.len() >= num_blocks,
+        "ternary sparse: masks/signs shorter than num_blocks"
+    );
+    assert!(
+        a_i8.len() >= in_dim,
+        "ternary sparse: activation slice too short ({} < {})",
+        a_i8.len(),
+        in_dim
+    );
+    debug_assert!(
+        a_i8[..in_dim].iter().all(|&x| x != i8::MIN),
+        "ternary sparse: activations must be in [-127, 127]"
+    );
+}
+
 /// Scalar XorSparse row dot product. Consumes the decoded per-block lane-order
-/// `masks`/`signs` (no parsing, no set-order expansion).
+/// `masks`/`signs` (no parsing, no set-order expansion). Exact for any `i8`.
+///
+/// Panics unless `num_blocks == in_dim.div_ceil(64)`, `masks`/`signs` hold at
+/// least `num_blocks` entries and `a_i8.len() >= in_dim`. Mask bits at lanes
+/// `>= in_dim` in the final block are ignored.
 pub fn ternary_dot_product_sparse_scalar(
     a_i8: &[i8],
     masks: &[u64],
@@ -517,44 +587,49 @@ pub fn ternary_dot_product_sparse_scalar(
     num_blocks: usize,
     in_dim: usize,
 ) -> i32 {
+    assert_eq!(num_blocks, in_dim.div_ceil(64));
+    assert!(masks.len() >= num_blocks && signs.len() >= num_blocks && a_i8.len() >= in_dim);
     let mut total = 0i32;
     for b in 0..num_blocks {
-        let mask = masks[b];
-        let k2 = signs[b];
         let start = b * 64;
         let end = (start + 64).min(in_dim);
-        total += dot_block_sparse_scalar(&a_i8[start..end], mask, k2);
+        total += dot_block_sparse_scalar(&a_i8[start..end], masks[b], signs[b]);
     }
     total
 }
 
-/// One 64-lane block, scalar fallback. `k2` is the lane-order sign mask (bit *k*
-/// set ⇒ weight at lane *k* is `-1`).
+/// One block of up to 64 lanes, scalar. `k2` is the lane-order sign mask (bit
+/// *k* set => weight at lane *k* is `-1`). Only lanes `< a.len()` are used.
 #[inline]
 fn dot_block_sparse_scalar(a: &[i8], mask: u64, k2: u64) -> i32 {
+    let valid = if a.len() >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << a.len()) - 1
+    };
     let mut acc = 0i32;
-    let mut bit = 0;
-    let mut m = mask;
+    let mut m = mask & valid;
     while m != 0 {
-        if m & 1 != 0 {
-            let sign = if (k2 >> bit) & 1 != 0 { -1 } else { 1 };
-            acc += a[bit] as i32 * sign;
-        }
-        m >>= 1;
-        bit += 1;
+        let bit = m.trailing_zeros() as usize;
+        let sign = if (k2 >> bit) & 1 != 0 { -1 } else { 1 };
+        acc += a[bit] as i32 * sign;
+        m &= m - 1;
     }
     acc
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// One full 64-lane block with AVX-512BW mask ops. Returns 16 i32 partials.
+///
+/// # Safety
+/// The CPU must support `avx512f` and `avx512bw`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn ternary_dot_block_avx512(a: __m512i, mask: u64, k2: u64) -> __m512i {
-    use core::arch::x86_64::*;
+pub unsafe fn ternary_dot_block_avx512(a: __m512i, mask: u64, k2: u64) -> __m512i {
     let ones_u8 = _mm512_set1_epi8(1);
     let ones_i16 = _mm512_set1_epi16(1);
     let zero = _mm512_setzero_si512();
 
-    // `k2` is the lane-order sign mask (bit *k* set ⇒ weight at lane *k* is `-1`).
+    // `k2` is the lane-order sign mask (bit *k* set => weight at lane *k* is `-1`).
     let k1 = _load_mask64(&mask);
     let k2m = _load_mask64(&k2);
     let k_pos = _kandn_mask64(k2m, k1); // +1 positions
@@ -568,55 +643,57 @@ unsafe fn ternary_dot_block_avx512(a: __m512i, mask: u64, k2: u64) -> __m512i {
     _mm512_madd_epi16(_mm512_maddubs_epi16(ones_u8, sa), ones_i16)
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// AVX-512BW XorSparse row dot product.
+///
+/// # Safety
+/// The CPU must support `avx512f` and `avx512bw`; `num_blocks ==
+/// in_dim.div_ceil(64)`, `masks.len() >= num_blocks`,
+/// `signs.len() >= num_blocks` and `a_i8.len() >= in_dim`. Activations should
+/// be in `[-127, 127]` (see the module docs) for an exact result.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn ternary_dot_product_sparse_avx512(
+pub unsafe fn ternary_dot_product_sparse_avx512(
     a_i8: &[i8],
     masks: &[u64],
     signs: &[u64],
     num_blocks: usize,
     in_dim: usize,
 ) -> i32 {
-    use core::arch::x86_64::*;
     let a_ptr = a_i8.as_ptr();
     let zero = _mm512_setzero_si512();
     let mut acc = [zero; 16];
-    let mut block_idx = 0usize;
+    let mut tail = 0i32;
 
     for b in 0..num_blocks {
         let mask = masks[b];
         let k2 = signs[b];
         let start = b * 64;
         let n = (start + 64).min(in_dim) - start;
-        // The final block may be short; fall back to scalar for it.
-        if b + 1 == num_blocks && n < 64 {
-            let mut tmp = [0i8; 64];
-            tmp[..n].copy_from_slice(&a_i8[start..start + n]);
-            let d = dot_block_sparse_scalar(&tmp[..n], mask, k2);
-            let mut merged = acc[block_idx % 16];
-            merged = _mm512_add_epi32(merged, _mm512_set1_epi32(d));
-            acc[block_idx % 16] = merged;
+        // A short final block would over-read the activations: scalar.
+        if n < 64 {
+            tail = dot_block_sparse_scalar(&a_i8[start..start + n], mask, k2);
             break;
         }
 
         let a = _mm512_loadu_si512(a_ptr.add(start) as *const __m512i);
         let partial = ternary_dot_block_avx512(a, mask, k2);
-        acc[block_idx % 16] = _mm512_add_epi32(acc[block_idx % 16], partial);
-        block_idx += 1;
+        acc[b % 16] = _mm512_add_epi32(acc[b % 16], partial);
     }
 
     let mut merged = acc[0];
-    for k in 1..16 {
-        merged = _mm512_add_epi32(merged, acc[k]);
+    for v in &acc[1..] {
+        merged = _mm512_add_epi32(merged, *v);
     }
-    let mut tmp = [0i32; 16];
-    _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, merged);
-    tmp.iter().sum::<i32>()
+    _mm512_reduce_add_epi32(merged) + tail
 }
 
 /// XorSparse row dot product. Consumes the decoded per-block lane-order
 /// `masks`/`signs` (built once at load). Dispatches to the AVX-512 kernel when
 /// available, otherwise scalar.
+///
+/// Panics unless `num_blocks == in_dim.div_ceil(64)`, `masks`/`signs` hold at
+/// least `num_blocks` entries and `a_i8.len() >= in_dim`. Activations must be
+/// in `[-127, 127]` (checked in debug builds).
 pub fn ternary_dot_product_sparse(
     a_i8: &[i8],
     masks: &[u64],
@@ -624,9 +701,11 @@ pub fn ternary_dot_product_sparse(
     num_blocks: usize,
     in_dim: usize,
 ) -> i32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    check_sparse_args(a_i8, masks, signs, num_blocks, in_dim);
+    #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::util::cpu_features().avx512bw() {
+            // SAFETY: features detected, lengths checked above.
             return unsafe {
                 ternary_dot_product_sparse_avx512(a_i8, masks, signs, num_blocks, in_dim)
             };
@@ -677,7 +756,7 @@ mod sparse_correctness_tests {
             let packed = pack_1_58bit_4pack(&w, 1.0);
             let act = random_act(in_dim, &mut rng);
 
-            let bpr = (in_dim + 3) / 4;
+            let bpr = in_dim.div_ceil(4);
             let dense: Vec<i32> = (0..out_dim)
                 .map(|r| {
                     super::ternary_dot_product_pack4(&act, &packed[r * bpr..(r + 1) * bpr], in_dim)
@@ -715,9 +794,14 @@ mod sparse_correctness_tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx_block_matches_scalar() {
         use core::arch::x86_64::*;
+        if !crate::util::cpu_features().avx512bw() {
+            eprintln!("skipping avx_block_matches_scalar: no AVX-512BW");
+            return;
+        }
         let a: Vec<i8> = (0..64).map(|i| ((i as i8) % 5) - 2).collect();
         let avx_a = unsafe { _mm512_loadu_si512(a.as_ptr() as *const __m512i) };
         let mask: u64 = 0xAAAA_AAAA_AAAA_AAAA;

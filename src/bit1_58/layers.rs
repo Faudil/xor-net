@@ -57,7 +57,7 @@ fn ternarize_row(
                 let vals = row
                     .iter()
                     .map(|&w| {
-                        let q = (w / s).round().max(-1.0).min(1.0);
+                        let q = (w / s).round().clamp(-1.0, 1.0);
                         if q < -0.5 {
                             -1
                         } else if q > 0.5 {
@@ -79,7 +79,7 @@ fn ternarize_row(
                 let vals = row
                     .iter()
                     .map(|&w| {
-                        let q = (w / s).round().max(-1.0).min(1.0);
+                        let q = (w / s).round().clamp(-1.0, 1.0);
                         if q < -0.5 {
                             -1
                         } else if q > 0.5 {
@@ -92,6 +92,34 @@ fn ternarize_row(
                 (vals, s)
             }
         }
+    }
+}
+
+/// Shared precondition of the fused single-row paths: one row of `in_dim`
+/// pre-quantised activations feeding layers that all take `in_dim` inputs.
+/// The raw-pointer output writes in those paths rely on it.
+fn check_fused_inputs(
+    xs: &FastTensor,
+    quantized_in: &[i8],
+    in_dim: usize,
+    lins: &[&TernaryLinear],
+) {
+    assert!(!xs.shape.is_empty(), "fused ternary path: rank-0 input");
+    assert!(
+        quantized_in.len() >= in_dim,
+        "fused ternary path: quantized input has {} values, expected {}",
+        quantized_in.len(),
+        in_dim
+    );
+    for l in lins {
+        assert_eq!(
+            l.in_dim, in_dim,
+            "fused ternary path: layer in_dim mismatch"
+        );
+        assert!(
+            l.w_scales.len() >= l.out_dim,
+            "fused ternary path: w_scales too short"
+        );
     }
 }
 
@@ -111,7 +139,7 @@ impl TernaryLinear {
             .iter()
             .all(|&w| w == -1.0 || w == 0.0 || w == 1.0);
         let mut w_scales = Vec::with_capacity(out_dim);
-        let mut packed_weights = Vec::with_capacity((out_dim * in_dim + 3) / 4);
+        let mut packed_weights = Vec::with_capacity((out_dim * in_dim).div_ceil(4));
 
         if already_ternary {
             let global_w_scale = provided_scale.unwrap_or(1.0);
@@ -251,8 +279,8 @@ impl TernaryLinear {
         match &self.rep {
             TernaryRep::Dense(pw) => {
                 let bpr = match self.pack_type {
-                    TernaryPackType::Pack4 => (self.in_dim + 3) / 4,
-                    TernaryPackType::Pack5 => (self.in_dim + 4) / 5,
+                    TernaryPackType::Pack4 => self.in_dim.div_ceil(4),
+                    TernaryPackType::Pack5 => self.in_dim.div_ceil(5),
                 };
                 let w = &pw[row * bpr..(row + 1) * bpr];
                 ternary_dot(self.pack_type, input, w, n)
@@ -322,7 +350,7 @@ impl TernaryLinear {
             let inv_scale = quantize_f32_to_i8(in_row, &mut quantized_in);
 
             let num_threads = crate::util::get_num_threads();
-            let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
+            let chunk_size = out_dim.div_ceil(num_threads).max(128);
 
             out_data
                 .par_chunks_mut(chunk_size)
@@ -345,9 +373,9 @@ impl TernaryLinear {
                     let in_row = &input_slice[b * in_dim..(b + 1) * in_dim];
                     let inv_scale = quantize_f32_to_i8(in_row, &mut quantized_in);
 
-                    for o in 0..out_dim {
+                    for (o, out_val) in out_row.iter_mut().enumerate() {
                         let dot_i32 = self.dot_row(o, &quantized_in, in_dim);
-                        out_row[o] = dot_i32 as f32 * inv_scale * self.w_scales[o];
+                        *out_val = dot_i32 as f32 * inv_scale * self.w_scales[o];
                     }
                     crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
                 });
@@ -379,11 +407,27 @@ impl TernaryLinear {
 
         let in_dim = self.in_dim;
         let out_dim = self.out_dim;
+        // One pre-quantised row with one `inv_scale`: the input must be a
+        // single row, otherwise the output would not match `out_shape`.
+        let rows: usize = xs.shape[..rank - 1].iter().product();
+        if rows != 1 {
+            anyhow::bail!(
+                "TernaryLinear::forward_with_quantized handles a single row, got shape {:?}",
+                xs.shape
+            );
+        }
+        if quantized_in.len() < in_dim {
+            anyhow::bail!(
+                "TernaryLinear::forward_with_quantized: quantized input has {} values, expected {}",
+                quantized_in.len(),
+                in_dim
+            );
+        }
 
         let mut out_data = crate::tensor::workspace::get_pooled_buffer(out_dim);
 
         let num_threads = crate::util::get_num_threads();
-        let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
+        let chunk_size = out_dim.div_ceil(num_threads).max(128);
 
         out_data
             .par_chunks_mut(chunk_size)
@@ -410,6 +454,7 @@ impl TernaryLinear {
     ) -> (FastTensor, FastTensor, FastTensor) {
         let rank = xs.shape.len();
         let in_dim = q_lin.in_dim;
+        check_fused_inputs(xs, quantized_in, in_dim, &[q_lin, k_lin, v_lin]);
 
         let mut q_out = crate::tensor::workspace::get_pooled_buffer(q_lin.out_dim);
         let mut k_out = crate::tensor::workspace::get_pooled_buffer(k_lin.out_dim);
@@ -420,7 +465,7 @@ impl TernaryLinear {
         let total_rows = q_out_dim + k_out_dim + v_lin.out_dim;
 
         let num_threads = crate::util::get_num_threads();
-        let chunk_size = ((total_rows + num_threads - 1) / num_threads).max(128);
+        let chunk_size = total_rows.div_ceil(num_threads).max(128);
 
         // Each output row index is claimed exactly once via the atomic counter,
         // so the parallel workers below can write to disjoint f32 slots through
@@ -495,6 +540,7 @@ impl TernaryLinear {
     ) -> (FastTensor, FastTensor) {
         let rank = xs.shape.len();
         let in_dim = fc1_lin.in_dim;
+        check_fused_inputs(xs, quantized_in, in_dim, &[fc1_lin, fc2_lin]);
 
         let mut fc1_out = crate::tensor::workspace::get_pooled_buffer(fc1_lin.out_dim);
         let mut fc2_out = crate::tensor::workspace::get_pooled_buffer(fc2_lin.out_dim);
@@ -503,7 +549,7 @@ impl TernaryLinear {
         let total_rows = fc1_out_dim + fc2_lin.out_dim;
 
         let num_threads = crate::util::get_num_threads();
-        let chunk_size = ((total_rows + num_threads - 1) / num_threads).max(128);
+        let chunk_size = total_rows.div_ceil(num_threads).max(128);
 
         let fc1_ptr: usize = fc1_out.as_mut_ptr() as usize;
         let fc2_ptr: usize = fc2_out.as_mut_ptr() as usize;
@@ -562,6 +608,7 @@ impl TernaryLinear {
     ///  - Tighter spatial locality: silu buffer is quantized immediately while still L3-warm
     ///
     /// `use_silu`: true = SiLU activation (gate * σ(gate) * up), false = ReLU² (max(gate,0)² * up)
+    #[allow(clippy::too_many_arguments)]
     pub fn fused_mlp_all(
         xs: &FastTensor,
         quantized_in: &[i8],      // pre-quantized input (hidden_size i8 values)
@@ -576,6 +623,11 @@ impl TernaryLinear {
         let in_dim = gate_lin.in_dim; // hidden_size   e.g. 2048
         let inter = gate_lin.out_dim; // intermediate  e.g. 5504
         let out_dim = down_lin.out_dim; // hidden_size   e.g. 2048
+        check_fused_inputs(xs, quantized_in, in_dim, &[gate_lin, up_lin]);
+        assert!(
+            up_lin.out_dim == inter && down_lin.in_dim == inter,
+            "fused_mlp_all: gate/up/down dims are inconsistent"
+        );
 
         // ── Phase 1: gate + up in parallel ──────────────────────────────────
         let mut gate_buf = crate::tensor::workspace::get_pooled_buffer(inter);
@@ -583,7 +635,7 @@ impl TernaryLinear {
 
         let total_rows12 = inter + inter; // gate rows + up rows
         let num_threads = rayon::current_num_threads();
-        let chunk12 = ((total_rows12 + num_threads - 1) / num_threads).max(128);
+        let chunk12 = total_rows12.div_ceil(num_threads).max(128);
 
         let gate_ptr: usize = gate_buf.as_mut_ptr() as usize;
         let up_ptr: usize = up_buf.as_mut_ptr() as usize;
@@ -644,7 +696,7 @@ impl TernaryLinear {
 
             // Phase 3 with normed data
             let mut down_buf = crate::tensor::workspace::get_pooled_buffer(out_dim);
-            let chunk3 = ((out_dim + num_threads - 1) / num_threads).max(128);
+            let chunk3 = out_dim.div_ceil(num_threads).max(128);
             let down_ptr: usize = down_buf.as_mut_ptr() as usize;
             let down_w = &down_lin.w_scales;
             {
@@ -689,7 +741,7 @@ impl TernaryLinear {
 
         // ── Phase 3: down_proj ───────────────────────────────────────────────
         let mut down_buf = crate::tensor::workspace::get_pooled_buffer(out_dim);
-        let chunk3 = ((out_dim + num_threads - 1) / num_threads).max(128);
+        let chunk3 = out_dim.div_ceil(num_threads).max(128);
         let down_ptr: usize = down_buf.as_mut_ptr() as usize;
         let down_w = &down_lin.w_scales;
         {
@@ -733,6 +785,7 @@ impl TernaryLinear {
     ///
     /// `down` must be `Ternary` or `Int8` (both implement `forward_with_quantized`
     /// and ignore the f32 input tensor, using `quantized_mid` directly).
+    #[allow(clippy::too_many_arguments)]
     pub fn fused_mlp_gate_up_down(
         xs: &FastTensor,
         quantized_in: &[i8],      // pre-quantized input (hidden_size i8 values)
@@ -746,6 +799,11 @@ impl TernaryLinear {
         let rank = xs.shape.len();
         let in_dim = gate_lin.in_dim; // hidden_size
         let inter = gate_lin.out_dim; // intermediate
+        check_fused_inputs(xs, quantized_in, in_dim, &[gate_lin, up_lin]);
+        assert_eq!(
+            up_lin.out_dim, inter,
+            "fused_mlp_gate_up_down: gate/up dims differ"
+        );
 
         // ── Phase 1: gate + up in parallel ──────────────────────────────────
         let mut gate_buf = crate::tensor::workspace::get_pooled_buffer(inter);
@@ -753,7 +811,7 @@ impl TernaryLinear {
 
         let total_rows12 = inter + inter; // gate rows + up rows
         let num_threads = rayon::current_num_threads();
-        let chunk12 = ((total_rows12 + num_threads - 1) / num_threads).max(128);
+        let chunk12 = total_rows12.div_ceil(num_threads).max(128);
 
         let gate_ptr: usize = gate_buf.as_mut_ptr() as usize;
         let up_ptr: usize = up_buf.as_mut_ptr() as usize;

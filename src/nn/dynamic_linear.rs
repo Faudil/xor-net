@@ -5,13 +5,15 @@ use crate::loader::{SafeTensorLoader, sparse_loader::SparseFile};
 use crate::tensor::FastTensor;
 use rayon::prelude::*;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// AVX2+FMA f32 dot product (4 accumulators).
+///
+/// # Safety
+/// The CPU must support `avx2` and `fma`, and `b.len() >= a.len()`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn dot_product_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
+    debug_assert!(b.len() >= a.len());
     let n = a.len();
     let mut sum0 = _mm256_setzero_ps();
     let mut sum1 = _mm256_setzero_ps();
@@ -58,29 +60,37 @@ pub unsafe fn dot_product_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     total
 }
 
+/// Reference scalar f32 dot product. Panics if `a.len() != b.len()`.
+pub fn dot_product_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "dot_product_f32: length mismatch");
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// f32 dot product dispatched to AVX2+FMA when available.
+///
+/// Panics if `a.len() != b.len()`.
 #[inline(always)]
 pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    assert_eq!(a.len(), b.len(), "dot_product_f32: length mismatch");
+    #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if crate::util::cpu_features().avx2_fma() {
+            // SAFETY: avx2+fma detected; lengths checked above.
             return unsafe { dot_product_f32_avx2(a, b) };
         }
     }
-
-    let mut sum = 0.0f32;
-    for i in 0..a.len() {
-        sum += a[i] * b[i];
-    }
-    sum
+    dot_product_f32_scalar(a, b)
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// AVX2 i8 dot product (sign-extend to i16, `madd`). Exact for all `i8`.
+///
+/// # Safety
+/// The CPU must support `avx2`, and `b.len() >= a.len()`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn dot_product_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
+    debug_assert!(b.len() >= a.len());
     let n = a.len();
     let mut acc = _mm256_setzero_si256();
     let mut i = 0;
@@ -106,13 +116,15 @@ pub unsafe fn dot_product_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
     total
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// AVX-512BW i8 dot product (sign-extend to i16, `madd`). Exact for all `i8`.
+///
+/// # Safety
+/// The CPU must support `avx512f` and `avx512bw`, and `b.len() >= a.len()`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 pub unsafe fn dot_product_i8_avx512(a: &[i8], b: &[i8]) -> i32 {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
+    debug_assert!(b.len() >= a.len());
     let n = a.len();
     let mut acc = _mm512_setzero_si512();
     let mut i = 0;
@@ -147,22 +159,30 @@ pub unsafe fn dot_product_i8_avx512(a: &[i8], b: &[i8]) -> i32 {
     total
 }
 
+/// Reference scalar i8 dot product. Panics if `a.len() != b.len()`.
+pub fn dot_product_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
+    assert_eq!(a.len(), b.len(), "dot_product_i8: length mismatch");
+    a.iter().zip(b).map(|(&x, &y)| x as i32 * y as i32).sum()
+}
+
+/// i8 dot product dispatched to AVX-512BW / AVX2 when available. Exact.
+///
+/// Panics if `a.len() != b.len()`.
 #[inline(always)]
 pub fn dot_product_i8(a: &[i8], b: &[i8]) -> i32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    assert_eq!(a.len(), b.len(), "dot_product_i8: length mismatch");
+    #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        let f = crate::util::cpu_features();
+        // SAFETY: features detected; lengths checked above.
+        if f.avx512bw() {
             return unsafe { dot_product_i8_avx512(a, b) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if f.avx2 {
             return unsafe { dot_product_i8_avx2(a, b) };
         }
     }
-    let mut sum = 0i32;
-    for i in 0..a.len() {
-        sum += a[i] as i32 * b[i] as i32;
-    }
-    sum
+    dot_product_i8_scalar(a, b)
 }
 
 /// VNNI (dpbusd) int8 GEMV. `a_u8` must be the activation quantized to i8 then
@@ -173,13 +193,18 @@ pub fn dot_product_i8(a: &[i8], b: &[i8]) -> i32 {
 /// dpbusd(u8, i8) = Σ (a_i8 + 128)·b_i8 = true_dot + 128·Σ b_i8, so we recover
 /// true_dot = dpbusd - 128·w_row_sum. Runs ~4× faster than the pre-VNNI
 /// `madd_epi16` path used by `dot_product_i8_avx512`.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+///
+/// Exact for every `i8` activation (including `-128`, i.e. `a_u8 == 0`) as
+/// long as `w_row_sum == Σ b_i8` and the true dot product fits in `i32`.
+///
+/// # Safety
+/// The CPU must support `avx512f`, `avx512bw` and `avx512vnni`, and
+/// `b_i8.len() >= a_u8.len()`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 pub unsafe fn dot_product_i8_avx512_vnni(a_u8: &[u8], b_i8: &[i8], w_row_sum: i32) -> i32 {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
+    debug_assert!(b_i8.len() >= a_u8.len());
     let n = a_u8.len();
     let mut acc = [_mm512_setzero_si512(); 8];
     let a_ptr = a_u8.as_ptr() as *const __m512i;
@@ -187,6 +212,9 @@ pub unsafe fn dot_product_i8_avx512_vnni(a_u8: &[u8], b_i8: &[i8], w_row_sum: i3
     let groups = n / 64;
     let mut g = 0;
     while g + 8 <= groups {
+        // Fully unrolled by the compiler; indexing keeps the 8 accumulators
+        // in distinct registers (an iterator rewrite risks worse codegen).
+        #[allow(clippy::needless_range_loop)]
         for k in 0..8 {
             let av = _mm512_loadu_si512(a_ptr.add(g + k));
             let bv = _mm512_loadu_si512(b_ptr.add(g + k));
@@ -202,8 +230,8 @@ pub unsafe fn dot_product_i8_avx512_vnni(a_u8: &[u8], b_i8: &[i8], w_row_sum: i3
     }
 
     let mut merged = acc[0];
-    for k in 1..8 {
-        merged = _mm512_add_epi32(merged, acc[k]);
+    for v in &acc[1..] {
+        merged = _mm512_add_epi32(merged, *v);
     }
     let mut sums = [0i32; 16];
     _mm512_storeu_si512(sums.as_mut_ptr() as *mut __m512i, merged);
@@ -218,8 +246,79 @@ pub unsafe fn dot_product_i8_avx512_vnni(a_u8: &[u8], b_i8: &[i8], w_row_sum: i3
         tail_true += ai * bi;
         tail_b += bi;
     }
-    let covered_b = w_row_sum - tail_b;
-    dp - 128 * covered_b + tail_true
+    let covered_b = w_row_sum.wrapping_sub(tail_b);
+    dp.wrapping_sub(covered_b.wrapping_mul(128))
+        .wrapping_add(tail_true)
+}
+
+/// Safe wrapper for the VNNI int8 dot product with the `+128` zero-point
+/// correction (see [`dot_product_i8_avx512_vnni`]); falls back to the exact
+/// scalar computation when VNNI is unavailable.
+///
+/// Panics if `a_u8.len() != b_i8.len()`.
+pub fn dot_product_u8_zp_i8(a_u8: &[u8], b_i8: &[i8], w_row_sum: i32) -> i32 {
+    assert_eq!(
+        a_u8.len(),
+        b_i8.len(),
+        "dot_product_u8_zp_i8: length mismatch"
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::util::cpu_features().avx512_vnni() {
+            // SAFETY: features detected; lengths checked above.
+            return unsafe { dot_product_i8_avx512_vnni(a_u8, b_i8, w_row_sum) };
+        }
+    }
+    let _ = w_row_sum;
+    a_u8.iter()
+        .zip(b_i8)
+        .map(|(&a, &b)| (a as i32 - 128) * b as i32)
+        .sum()
+}
+
+/// Prefetch hint for the next weight bytes. Uses `wrapping_add`, so the
+/// address may point past the end of `row` (a prefetch never faults).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch_nta(row: &[i8], ahead: usize) {
+    // SAFETY: `_mm_prefetch` is SSE (baseline on x86_64), never faults and
+    // does not dereference the pointer in the Rust memory model.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(
+            row.as_ptr().wrapping_add(ahead),
+            std::arch::x86_64::_MM_HINT_NTA,
+        );
+    }
+}
+
+/// One packed int4 row dot product. `w_packed` holds `in_dim.div_ceil(2)`
+/// bytes (low nibble = even element, high nibble = odd element, both signed
+/// two's complement); `q_in` holds at least `in_dim` activations.
+#[inline(always)]
+fn int4_dot_row(w_packed: &[u8], q_in: &[i8], in_dim: usize) -> i32 {
+    let pairs = in_dim / 2;
+    let mut dot = 0i32;
+    for (&b, in_chunk) in w_packed[..pairs]
+        .iter()
+        .zip(q_in[..pairs * 2].chunks_exact(2))
+    {
+        let q0 = ((b & 0x0F) as i8) << 4 >> 4;
+        let q1 = ((b & 0xF0) as i8) >> 4;
+        dot += (in_chunk[0] as i32) * (q0 as i32) + (in_chunk[1] as i32) * (q1 as i32);
+    }
+    if in_dim % 2 == 1 {
+        // Odd `in_dim`: the final byte holds only the low nibble.
+        let q0 = ((w_packed[pairs] & 0x0F) as i8) << 4 >> 4;
+        dot += q_in[in_dim - 1] as i32 * q0 as i32;
+    }
+    dot
+}
+
+/// Leading (batch) element count of a tensor shape, i.e. the product of all
+/// but the last dimension.
+#[inline]
+fn batch_size(shape: &[usize]) -> usize {
+    shape[..shape.len() - 1].iter().product()
 }
 
 #[derive(Debug, Clone)]
@@ -245,7 +344,7 @@ impl Int8Linear {
             scales.push(scale);
             let mut ssum = 0i32;
             for &w in row {
-                let q = (w / scale).round().max(-127.0).min(127.0) as i8;
+                let q = (w / scale).round().clamp(-127.0, 127.0) as i8;
                 ssum += q as i32;
                 weight_i8.push(q);
             }
@@ -283,45 +382,7 @@ impl Int8Linear {
                 &mut quantized_in,
             );
 
-            let use_vnni = is_x86_feature_detected!("avx512vnni");
-            // Reinterpret the i8 activation as u8 with a +128 zero-point so it
-            // can feed the unsigned operand of `vpdpbusd`.
-            let mut act_u8 = vec![0u8; in_dim];
-            if use_vnni {
-                for i in 0..in_dim {
-                    act_u8[i] = (quantized_in[i] as u8) ^ 0x80;
-                }
-            }
-
-            let num_threads = crate::util::get_num_threads();
-            let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
-
-            out_data
-                .par_chunks_mut(chunk_size)
-                .enumerate()
-                .for_each(|(chunk_idx, out_chunk)| {
-                    let start_o = chunk_idx * chunk_size;
-                    for (i, out_val) in out_chunk.iter_mut().enumerate() {
-                        let o = start_o + i;
-                        let w_row = &self.weight_i8[o * in_dim..(o + 1) * in_dim];
-                        let dot = if use_vnni {
-                            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                            unsafe {
-                                std::arch::x86_64::_mm_prefetch(
-                                    w_row.as_ptr().add(64) as *const i8,
-                                    std::arch::x86_64::_MM_HINT_NTA,
-                                );
-                            }
-                            unsafe {
-                                dot_product_i8_avx512_vnni(&act_u8, w_row, self.weight_row_sum[o])
-                            }
-                        } else {
-                            dot_product_i8(&quantized_in, w_row)
-                        };
-                        *out_val = dot as f32 * inv_scale * self.scales[o];
-                    }
-                });
-
+            self.gemv_quantized(&quantized_in, inv_scale, &mut out_data);
             crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
         } else {
             out_data
@@ -332,10 +393,10 @@ impl Int8Linear {
                     let in_row = &xs.data[b * in_dim..(b + 1) * in_dim];
                     let inv_scale =
                         crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
-                    for o in 0..out_dim {
+                    for (o, out_val) in out_row.iter_mut().enumerate() {
                         let w_row = &self.weight_i8[o * in_dim..(o + 1) * in_dim];
-                        let dot = dot_product_i8(&quantized_in, w_row);
-                        out_row[o] = dot as f32 * inv_scale * self.scales[o];
+                        let dot = dot_product_i8(&quantized_in[..in_dim], w_row);
+                        *out_val = dot as f32 * inv_scale * self.scales[o];
                     }
                     crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
                 });
@@ -344,6 +405,63 @@ impl Int8Linear {
         Ok(FastTensor::new(out_data, out_shape))
     }
 
+    /// Single-row GEMV over an already-quantised activation
+    /// (`quantized_in[..in_dim]`), writing `out[..out_dim]`.
+    fn gemv_quantized(&self, quantized_in: &[i8], inv_scale: f32, out: &mut [f32]) {
+        let in_dim = self.in_dim;
+        let out_dim = self.out_dim;
+        let q = &quantized_in[..in_dim];
+        let out = &mut out[..out_dim];
+        assert!(
+            self.weight_i8.len() >= out_dim * in_dim
+                && self.scales.len() >= out_dim
+                && self.weight_row_sum.len() >= out_dim,
+            "Int8Linear: weight/scale buffers smaller than out_dim x in_dim"
+        );
+
+        let num_threads = crate::util::get_num_threads();
+        let chunk_size = out_dim.div_ceil(num_threads).max(128);
+
+        #[cfg(target_arch = "x86_64")]
+        if crate::util::cpu_features().avx512_vnni() {
+            // Reinterpret the i8 activation as u8 with a +128 zero-point so it
+            // can feed the unsigned operand of `vpdpbusd`.
+            let act_u8: Vec<u8> = q.iter().map(|&x| (x as u8) ^ 0x80).collect();
+            out.par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(chunk_idx, out_chunk)| {
+                    let start_o = chunk_idx * chunk_size;
+                    for (i, out_val) in out_chunk.iter_mut().enumerate() {
+                        let o = start_o + i;
+                        let w_row = &self.weight_i8[o * in_dim..(o + 1) * in_dim];
+                        prefetch_nta(w_row, 64);
+                        // SAFETY: avx512f+bw+vnni detected above;
+                        // `act_u8.len() == w_row.len() == in_dim`.
+                        let dot = unsafe {
+                            dot_product_i8_avx512_vnni(&act_u8, w_row, self.weight_row_sum[o])
+                        };
+                        *out_val = dot as f32 * inv_scale * self.scales[o];
+                    }
+                });
+            return;
+        }
+
+        out.par_chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(chunk_idx, out_chunk)| {
+                let start_o = chunk_idx * chunk_size;
+                for (i, out_val) in out_chunk.iter_mut().enumerate() {
+                    let o = start_o + i;
+                    let w_row = &self.weight_i8[o * in_dim..(o + 1) * in_dim];
+                    let dot = dot_product_i8(q, w_row);
+                    *out_val = dot as f32 * inv_scale * self.scales[o];
+                }
+            });
+    }
+
+    /// GEMV over an already-quantised single row. `xs` only supplies the shape
+    /// (its data is ignored); the product of its leading dims must be 1 and
+    /// `quantized_in` must hold at least `in_dim` values.
     pub fn forward_with_quantized(
         &self,
         xs: &FastTensor,
@@ -355,54 +473,37 @@ impl Int8Linear {
         if rank == 0 {
             anyhow::bail!("Input must have at least 1 dimension");
         }
-        let last_dim = &mut out_shape[rank - 1];
-        if *last_dim != self.in_dim {
+        if out_shape[rank - 1] != self.in_dim {
             anyhow::bail!("Int8Linear shape mismatch");
         }
-        *last_dim = self.out_dim;
-        let out_dim = self.out_dim;
-        let in_dim = self.in_dim;
+        check_single_row(&xs.shape, quantized_in.len(), self.in_dim)?;
+        out_shape[rank - 1] = self.out_dim;
 
-        let use_vnni = is_x86_feature_detected!("avx512vnni");
-        let mut act_u8 = vec![0u8; in_dim];
-        if use_vnni {
-            for i in 0..in_dim {
-                act_u8[i] = (quantized_in[i] as u8) ^ 0x80;
-            }
-        }
-
-        let mut out_data = crate::tensor::workspace::get_pooled_buffer(out_dim);
-        let num_threads = crate::util::get_num_threads();
-        let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
-
-        out_data
-            .par_chunks_mut(chunk_size)
-            .enumerate()
-            .for_each(|(chunk_idx, out_chunk)| {
-                let start_o = chunk_idx * chunk_size;
-                for (i, out_val) in out_chunk.iter_mut().enumerate() {
-                    let o = start_o + i;
-                    let w_row = &self.weight_i8[o * in_dim..(o + 1) * in_dim];
-                    let dot = if use_vnni {
-                        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                        unsafe {
-                            std::arch::x86_64::_mm_prefetch(
-                                w_row.as_ptr().add(64) as *const i8,
-                                std::arch::x86_64::_MM_HINT_NTA,
-                            );
-                        }
-                        unsafe {
-                            dot_product_i8_avx512_vnni(&act_u8, w_row, self.weight_row_sum[o])
-                        }
-                    } else {
-                        dot_product_i8(quantized_in, w_row)
-                    };
-                    *out_val = dot as f32 * inv_scale * self.scales[o];
-                }
-            });
-
+        let mut out_data = crate::tensor::workspace::get_pooled_buffer(self.out_dim);
+        self.gemv_quantized(quantized_in, inv_scale, &mut out_data);
         Ok(FastTensor::new(out_data, out_shape))
     }
+}
+
+/// `forward_with_quantized` takes one pre-quantised row (one `inv_scale`), so
+/// the input shape must describe exactly one row.
+fn check_single_row(shape: &[usize], quantized_len: usize, in_dim: usize) -> anyhow::Result<()> {
+    let b = batch_size(shape);
+    if b != 1 {
+        anyhow::bail!(
+            "forward_with_quantized handles a single row, but input shape {:?} has {} rows",
+            shape,
+            b
+        );
+    }
+    if quantized_len < in_dim {
+        anyhow::bail!(
+            "forward_with_quantized: quantized input has {} values, expected {}",
+            quantized_len,
+            in_dim
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -415,7 +516,7 @@ pub struct Int4Linear {
 
 impl Int4Linear {
     pub fn new(weights_f32: &[f32], out_dim: usize, in_dim: usize) -> Self {
-        let mut weight_i4 = Vec::with_capacity((weights_f32.len() + 1) / 2);
+        let mut weight_i4 = Vec::with_capacity(weights_f32.len().div_ceil(2));
         let mut scales = Vec::with_capacity(out_dim);
         for r in 0..out_dim {
             let row = &weights_f32[r * in_dim..(r + 1) * in_dim];
@@ -427,8 +528,8 @@ impl Int4Linear {
                 let w0 = row[c];
                 let w1 = if c + 1 < in_dim { row[c + 1] } else { 0.0 };
 
-                let q0 = (w0 / scale).round().max(-8.0).min(7.0) as i8;
-                let q1 = (w1 / scale).round().max(-8.0).min(7.0) as i8;
+                let q0 = (w0 / scale).round().clamp(-8.0, 7.0) as i8;
+                let q1 = (w1 / scale).round().clamp(-8.0, 7.0) as i8;
 
                 let packed = ((q0 as u8) & 0x0F) | ((q1 as u8) << 4);
                 weight_i4.push(packed);
@@ -466,7 +567,7 @@ impl Int4Linear {
             );
 
             let num_threads = crate::util::get_num_threads();
-            let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
+            let chunk_size = out_dim.div_ceil(num_threads).max(128);
 
             out_data
                 .par_chunks_mut(chunk_size)
@@ -475,19 +576,9 @@ impl Int4Linear {
                     let start_o = chunk_idx * chunk_size;
                     for (i, out_val) in out_chunk.iter_mut().enumerate() {
                         let o = start_o + i;
-                        let w_row_start = o * ((in_dim + 1) / 2);
-                        let w_row_end = w_row_start + ((in_dim + 1) / 2);
-                        let w_packed = &self.weight_i4[w_row_start..w_row_end];
-
-                        let mut dot = 0i32;
-                        let q_in_chunks = quantized_in.chunks_exact(2);
-                        for (&b, in_chunk) in w_packed.iter().zip(q_in_chunks) {
-                            let q0 = ((b & 0x0F) as i8) << 4 >> 4;
-                            let q1 = ((b & 0xF0) as i8) >> 4;
-
-                            dot += (in_chunk[0] as i32) * (q0 as i32)
-                                + (in_chunk[1] as i32) * (q1 as i32);
-                        }
+                        let bpr = in_dim.div_ceil(2);
+                        let w_packed = &self.weight_i4[o * bpr..(o + 1) * bpr];
+                        let dot = int4_dot_row(w_packed, &quantized_in, in_dim);
                         *out_val = dot as f32 * inv_scale * self.scales[o];
                     }
                 });
@@ -502,21 +593,11 @@ impl Int4Linear {
                     let inv_scale =
                         crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
 
-                    for o in 0..out_dim {
-                        let w_row_start = o * ((in_dim + 1) / 2);
-                        let w_row_end = w_row_start + ((in_dim + 1) / 2);
-                        let w_packed = &self.weight_i4[w_row_start..w_row_end];
-
-                        let mut dot = 0i32;
-                        let q_in_chunks = quantized_in.chunks_exact(2);
-                        for (&w_b, in_chunk) in w_packed.iter().zip(q_in_chunks) {
-                            let q0 = ((w_b & 0x0F) as i8) << 4 >> 4;
-                            let q1 = ((w_b & 0xF0) as i8) >> 4;
-
-                            dot += (in_chunk[0] as i32) * (q0 as i32)
-                                + (in_chunk[1] as i32) * (q1 as i32);
-                        }
-                        out_row[o] = dot as f32 * inv_scale * self.scales[o];
+                    for (o, out_val) in out_row.iter_mut().enumerate() {
+                        let bpr = in_dim.div_ceil(2);
+                        let w_packed = &self.weight_i4[o * bpr..(o + 1) * bpr];
+                        let dot = int4_dot_row(w_packed, &quantized_in, in_dim);
+                        *out_val = dot as f32 * inv_scale * self.scales[o];
                     }
                     crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
                 });
@@ -536,17 +617,19 @@ impl Int4Linear {
         if rank == 0 {
             anyhow::bail!("Input must have at least 1 dimension");
         }
-        let last_dim = &mut out_shape[rank - 1];
-        if *last_dim != self.in_dim {
+        if out_shape[rank - 1] != self.in_dim {
             anyhow::bail!("Int4Linear shape mismatch");
         }
-        *last_dim = self.out_dim;
+        check_single_row(&xs.shape, quantized_in.len(), self.in_dim)?;
+        out_shape[rank - 1] = self.out_dim;
         let out_dim = self.out_dim;
         let in_dim = self.in_dim;
+        let quantized_in = &quantized_in[..in_dim];
 
         let mut out_data = crate::tensor::workspace::get_pooled_buffer(out_dim);
         let num_threads = crate::util::get_num_threads();
-        let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
+        let chunk_size = out_dim.div_ceil(num_threads).max(128);
+        let bpr = in_dim.div_ceil(2);
 
         out_data
             .par_chunks_mut(chunk_size)
@@ -555,19 +638,8 @@ impl Int4Linear {
                 let start_o = chunk_idx * chunk_size;
                 for (i, out_val) in out_chunk.iter_mut().enumerate() {
                     let o = start_o + i;
-                    let w_row_start = o * ((in_dim + 1) / 2);
-                    let w_row_end = w_row_start + ((in_dim + 1) / 2);
-                    let w_packed = &self.weight_i4[w_row_start..w_row_end];
-
-                    let mut dot = 0i32;
-                    let q_in_chunks = quantized_in.chunks_exact(2);
-                    for (&b, in_chunk) in w_packed.iter().zip(q_in_chunks) {
-                        let q0 = ((b & 0x0F) as i8) << 4 >> 4;
-                        let q1 = ((b & 0xF0) as i8) >> 4;
-
-                        dot +=
-                            (in_chunk[0] as i32) * (q0 as i32) + (in_chunk[1] as i32) * (q1 as i32);
-                    }
+                    let w_packed = &self.weight_i4[o * bpr..(o + 1) * bpr];
+                    let dot = int4_dot_row(w_packed, quantized_in, in_dim);
                     *out_val = dot as f32 * inv_scale * self.scales[o];
                 }
             });
@@ -629,7 +701,7 @@ impl F32Linear {
         if b_size == 1 {
             let in_row = &xs.data[0..in_features];
             let num_threads = crate::util::get_num_threads();
-            let chunk_size = ((out_features + num_threads - 1) / num_threads).max(128);
+            let chunk_size = out_features.div_ceil(num_threads).max(128);
 
             out_data
                 .par_chunks_mut(chunk_size)
@@ -648,9 +720,9 @@ impl F32Linear {
                 .enumerate()
                 .for_each(|(b, out_row)| {
                     let in_row = &xs.data[b * in_features..(b + 1) * in_features];
-                    for o in 0..out_features {
+                    for (o, out_val) in out_row.iter_mut().enumerate() {
                         let w_row = &self.weight.data[o * in_features..(o + 1) * in_features];
-                        out_row[o] = dot_product_f32(in_row, w_row);
+                        *out_val = dot_product_f32(in_row, w_row);
                     }
                 });
         }
@@ -863,13 +935,7 @@ impl DynamicLinear {
                             inner: LinearKind::Ternary(l),
                         });
                     }
-                    return Self::new_ternary(
-                        in_dim,
-                        out_dim,
-                        &weight.data,
-                        pack_type,
-                        provided_scale,
-                    );
+                    Self::new_ternary(in_dim, out_dim, &weight.data, pack_type, provided_scale)
                 }
             }
         }

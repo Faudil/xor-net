@@ -90,6 +90,10 @@ path = "examples/test_prompt.rs"
 name = "bench_simd"
 harness = false
 
+[[bench]]
+name = "kernels"
+harness = false
+
 [[bin]]
 name = "convert_sparse"
 path = "src/bin/convert_sparse.rs"
@@ -107,14 +111,21 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokenizers = "0.23.1"
 ahash = "0.8"
-jemallocator = "0.5.4"
 safetensors = "0.5.2"
 memmap2 = "0.9.11"
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310", "generate-import-lib"], optional = true }
+minijinja = { version = "2.24", features = ["json", "loader", "loop_controls", "preserve_order"] }
+minijinja-contrib = { version = "2.24", features = ["pycompat"] }
+pyo3 ={ version = "0.23", features = ["extension-module", "abi3-py310", "generate-import-lib"], optional = true }
 
 [dev-dependencies]
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
+
+# jemalloc is only used as the global allocator by some examples; the library
+# never installs it. Keeping it out of [dependencies] spares downstream crates
+# the C build and keeps MSVC builds working.
+[target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
+jemallocator = "0.5.4"
 
 [features]
 default = []

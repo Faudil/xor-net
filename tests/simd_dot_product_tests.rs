@@ -41,7 +41,9 @@ fn ternary_pack5_dot_product_hand_computed() {
 #[test]
 fn ternary_pack4_all_zeros_weights() {
     // All-zero weights → dot product must be 0 regardless of activations
-    let acts: Vec<i8> = vec![127, -128, 50, -50, 1, -1, 0, 100];
+    // Activations span the full supported range [-127, 127] (-128 is outside
+    // the kernels' documented domain; the quantizer never produces it).
+    let acts: Vec<i8> = vec![127, -127, 50, -50, 1, -1, 0, 100];
     let w_f32 = vec![0.0f32; 8];
     let w_packed = pack_1_58bit_4pack(&w_f32, 1.0);
     let result = ternary_dot_product_pack4(&acts, &w_packed, 8);

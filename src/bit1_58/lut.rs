@@ -1,9 +1,20 @@
+//! Alternative AVX2 decoders for the pack4 ternary dot product.
+//!
+//! Same contract as the kernels in [`crate::bit1_58::simd`]: activations in
+//! `[-127, 127]`, pack4 code `0b11` decodes to `0`.
+
+#[cfg(target_arch = "x86_64")]
+use crate::bit1_58::simd::pack4_tail;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 /// Pure LUT-based AVX2 decode: broadcastq → shuffle → blend → mask → shuffle.
 /// Fewer instructions overall but shuffle-port heavy.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+///
+/// # Safety
+/// The CPU must support `avx2`; `a_i8.len() >= total_elems` and
+/// `b_pack4.len() >= total_elems.div_ceil(4)`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn ternary_dot_product_pack4_avx2_lut(
     a_i8: &[i8],
@@ -33,7 +44,8 @@ pub unsafe fn ternary_dot_product_pack4_avx2_lut(
         let step = chunks32 / 2 * 2;
         let mut i = 0;
         while i < step {
-            _mm_prefetch(b_ptr.add(i * 8 + 16) as *const i8, _MM_HINT_T0);
+            // Prefetch may point past the end: wrap instead of `add` (no UB).
+            _mm_prefetch(b_ptr.wrapping_add(i * 8 + 16) as *const i8, _MM_HINT_T0);
 
             let acts0 = _mm256_loadu_si256(a_ptr.add(i));
             let pw0 = _mm_loadl_epi64(b_ptr.add(i * 8) as *const __m128i);
@@ -86,31 +98,7 @@ pub unsafe fn ternary_dot_product_pack4_avx2_lut(
         let mut acc_arr = [0i32; 8];
         _mm256_storeu_si256(acc_arr.as_mut_ptr() as *mut __m256i, acc32);
         let mut sum: i32 = acc_arr.iter().sum();
-
-        let mut rem_idx = chunks32 * 32;
-        let mut w_idx = chunks32 * 8;
-        while rem_idx < total_elems {
-            let w_byte = b_pack4[w_idx];
-            let w0 = (w_byte & 0x03) as i8 - 1;
-            let w1 = ((w_byte >> 2) & 0x03) as i8 - 1;
-            let w2 = ((w_byte >> 4) & 0x03) as i8 - 1;
-            let w3 = ((w_byte >> 6) & 0x03) as i8 - 1;
-            if rem_idx < total_elems {
-                sum += a_i8[rem_idx] as i32 * w0 as i32;
-            }
-            if rem_idx + 1 < total_elems {
-                sum += a_i8[rem_idx + 1] as i32 * w1 as i32;
-            }
-            if rem_idx + 2 < total_elems {
-                sum += a_i8[rem_idx + 2] as i32 * w2 as i32;
-            }
-            if rem_idx + 3 < total_elems {
-                sum += a_i8[rem_idx + 3] as i32 * w3 as i32;
-            }
-            rem_idx += 4;
-            w_idx += 1;
-        }
-
+        sum += pack4_tail(a_i8, b_pack4, chunks32 * 32, total_elems);
         sum
     }
 }
@@ -121,7 +109,11 @@ pub unsafe fn ternary_dot_product_pack4_avx2_lut(
 /// LUT path is shuffle-port heavy (port 5 on Intel / port 1 on AMD).
 /// Original path is shift/ALU heavy (ports 0,1 on Intel / ports 0,3 on AMD).
 /// Interleaving them lets the OoO engine overlap both pipelines.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+///
+/// # Safety
+/// The CPU must support `avx2`; `a_i8.len() >= total_elems` and
+/// `b_pack4.len() >= total_elems.div_ceil(4)`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn ternary_dot_product_pack4_avx2_hybrid(
     a_i8: &[i8],
@@ -163,8 +155,9 @@ pub unsafe fn ternary_dot_product_pack4_avx2_hybrid(
 
         while i < step4 {
             // Prefetch weight bytes for upcoming iterations
-            _mm_prefetch(b_ptr.add(i * 8 + 32) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(a_i8.as_ptr().add((i + 4) * 32) as *const i8, _MM_HINT_T0);
+            // Prefetch may point past the end: wrap instead of `add` (no UB).
+            _mm_prefetch(b_ptr.wrapping_add(i * 8 + 32) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(a_i8.as_ptr().wrapping_add((i + 4) * 32), _MM_HINT_T0);
 
             // =========== Block 0: LUT decode ===========
             let acts0 = _mm256_loadu_si256(a_ptr.add(i));
@@ -266,32 +259,7 @@ pub unsafe fn ternary_dot_product_pack4_avx2_hybrid(
         let mut acc_arr = [0i32; 8];
         _mm256_storeu_si256(acc_arr.as_mut_ptr() as *mut __m256i, acc32);
         let mut sum: i32 = acc_arr.iter().sum();
-
-        // Scalar remainder
-        let mut rem_idx = chunks32 * 32;
-        let mut w_idx = chunks32 * 8;
-        while rem_idx < total_elems {
-            let w_byte = b_pack4[w_idx];
-            let w0 = (w_byte & 0x03) as i8 - 1;
-            let w1 = ((w_byte >> 2) & 0x03) as i8 - 1;
-            let w2 = ((w_byte >> 4) & 0x03) as i8 - 1;
-            let w3 = ((w_byte >> 6) & 0x03) as i8 - 1;
-            if rem_idx < total_elems {
-                sum += a_i8[rem_idx] as i32 * w0 as i32;
-            }
-            if rem_idx + 1 < total_elems {
-                sum += a_i8[rem_idx + 1] as i32 * w1 as i32;
-            }
-            if rem_idx + 2 < total_elems {
-                sum += a_i8[rem_idx + 2] as i32 * w2 as i32;
-            }
-            if rem_idx + 3 < total_elems {
-                sum += a_i8[rem_idx + 3] as i32 * w3 as i32;
-            }
-            rem_idx += 4;
-            w_idx += 1;
-        }
-
+        sum += pack4_tail(a_i8, b_pack4, chunks32 * 32, total_elems);
         sum
     }
 }

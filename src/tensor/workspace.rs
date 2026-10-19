@@ -1,3 +1,17 @@
+//! Thread-local scratch-buffer pools for the decode hot path.
+//!
+//! Contract: a buffer returned by [`get_pooled_buffer`] /
+//! [`get_pooled_buffer_i8`] has exactly the requested length and every element
+//! is *initialised*, but its contents are **unspecified** (stale data from a
+//! previous user, or zero). Callers must write every element they later read.
+//!
+//! Soundness: a `Vec` in the pool always has all of its `len` elements
+//! initialised (it is an ordinary `Vec`). Reusing it we either `truncate` (no
+//! write) or `resize` with zeros (initialises only the newly exposed tail), so
+//! no uninitialised memory is ever exposed. In steady-state decode the same
+//! sizes recur, so the zero-fill path is rarely taken and costs a short
+//! `memset` when it is.
+
 use std::cell::RefCell;
 
 thread_local! {
@@ -6,21 +20,26 @@ thread_local! {
 }
 
 #[inline(always)]
-pub fn get_pooled_buffer(size: usize) -> Vec<f32> {
-    F32_BUFFER_POOL.with(|pool| {
-        let mut p = pool.borrow_mut();
-        if let Some(mut buf) = p.pop() {
-            if buf.capacity() < size {
-                buf.reserve(size - buf.len());
-            }
-            unsafe {
-                buf.set_len(size);
+fn reuse_or_alloc<T: Copy + Default>(popped: Option<Vec<T>>, size: usize) -> Vec<T> {
+    match popped {
+        Some(mut buf) => {
+            if buf.len() >= size {
+                buf.truncate(size);
+            } else {
+                buf.resize(size, T::default());
             }
             buf
-        } else {
-            crate::util::uninit_vec(size)
         }
-    })
+        None => vec![T::default(); size],
+    }
+}
+
+/// Take an `f32` buffer of length `size` from the pool (contents unspecified,
+/// see the module docs).
+#[inline(always)]
+pub fn get_pooled_buffer(size: usize) -> Vec<f32> {
+    let popped = F32_BUFFER_POOL.with(|pool| pool.borrow_mut().pop());
+    reuse_or_alloc(popped, size)
 }
 
 #[inline(always)]
@@ -35,22 +54,12 @@ pub fn return_pooled_buffer(buf: Vec<f32>) {
     }
 }
 
+/// Take an `i8` buffer of length `size` from the pool (contents unspecified,
+/// see the module docs).
 #[inline(always)]
 pub fn get_pooled_buffer_i8(size: usize) -> Vec<i8> {
-    I8_BUFFER_POOL.with(|pool| {
-        let mut p = pool.borrow_mut();
-        if let Some(mut buf) = p.pop() {
-            if buf.capacity() < size {
-                buf.reserve(size - buf.len());
-            }
-            unsafe {
-                buf.set_len(size);
-            }
-            buf
-        } else {
-            crate::util::uninit_vec(size)
-        }
-    })
+    let popped = I8_BUFFER_POOL.with(|pool| pool.borrow_mut().pop());
+    reuse_or_alloc(popped, size)
 }
 
 #[inline(always)]

@@ -62,3 +62,30 @@ fn test_debug_output() {
     assert!(debug_str.contains("shape"));
     assert!(debug_str.contains("data_len"));
 }
+
+// ───────────── workspace pool (sound reuse) ─────────────
+
+#[test]
+fn pooled_buffers_have_requested_length_and_are_reusable() {
+    use xor_net::tensor::workspace::*;
+    for &(a, b) in &[(2048usize, 4096usize), (4096, 1500), (3000, 3000)] {
+        let mut buf = get_pooled_buffer(a);
+        assert_eq!(buf.len(), a);
+        buf.iter_mut().for_each(|x| *x = 1.5);
+        return_pooled_buffer(buf);
+        // Growing exposes a zeroed tail; shrinking keeps (stale) initialised data.
+        let buf2 = get_pooled_buffer(b);
+        assert_eq!(buf2.len(), b);
+        assert!(buf2.iter().all(|&x| x == 1.5 || x == 0.0));
+        return_pooled_buffer(buf2);
+
+        let mut q = get_pooled_buffer_i8(a);
+        assert_eq!(q.len(), a);
+        q.iter_mut().for_each(|x| *x = -3);
+        return_pooled_buffer_i8(q);
+        let q2 = get_pooled_buffer_i8(b);
+        assert_eq!(q2.len(), b);
+        assert!(q2.iter().all(|&x| x == -3 || x == 0));
+        return_pooled_buffer_i8(q2);
+    }
+}

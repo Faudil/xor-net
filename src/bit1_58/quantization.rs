@@ -5,12 +5,12 @@ pub enum TernaryPackType {
 }
 
 pub fn pack_1_58bit_4pack(weights: &[f32], w_scale: f32) -> Vec<u8> {
-    let mut packed = Vec::with_capacity((weights.len() + 3) / 4);
+    let mut packed = Vec::with_capacity(weights.len().div_ceil(4));
     for chunk in weights.chunks(4) {
         let mut b = 0u8;
         for (i, &w) in chunk.iter().enumerate() {
             let scaled = if w_scale > 0.0 { w / w_scale } else { 0.0 };
-            let q = scaled.round().max(-1.0).min(1.0);
+            let q = scaled.round().clamp(-1.0, 1.0);
 
             let val = if q < -0.5 {
                 0b00
@@ -46,13 +46,13 @@ pub fn unpack_1_58bit_4pack(packed: &[u8], len: usize) -> Vec<f32> {
 }
 
 pub fn pack_1_58bit_5pack(weights: &[f32], w_scale: f32) -> Vec<u8> {
-    let mut packed = Vec::with_capacity((weights.len() + 4) / 5);
+    let mut packed = Vec::with_capacity(weights.len().div_ceil(5));
     for chunk in weights.chunks(5) {
         let mut b = 0u8;
         let mut multiplier = 1u8;
         for &w in chunk {
             let scaled = if w_scale > 0.0 { w / w_scale } else { 0.0 };
-            let q = scaled.round().max(-1.0).min(1.0);
+            let q = scaled.round().clamp(-1.0, 1.0);
 
             let val = if q < -0.5 {
                 0
@@ -90,10 +90,60 @@ pub fn unpack_1_58bit_5pack(packed: &[u8], len: usize) -> Vec<f32> {
     weights
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// Symmetric per-tensor i8 quantisation step for one element: round half to
+/// even (matching `vcvtps2dq` under the default MXCSR rounding mode) and clamp
+/// to `[-127, 127]`. NaN maps to 0.
+#[inline(always)]
+fn quantize_one(x: f32, scale: f32) -> i8 {
+    let q = (x * scale).round_ties_even();
+    // `clamp` would propagate NaN; `max`/`min` map it to -127, so test first.
+    if q.is_nan() {
+        0
+    } else {
+        q.clamp(-127.0, 127.0) as i8
+    }
+}
+
+#[inline(always)]
+fn quant_scales(max_abs: f32) -> (f32, f32) {
+    if max_abs > 0.0 {
+        (127.0 / max_abs, max_abs / 127.0)
+    } else {
+        (1.0, 1.0)
+    }
+}
+
+/// Reference scalar implementation of [`quantize_f32_to_i8`].
+///
+/// Panics if `quantized.len() < activations.len()`.
+pub fn quantize_f32_to_i8_scalar(activations: &[f32], quantized: &mut [i8]) -> f32 {
+    assert!(
+        quantized.len() >= activations.len(),
+        "quantize_f32_to_i8: output shorter than input"
+    );
+    let mut max_abs: f32 = 0.0;
+    for &x in activations {
+        if x.abs() > max_abs {
+            max_abs = x.abs();
+        }
+    }
+    let (scale, inv_scale) = quant_scales(max_abs);
+    for (q_out, &x) in quantized.iter_mut().zip(activations.iter()) {
+        *q_out = quantize_one(x, scale);
+    }
+    inv_scale
+}
+
+/// AVX-512F implementation of [`quantize_f32_to_i8`]. Bit-exact with
+/// [`quantize_f32_to_i8_scalar`] for finite inputs.
+///
+/// # Safety
+/// The CPU must support `avx512f`, and `quantized.len() >= activations.len()`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub unsafe fn quantize_f32_to_i8_avx512(activations: &[f32], quantized: &mut [i8]) -> f32 {
     use std::arch::x86_64::*;
+    debug_assert!(quantized.len() >= activations.len());
     let mut max_vec = _mm512_setzero_ps();
     let chunks = activations.len() / 16;
     let ptr = activations.as_ptr();
@@ -114,15 +164,14 @@ pub unsafe fn quantize_f32_to_i8_avx512(activations: &[f32], quantized: &mut [i8
             max_abs = m;
         }
     }
-    for i in chunks * 16..activations.len() {
-        let abs = activations[i].abs();
+    for &x in &activations[chunks * 16..] {
+        let abs = x.abs();
         if abs > max_abs {
             max_abs = abs;
         }
     }
 
-    let scale = if max_abs > 0.0 { 127.0 / max_abs } else { 1.0 };
-    let inv_scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+    let (scale, inv_scale) = quant_scales(max_abs);
 
     let v_scale = _mm512_set1_ps(scale);
     let v_max = _mm512_set1_ps(127.0);
@@ -140,108 +189,101 @@ pub unsafe fn quantize_f32_to_i8_avx512(activations: &[f32], quantized: &mut [i8
     }
 
     for i in chunks * 16..activations.len() {
-        let q = (activations[i] * scale).round();
-        let q_clamped = if q > 127.0 {
-            127.0
-        } else if q < -127.0 {
-            -127.0
-        } else {
-            q
-        };
-        quantized[i] = q_clamped as i8;
+        quantized[i] = quantize_one(activations[i], scale);
     }
 
     inv_scale
 }
 
-use std::sync::atomic::{AtomicU8, Ordering};
-static HAS_AVX512F: AtomicU8 = AtomicU8::new(0); // 0: uninitialized, 1: no, 2: yes
+/// Symmetric absmax quantisation of `activations` into `quantized[..n]`
+/// (`n = activations.len()`), returning the inverse scale (`max_abs / 127`).
+///
+/// Output values are in `[-127, 127]` (never `-128`), which the ternary dot
+/// product kernels rely on. Ties round half to even.
+///
+/// Panics if `quantized.len() < activations.len()`.
+pub fn quantize_f32_to_i8(activations: &[f32], quantized: &mut [i8]) -> f32 {
+    assert!(
+        quantized.len() >= activations.len(),
+        "quantize_f32_to_i8: output shorter than input"
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::util::cpu_features().avx512f {
+            // SAFETY: avx512f detected; output length checked above.
+            return unsafe { quantize_f32_to_i8_avx512(activations, quantized) };
+        }
+    }
+    quantize_f32_to_i8_scalar(activations, quantized)
+}
 
 #[inline(always)]
-fn has_avx512f() -> bool {
-    let val = HAS_AVX512F.load(Ordering::Relaxed);
-    if val != 0 {
-        return val == 2;
+fn silu_mul_one(g: f32, u: f32, use_silu: bool) -> f32 {
+    if use_silu {
+        g * (1.0 / (1.0 + (-g).exp())) * u
+    } else {
+        let r = g.max(0.0);
+        r * r * u
     }
-    let detected = {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            is_x86_feature_detected!("avx512f")
-        }
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        {
-            false
-        }
-    };
-    HAS_AVX512F.store(if detected { 2 } else { 1 }, Ordering::Relaxed);
-    detected
 }
 
-pub fn quantize_f32_to_i8(activations: &[f32], quantized: &mut [i8]) -> f32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if has_avx512f() {
-            let inv_scale = unsafe { quantize_f32_to_i8_avx512(activations, quantized) };
-            return inv_scale;
-        }
+/// Reference scalar implementation of [`silu_inplace`] (libm `exp`).
+///
+/// Panics if `gate.len() != up.len()`.
+pub fn silu_inplace_scalar(gate: &mut [f32], up: &[f32], use_silu: bool) {
+    assert_eq!(
+        gate.len(),
+        up.len(),
+        "silu_inplace: gate/up length mismatch"
+    );
+    for (g, &u) in gate.iter_mut().zip(up) {
+        *g = silu_mul_one(*g, u, use_silu);
     }
-
-    let mut max_abs: f32 = 0.0;
-    for &x in activations {
-        if x.abs() > max_abs {
-            max_abs = x.abs();
-        }
-    }
-
-    let scale = if max_abs > 0.0 { 127.0 / max_abs } else { 1.0 };
-    let inv_scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
-
-    for (q_out, &x) in quantized.iter_mut().zip(activations.iter()) {
-        let q = (x * scale).round();
-        *q_out = q.max(-127.0).min(127.0) as i8;
-    }
-
-    inv_scale
 }
 
 /// Compute `y = silu(gate) * up` (or `relu(gate)^2 * up` when `!use_silu`) in
 /// place, writing the result back into `gate`. The SiLU path uses a vectorized
-/// `exp` approximation (Pommier `exp_ps` port) so the activation no longer
-/// serializes through a scalar libm `expf` per element.
+/// `exp` approximation (Pommier `exp_ps` port, relative error ~1e-5) so the
+/// activation no longer serializes through a scalar libm `expf` per element.
+///
+/// Panics if `gate.len() != up.len()`.
 pub fn silu_inplace(gate: &mut [f32], up: &[f32], use_silu: bool) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    assert_eq!(
+        gate.len(),
+        up.len(),
+        "silu_inplace: gate/up length mismatch"
+    );
+    #[cfg(target_arch = "x86_64")]
     {
-        if has_avx512f() {
+        if crate::util::cpu_features().avx512f {
+            // SAFETY: avx512f detected; lengths checked above.
             unsafe { silu_inplace_avx512(gate, up, use_silu) };
             return;
         }
     }
-
-    for i in 0..gate.len() {
-        let g = gate[i];
-        let u = up[i];
-        gate[i] = if use_silu {
-            g * (1.0 / (1.0 + (-g).exp())) * u
-        } else {
-            let r = g.max(0.0);
-            r * r * u
-        };
-    }
+    silu_inplace_scalar(gate, up, use_silu);
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// AVX-512F implementation of [`silu_inplace`].
+///
+/// # Safety
+/// The CPU must support `avx512f`, and `up.len() >= gate.len()`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-unsafe fn silu_inplace_avx512(gate: &mut [f32], up: &[f32], use_silu: bool) {
+pub unsafe fn silu_inplace_avx512(gate: &mut [f32], up: &[f32], use_silu: bool) {
     use std::arch::x86_64::*;
+    debug_assert!(up.len() >= gate.len());
 
     let n = gate.len();
     let gp: *mut f32 = gate.as_mut_ptr();
     let up_ptr: *const f32 = up.as_ptr();
 
     // exp(x) range constants
-    let inv_ln2 = _mm512_set1_ps(1.44269504088896341); // log2(e)
+    let inv_ln2 = _mm512_set1_ps(std::f32::consts::LOG2_E);
     let ln2 = _mm512_set1_ps(std::f32::consts::LN_2);
+    #[allow(clippy::excessive_precision)]
     let exp_hi = _mm512_set1_ps(88.3762626647949);
+    #[allow(clippy::excessive_precision)]
     let exp_lo = _mm512_set1_ps(-88.3762626647949);
     let one = _mm512_set1_ps(1.0);
     let zero = _mm512_setzero_ps();
@@ -279,18 +321,11 @@ unsafe fn silu_inplace_avx512(gate: &mut [f32], up: &[f32], use_silu: bool) {
         };
 
         let y = _mm512_mul_ps(act, u);
-        _mm512_storeu_ps(gp.add(i) as *mut f32, y);
+        _mm512_storeu_ps(gp.add(i), y);
         i += 16;
     }
 
-    for i in i..n {
-        let g = *gp.add(i);
-        let u = *up_ptr.add(i);
-        *gp.add(i) = if use_silu {
-            g * (1.0 / (1.0 + (-g).exp())) * u
-        } else {
-            let r = g.max(0.0);
-            r * r * u
-        };
+    for j in i..n {
+        gate[j] = silu_mul_one(gate[j], up[j], use_silu);
     }
 }

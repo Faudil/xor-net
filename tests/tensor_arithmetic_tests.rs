@@ -24,7 +24,7 @@ fn ref_silu(x: f32) -> f32 {
 }
 fn ref_gelu(x: f32) -> f32 {
     let x3 = x * x * x;
-    0.5 * x * (1.0 + (0.79788456 * (x + 0.044715 * x3)).tanh())
+    0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044715 * x3)).tanh())
 }
 
 #[test]
@@ -46,7 +46,7 @@ fn add_inplace_matches_add() {
 
 #[test]
 fn add_zero_is_identity() {
-    let a = FastTensor::new(vec![3.14, -2.71, 1.41, 0.0], vec![4]);
+    let a = FastTensor::new(vec![3.25, -2.75, 1.5, 0.0], vec![4]);
     let z = FastTensor::zeros(vec![4]);
     let c = a.add(&z).unwrap();
     assert_close(&c.data, &a.data, EPS, "add zero identity");
@@ -151,7 +151,7 @@ fn ternary_dot_product_pack4_matches_scalar() {
     let acts_f32: Vec<f32> = (0..in_dim).map(|_| (next() - 0.5) * 40.0).collect();
     let acts_i8: Vec<i8> = acts_f32
         .iter()
-        .map(|&x| x.round().max(-127.0).min(127.0) as i8)
+        .map(|&x| x.round().clamp(-127.0, 127.0) as i8)
         .collect();
 
     let packed = pack_1_58bit_4pack(&weights, 1.0);
@@ -177,7 +177,7 @@ fn silu_inplace_vectorized_matches_scalar() {
         .chain(std::iter::once(200.0))
         .chain(std::iter::once(-200.0))
         .collect();
-    let up: Vec<f32> = (0..gate.len()).map(|i| (i as f32 * 0.13 - 5.0)).collect();
+    let up: Vec<f32> = (0..gate.len()).map(|i| i as f32 * 0.13 - 5.0).collect();
 
     // use_silu = true
     let mut g1 = gate.clone();

@@ -99,8 +99,8 @@ impl FastTensor {
                     }
                 });
         } else {
-            for i in 0..out_data.len() {
-                out_data[i] = self.data[i] + other.data[i];
+            for ((o, &a), &b) in out_data.iter_mut().zip(&self.data).zip(&other.data) {
+                *o = a + b;
             }
         }
         Ok(Self::new(out_data, self.shape.clone()))
@@ -128,10 +128,9 @@ impl FastTensor {
                     }
                 });
         } else {
-            for i in 0..out_data.len() {
-                let x = self.data[i];
+            for ((o, &x), &y) in out_data.iter_mut().zip(&self.data).zip(&other.data) {
                 let silu = x / (1.0f32 + (-x).exp());
-                out_data[i] = silu * other.data[i];
+                *o = silu * y;
             }
         }
         Ok(Self::new(out_data, self.shape.clone()))
@@ -423,7 +422,7 @@ impl FastTensor {
             .zip(self.data.par_iter())
             .for_each(|(out, &x)| {
                 let x_cube = x * x * x;
-                let inner = 0.79788456f32 * (x + 0.044715f32 * x_cube);
+                let inner = 0.797_884_6_f32 * (x + 0.044715f32 * x_cube);
                 *out = 0.5f32 * x * (1.0f32 + inner.tanh());
             });
         Ok(Self::new(out_data, self.shape.clone()))

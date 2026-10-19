@@ -20,13 +20,13 @@ fn test_uninit_vec_large_allocation() {
 
 #[test]
 fn test_parallel_threshold_positive() {
-    assert!(PARALLEL_THRESHOLD > 0);
+    const { assert!(PARALLEL_THRESHOLD > 0) };
     assert_eq!(PARALLEL_THRESHOLD % 1024, 0);
 }
 
 #[test]
 fn test_chunk_size_positive() {
-    assert!(CHUNK_SIZE > 0);
+    const { assert!(CHUNK_SIZE > 0) };
     assert_eq!(CHUNK_SIZE % 1024, 0);
 }
 
@@ -51,10 +51,12 @@ fn test_get_num_threads_is_consistent() {
 #[test]
 fn test_uninit_vec_is_writable() {
     let mut v: Vec<f32> = uninit_vec(10);
-    for i in 0..10 {
-        v[i] = i as f32;
+    // Now zero-initialised (sound to read before writing).
+    assert!(v.iter().all(|&x| x == 0.0));
+    for (i, x) in v.iter_mut().enumerate() {
+        *x = i as f32;
     }
-    for i in 0..10 {
-        assert!((v[i] - i as f32).abs() < 1e-6);
+    for (i, &x) in v.iter().enumerate() {
+        assert!((x - i as f32).abs() < 1e-6);
     }
 }

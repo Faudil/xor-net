@@ -75,6 +75,7 @@ impl CpuRingCache {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn fast_attention(
     q: &FastTensor,
     k: &FastTensor,

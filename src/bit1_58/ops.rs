@@ -59,8 +59,8 @@ impl CustomOp1 for TernaryMatMulOp {
         let mut out_data = vec![0.0; b_size * self.out_dim];
 
         let bytes_per_row = match self.pack_type {
-            TernaryPackType::Pack4 => (self.in_dim + 3) / 4,
-            TernaryPackType::Pack5 => (self.in_dim + 4) / 5,
+            TernaryPackType::Pack4 => self.in_dim.div_ceil(4),
+            TernaryPackType::Pack5 => self.in_dim.div_ceil(5),
         };
 
         use rayon::prelude::*;

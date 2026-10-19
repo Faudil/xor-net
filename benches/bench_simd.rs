@@ -1,8 +1,17 @@
+// Kernel bodies are written in the pre-2024 style (implicitly unsafe), as in
+// the library crate.
+#![allow(unsafe_op_in_unsafe_fn)]
+
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+/// Original 2x-unrolled AVX2 pack4 kernel (no tail handling).
+///
+/// # Safety
+/// Requires `avx2`; `a_i8.len() >= total_elems`, `b_pack4.len() >= total_elems / 4`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn bench_old(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
@@ -78,6 +87,10 @@ pub unsafe fn bench_old(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 
     sums.iter().sum::<i32>()
 }
 
+/// 4x-unrolled AVX2 pack4 kernel (no tail handling).
+///
+/// # Safety
+/// Requires `avx2`; `a_i8.len() >= total_elems`, `b_pack4.len() >= total_elems / 4`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn bench_unrolled4(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
@@ -189,14 +202,22 @@ pub unsafe fn bench_unrolled4(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -
     sums.iter().sum::<i32>()
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    println!("bench_simd: x86_64-only benchmark, skipping");
+}
+
+#[cfg(target_arch = "x86_64")]
 fn main() {
     let size = 14336;
     let a = vec![1i8; size];
-    let mut b = vec![0u8; size / 4];
-    for i in 0..b.len() {
-        b[i] = 0b10010010; // 1, 0, -1, 1
-    }
+    let b = vec![0b10010010u8; size / 4]; // 1, 0, -1, 1
 
+    if !std::is_x86_feature_detected!("avx2") {
+        println!("bench_simd: AVX2 not available, skipping");
+        return;
+    }
+    // SAFETY: avx2 checked above; slices sized for `size` elements.
     unsafe {
         let mut t1 = 0;
         let mut t2 = 0;

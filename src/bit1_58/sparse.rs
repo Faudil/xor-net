@@ -60,7 +60,7 @@ pub struct SparseTernary {
 /// trailing positions in the final block are simply never set in the mask.
 pub fn encode_sparse_row_into(buf: &mut Vec<u8>, vals: &[i8], in_dim: usize) {
     debug_assert!(vals.len() >= in_dim);
-    let num_blocks = (in_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let num_blocks = in_dim.div_ceil(BLOCK_SIZE);
     buf.extend_from_slice(&(num_blocks as u32).to_le_bytes());
     for b in 0..num_blocks {
         let start = b * BLOCK_SIZE;
@@ -68,10 +68,9 @@ pub fn encode_sparse_row_into(buf: &mut Vec<u8>, vals: &[i8], in_dim: usize) {
         let mut mask: u64 = 0;
         let mut signs: u64 = 0;
         let mut si: u32 = 0;
-        for i in start..end {
-            let v = vals[i];
+        for (lane, &v) in vals[start..end].iter().enumerate() {
             if v != 0 {
-                mask |= 1u64 << (i - start);
+                mask |= 1u64 << lane;
                 if v < 0 {
                     signs |= 1u64 << si;
                 }
@@ -79,7 +78,7 @@ pub fn encode_sparse_row_into(buf: &mut Vec<u8>, vals: &[i8], in_dim: usize) {
             }
         }
         buf.extend_from_slice(&mask.to_le_bytes());
-        let sign_bytes = ((si as usize) + 7) / 8;
+        let sign_bytes = (si as usize).div_ceil(8);
         let sb = signs.to_le_bytes();
         buf.extend_from_slice(&sb[..sign_bytes]);
     }
@@ -122,7 +121,7 @@ impl SparseTernary {
                 ]);
                 p += 8;
                 let nnz = mask.count_ones() as usize;
-                p += (nnz + 7) / 8;
+                p += nnz.div_ceil(8);
             }
         }
         offsets
@@ -153,7 +152,7 @@ impl SparseTernary {
                 ]);
                 p += 8;
                 let nnz = mask.count_ones() as usize;
-                let sign_bytes = (nnz + 7) / 8;
+                let sign_bytes = nnz.div_ceil(8);
                 let mut sb = 0u64;
                 for k in 0..sign_bytes {
                     sb |= (blob[p + k] as u64) << (8 * k);
@@ -224,17 +223,17 @@ impl SparseTernary {
             ]);
             p += 8;
             let nnz = mask.count_ones() as usize;
-            let sign_bytes = (nnz + 7) / 8;
+            let sign_bytes = nnz.div_ceil(8);
             let mut sb = 0u64;
             for k in 0..sign_bytes {
                 sb |= (self.blob[p + k] as u64) << (8 * k);
             }
             p += sign_bytes;
             let mut si = 0u32;
-            for i in start..end {
-                if (mask >> (i - start)) & 1 != 0 {
+            for (lane, o) in out[start..end].iter_mut().enumerate() {
+                if (mask >> lane) & 1 != 0 {
                     let s = if (sb >> si) & 1 != 0 { -1 } else { 1 };
-                    out[i] = s;
+                    *o = s;
                     si += 1;
                 }
             }

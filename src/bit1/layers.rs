@@ -18,7 +18,7 @@ impl BitLinear {
 
         let packed_weights: Vec<u8> = weights_f32
             .par_chunks(in_dim)
-            .flat_map_iter(|row| pack_1bit(row))
+            .flat_map_iter(pack_1bit)
             .collect();
 
         Ok(Self {
@@ -50,13 +50,13 @@ impl BitLinear {
         let b_size: usize = xs.shape[..rank - 1].iter().product();
 
         let mut out_data = crate::tensor::workspace::get_pooled_buffer(b_size * out_dim);
-        let bytes_per_row = (in_dim + 7) / 8;
+        let bytes_per_row = in_dim.div_ceil(8);
 
         if b_size == 1 {
             let in_row = &input_slice[0..in_dim];
             let packed_in = pack_1bit(in_row);
             let num_threads = crate::util::get_num_threads();
-            let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
+            let chunk_size = out_dim.div_ceil(num_threads).max(128);
 
             out_data
                 .par_chunks_mut(chunk_size)
@@ -76,10 +76,10 @@ impl BitLinear {
                 .zip(input_slice.par_chunks(in_dim))
                 .for_each(|(out_row, in_row)| {
                     let packed_in = pack_1bit(in_row);
-                    for o in 0..out_dim {
+                    for (o, out_val) in out_row.iter_mut().enumerate() {
                         let w_row =
                             &self.packed_weights[o * bytes_per_row..(o + 1) * bytes_per_row];
-                        out_row[o] = xnor_dot_product(&packed_in, w_row, in_dim);
+                        *out_val = xnor_dot_product(&packed_in, w_row, in_dim);
                     }
                 });
         }

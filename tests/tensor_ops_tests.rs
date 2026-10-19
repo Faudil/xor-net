@@ -1,3 +1,5 @@
+// Naive reference loops deliberately mirror the index math of the kernels.
+#![allow(clippy::needless_range_loop)]
 use candle_core::{Device, Result, Tensor};
 use xor_net::tensor::FastTensor;
 

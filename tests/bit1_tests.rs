@@ -1,6 +1,6 @@
 use xor_net::bit1::layers::BitLinear;
 use xor_net::bit1::quantization::pack_1bit;
-use xor_net::bit1::simd::{xnor_dot_product, xnor_dot_product_avx2};
+use xor_net::bit1::simd::{xnor_dot_product, xnor_dot_product_scalar};
 use xor_net::tensor::FastTensor;
 
 #[test]
@@ -25,13 +25,26 @@ fn test_bit1_simd_parity() {
         let a_packed = pack_1bit(&a_floats);
         let b_packed = pack_1bit(&b_floats);
 
-        let scalar_res = xnor_dot_product(&a_packed, &b_packed, len);
+        // Ground truth straight from the ±1 values.
+        let naive: f32 = a_floats
+            .iter()
+            .zip(&b_floats)
+            .map(|(&x, &y)| x.signum() * y.signum())
+            .sum();
+        let scalar_res = xnor_dot_product_scalar(&a_packed, &b_packed, len);
+        assert_eq!(scalar_res, naive, "scalar mismatch at len {}", len);
 
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        // Dispatched path (AVX2 when available).
+        let dispatched = xnor_dot_product(&a_packed, &b_packed, len);
+        assert_eq!(dispatched, naive, "dispatched mismatch at len {}", len);
+
+        #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
-                let avx2_res = unsafe { xnor_dot_product_avx2(&a_packed, &b_packed, len) };
-                assert_eq!(scalar_res, avx2_res, "Mismatch at len {}", len);
+                let avx2_res = unsafe {
+                    xor_net::bit1::simd::xnor_dot_product_avx2(&a_packed, &b_packed, len)
+                };
+                assert_eq!(avx2_res, naive, "AVX2 mismatch at len {}", len);
             }
         }
     }
