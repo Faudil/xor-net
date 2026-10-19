@@ -21,6 +21,41 @@ pub trait ModelState: Any + Send {
     /// written may implement this as a no-op; recurrent states must zero.
     fn reset(&mut self) -> anyhow::Result<()>;
 
+    /// Roll the state back so it holds exactly the first `len` positions of
+    /// the sequence fed so far (`len <=` that count), as if only those had
+    /// been fed. Returns `false`, leaving the state untouched, if this state
+    /// cannot represent that prefix; the caller then falls back to
+    /// [`checkpoint_len`](Self::checkpoint_len) or [`reset`](Self::reset).
+    ///
+    /// Position-indexed KV caches support any `len` (positions `>= len` are
+    /// simply overwritten later). Recurrent states only support the current
+    /// length, `0`, and the position saved by [`checkpoint`](Self::checkpoint).
+    fn truncate(&mut self, len: usize) -> bool {
+        let _ = len;
+        false
+    }
+
+    /// Save a restore point at the current length so a later
+    /// [`truncate`](Self::truncate) to exactly that length succeeds even if
+    /// the state cannot otherwise roll back. At most one checkpoint is kept
+    /// (a new one replaces it); [`reset`](Self::reset) discards it. A no-op
+    /// for states that truncate to any length.
+    fn checkpoint(&mut self) {}
+
+    /// Length of the saved checkpoint, if any (see [`checkpoint`](Self::checkpoint)).
+    fn checkpoint_len(&self) -> Option<usize> {
+        None
+    }
+
+    /// `true` if rollback relies on [`checkpoint`](Self::checkpoint) (the
+    /// state has recurrent parts), so callers should checkpoint where the
+    /// next request is likely to diverge, even if that means splitting a
+    /// prefill there. `false` (the default) for states that either truncate
+    /// anywhere or not at all.
+    fn needs_checkpoint(&self) -> bool {
+        false
+    }
+
     /// Downcasting hook for the owning model implementation.
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
@@ -32,7 +67,8 @@ pub trait ModelState: Any + Send {
 ///   positions `pos .. pos + tokens.len()`;
 /// - the caller feeds every position exactly once, in order (prefill may be
 ///   split in chunks), so `pos` equals the number of tokens already fed into
-///   `state` since it was created or [`reset`](ModelState::reset);
+///   `state` since it was created or [`reset`](ModelState::reset), minus any
+///   positions dropped by a successful [`truncate`](ModelState::truncate);
 /// - `pos + tokens.len() <= max_seq_len()`;
 /// - the return value is the logits of the *last* fed position only.
 pub trait CausalLM: Send + Sync {

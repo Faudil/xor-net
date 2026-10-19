@@ -156,6 +156,10 @@ codegen-units = 1
 panic = "abort"
 
 [[example]]
+name = "chat_reuse_check"
+path = "examples/chat_reuse_check.rs"
+
+[[example]]
 name = "bonsai_generate"
 path = "examples/bonsai_generate.rs"
 

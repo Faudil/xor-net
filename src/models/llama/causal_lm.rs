@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use super::{Cache, Config, Llama, LlamaEosToks};
+use super::{Cache, Config, Llama, LlamaEosToks, RopeTables};
 use crate::models::auto::AutoModelForCausalLM;
 use crate::models::traits::{CausalLM, Logits, ModelState, downcast_state};
 use crate::nn::QuantizationConfig;
@@ -16,6 +16,12 @@ impl ModelState for Cache {
         Ok(())
     }
 
+    fn truncate(&mut self, _len: usize) -> bool {
+        // Position-indexed: positions `>= len` are rewritten before attention
+        // reads them (it only reads `< pos + seq_len`).
+        true
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -26,6 +32,8 @@ pub struct LlamaCausalLM {
     model: Llama,
     config: Config,
     eos: Vec<u32>,
+    /// Shared by every state this model creates.
+    rope: RopeTables,
 }
 
 impl LlamaCausalLM {
@@ -35,7 +43,13 @@ impl LlamaCausalLM {
             Some(LlamaEosToks::Multiple(ids)) => ids.clone(),
             None => Vec::new(),
         };
-        Self { model, config, eos }
+        let rope = RopeTables::new(&config);
+        Self {
+            model,
+            config,
+            eos,
+            rope,
+        }
     }
 
     /// Load from a local HF-style directory (`config.json` + safetensors).
@@ -64,7 +78,7 @@ impl LlamaCausalLM {
 
 impl CausalLM for LlamaCausalLM {
     fn new_state(&self) -> anyhow::Result<Box<dyn ModelState>> {
-        Ok(Box::new(Cache::new(true, &self.config)?))
+        Ok(Box::new(Cache::with_rope(true, &self.config, &self.rope)?))
     }
 
     fn forward(

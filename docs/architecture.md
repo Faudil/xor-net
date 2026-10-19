@@ -29,9 +29,9 @@ number of layers. Everything above the kernels is model-family agnostic.
 
 | Path | What it is |
 |------|------------|
-| `src/generation.rs` | `Generator`: owns `Arc<dyn CausalLM>`, tokenizer, chat template (minijinja, HF-compatible), EOS ids and one reusable state. Chunked prefill, prefix caching across turns, UTF-8-safe streaming detokenisation, stop strings, `<think>` reasoning separation (`StreamEvent::{Text, Reasoning}`), chat-template kwargs such as `enable_thinking`. |
+| `src/generation.rs` | `Generator`: owns `Arc<dyn CausalLM>`, tokenizer, chat template (minijinja, HF-compatible), EOS ids and one reusable state. Chunked prefill, prefix caching across turns (the state is rolled back to the longest common prefix with the new prompt; recurrent states restore a single checkpoint taken at the end of the conversation history), UTF-8-safe streaming detokenisation, stop strings, `<think>` reasoning separation (`StreamEvent::{Text, Reasoning}`), chat-template kwargs such as `enable_thinking`. |
 | `src/sampler.rs` | Penalties, temperature, top-k / top-p / min-p (HF / vLLM order), seeded xoshiro RNG, partial selection (no full-vocab sort). |
-| `src/models/traits.rs` | `CausalLM` + opaque `ModelState` (KV cache and/or recurrent state). The only interface the generator sees. |
+| `src/models/traits.rs` | `CausalLM` + opaque `ModelState` (KV cache and/or recurrent state, with `truncate` / `checkpoint` for prefix reuse). The only interface the generator sees. |
 | `src/models/source.rs` | Resolves a user model reference (file, directory, `owner/repo[:file]` on the Hub) and loads a `Generator`. Used by the CLI and Python. |
 | `src/models/q1/` | Bonsai on the 1-bit fast path. `qwen3.rs`: dense Qwen3 (1.7B/4B/8B). `qwen35.rs`: hybrid Qwen3.5 (27B) with gated full attention every N-th layer and Gated DeltaNet linear attention otherwise. `mod.rs`: shared `Linear`, `Embedding` (dequantizes looked-up rows only), RoPE incl. YaRN, growable `KvCache`, attention. `format.rs`: `.xq1`. |
 | `src/bit1/q1_0.rs` | `Q1Weight` (split sign bits + f16 scales, owned or borrowed from an mmap) and the Q1_0 x int8 kernels: AVX-512 VNNI, AVX-512 BW, AVX2, scalar. Four weight rows share every activation load. |

@@ -956,8 +956,12 @@ impl Generator {
         }
     }
 
-    /// Reuse the model state across requests when the new prompt extends
-    /// exactly the tokens already processed (multi-turn chat). On by default.
+    /// Reuse the model state across requests (multi-turn chat). The state
+    /// is rolled back to the longest common prefix of the tokens already
+    /// processed and the new prompt (chat templates often re-render the
+    /// previous reply differently from what was sampled); states that cannot
+    /// roll back arbitrarily (recurrent layers) fall back to the end of the
+    /// previous prompt, which is checkpointed. On by default.
     pub fn set_prefix_caching(&mut self, on: bool) {
         self.prefix_caching = on;
     }
@@ -1074,7 +1078,7 @@ impl Generator {
     ) -> anyhow::Result<Generation> {
         let ids = self.encode(prompt, params.add_special_tokens)?;
         let starts_in_reasoning = ReasoningSplitter::prompt_opens_reasoning(prompt);
-        self.generate_impl(&ids, params, starts_in_reasoning, on_event)
+        self.generate_impl(&ids, params, starts_in_reasoning, None, on_event)
     }
 
     /// Chat completion: renders `messages` with `add_generation_prompt`
@@ -1109,7 +1113,8 @@ impl Generator {
             self.apply_chat_template_with_kwargs(messages, true, &params.chat_template_kwargs)?;
         let ids = self.encode(&prompt, false)?;
         let starts_in_reasoning = ReasoningSplitter::prompt_opens_reasoning(&prompt);
-        self.generate_impl(&ids, params, starts_in_reasoning, on_event)
+        let history = self.history_len(messages, params, &ids);
+        self.generate_impl(&ids, params, starts_in_reasoning, history, on_event)
     }
 
     /// Core decode loop on an already tokenised prompt (`on_text` sees
@@ -1136,7 +1141,30 @@ impl Generator {
             let tail = &prompt[prompt.len().saturating_sub(64)..];
             ReasoningSplitter::prompt_opens_reasoning(&self.decode(tail, false)?)
         };
-        self.generate_impl(prompt, params, starts_in_reasoning, on_event)
+        self.generate_impl(prompt, params, starts_in_reasoning, None, on_event)
+    }
+
+    /// Number of leading tokens of the chat prompt `ids` that encode the
+    /// conversation itself, i.e. `messages` rendered *without* the
+    /// generation prompt. That part renders identically in the next turn
+    /// (the reply and next user message are appended after it), whereas the
+    /// generation prompt (e.g. Qwen3's empty `<think></think>` block) is
+    /// usually not reproduced when the reply is re-rendered. `None` if it
+    /// cannot be determined.
+    fn history_len<M: Serialize>(
+        &self,
+        messages: &[M],
+        params: &GenerationParams,
+        ids: &[u32],
+    ) -> Option<usize> {
+        if !self.prefix_caching {
+            return None;
+        }
+        let text = self
+            .apply_chat_template_with_kwargs(messages, false, &params.chat_template_kwargs)
+            .ok()?;
+        let hist = self.encode(&text, false).ok()?;
+        (!hist.is_empty() && ids.starts_with(&hist)).then_some(hist.len())
     }
 
     fn generate_impl(
@@ -1144,6 +1172,7 @@ impl Generator {
         prompt: &[u32],
         params: &GenerationParams,
         starts_in_reasoning: bool,
+        checkpoint_at: Option<usize>,
         mut on_event: impl FnMut(StreamEvent<'_>) -> ControlFlow<()>,
     ) -> anyhow::Result<Generation> {
         // --- validation ------------------------------------------------------
@@ -1191,24 +1220,20 @@ impl Generator {
 
         // --- state: reuse the processed prefix when possible ---------------
         let mut fed = std::mem::take(&mut self.fed); // empty on any early exit
-        let reuse = self.prefix_caching
-            && self.state.is_some()
-            && !fed.is_empty()
-            && prompt.len() > fed.len()
-            && prompt.starts_with(&fed);
         let mut state = match self.state.take() {
-            Some(mut s) => {
-                if !reuse {
-                    s.reset()?;
-                }
-                s
-            }
+            Some(s) => s,
             None => self.model.new_state()?,
         };
-        if !reuse {
-            fed.clear();
+        let keep = if self.prefix_caching {
+            reusable_prefix(&mut *state, &fed, prompt)
+        } else {
+            0
+        };
+        if keep == 0 {
+            state.reset()?;
         }
-        usage.cached_prompt_tokens = fed.len();
+        fed.truncate(keep);
+        usage.cached_prompt_tokens = keep;
 
         let mut sink = OutputSink {
             splitter: (params.reasoning_format == ReasoningFormat::Separate)
@@ -1221,6 +1246,7 @@ impl Generator {
         let result = self.run(
             prompt,
             params,
+            checkpoint_at,
             &mut *state,
             &mut fed,
             &mut usage,
@@ -1253,6 +1279,7 @@ impl Generator {
         &mut self,
         prompt: &[u32],
         params: &GenerationParams,
+        checkpoint_at: Option<usize>,
         state: &mut dyn ModelState,
         fed: &mut Vec<u32>,
         usage: &mut Usage,
@@ -1273,10 +1300,25 @@ impl Generator {
         // --- prefill ---------------------------------------------------------
         let t0 = Instant::now();
         let chunk = params.prefill_chunk_size.max(1);
+        // Restore point for the next turn (one per state): the end of the
+        // prompt, or for chat the end of the conversation history before
+        // the generation prompt. Chat templates re-render the assistant
+        // reply (and often the generation prompt) differently from what was
+        // fed, so the next prompt diverges after that point. States that can
+        // roll back to any position ignore it.
+        let checkpoint = self.prefix_caching && state.needs_checkpoint();
+        let split = checkpoint_at
+            .filter(|&c| checkpoint && c >= fed.len() && c < prompt.len())
+            .unwrap_or(prompt.len());
         let mut logits = Vec::new();
-        for piece in prompt[fed.len()..].chunks(chunk) {
-            logits = model.forward(piece, fed.len(), state)?;
-            fed.extend_from_slice(piece);
+        for (end, at_end) in [(split, true), (prompt.len(), false)] {
+            for piece in prompt[fed.len()..end].chunks(chunk) {
+                logits = model.forward(piece, fed.len(), state)?;
+                fed.extend_from_slice(piece);
+            }
+            if checkpoint && at_end {
+                state.checkpoint();
+            }
         }
         check(&logits)?;
         timings.prefill = t0.elapsed();
@@ -1338,6 +1380,26 @@ impl Generator {
         timings.decode = t1.elapsed();
         timings.decode_tokens = usage.completion_tokens;
         Ok((out, finish, stops.matched().map(str::to_owned)))
+    }
+}
+
+/// How many leading positions of `state` (which holds `fed`) can be kept for
+/// `prompt`, rolling the state back as needed. At least one prompt token is
+/// always left to prefill (its logits start decoding). Tries the longest
+/// common prefix, then the state's checkpoint; `0` means start over (the
+/// caller resets). On a non-zero return the state holds exactly that prefix.
+fn reusable_prefix(state: &mut dyn ModelState, fed: &[u32], prompt: &[u32]) -> usize {
+    let lcp = fed.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+    let target = lcp.min(prompt.len().saturating_sub(1));
+    if target == 0 {
+        return 0;
+    }
+    if target == fed.len() || state.truncate(target) {
+        return target;
+    }
+    match state.checkpoint_len() {
+        Some(cp) if cp > 0 && cp <= target && state.truncate(cp) => cp,
+        _ => 0,
     }
 }
 

@@ -834,3 +834,239 @@ fn reasoning_with_stop_string_length_and_abort() {
     assert_eq!(out.finish_reason, FinishReason::Aborted);
     assert_eq!(out.reasoning.as_deref(), Some("pl"));
 }
+
+// ---------------------------------------------------------------------------
+// Prefix reuse with rollback (truncate / checkpoint)
+// ---------------------------------------------------------------------------
+
+/// State of [`RollLM`]: a running hash of every token fed. In `kv` mode it
+/// can roll back to any prefix (like a KV cache); otherwise (like a
+/// recurrent layer) only to the current length, 0, or its checkpoint.
+struct RollState {
+    kv: bool,
+    toks: Vec<u32>,
+    h: u64,
+    ckpt: Option<(usize, u64)>,
+}
+
+const ROLL_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+
+fn roll(h: u64, t: u32) -> u64 {
+    (h ^ t as u64).wrapping_mul(0x100_0000_01b3).rotate_left(17) ^ 0xdead_beef
+}
+
+impl ModelState for RollState {
+    fn reset(&mut self) -> anyhow::Result<()> {
+        self.toks.clear();
+        self.h = ROLL_SEED;
+        self.ckpt = None;
+        Ok(())
+    }
+    fn truncate(&mut self, len: usize) -> bool {
+        if len == self.toks.len() {
+            return true;
+        }
+        if len > self.toks.len() {
+            return false;
+        }
+        if self.kv {
+            self.toks.truncate(len);
+            self.h = self.toks.iter().fold(ROLL_SEED, |h, &t| roll(h, t));
+            return true;
+        }
+        match self.ckpt {
+            Some((n, h)) if n == len => {
+                self.toks.truncate(len);
+                self.h = h;
+                true
+            }
+            _ => false,
+        }
+    }
+    fn checkpoint(&mut self) {
+        if !self.kv {
+            self.ckpt = Some((self.toks.len(), self.h));
+        }
+    }
+    fn checkpoint_len(&self) -> Option<usize> {
+        self.ckpt.map(|c| c.0)
+    }
+    fn needs_checkpoint(&self) -> bool {
+        !self.kv
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Logits are a pseudo-random function of the whole history, so any
+/// rollback bug changes them.
+struct RollLM {
+    kv: bool,
+    vocab: usize,
+    /// (pos, len, logits) of every forward call.
+    log: Mutex<Vec<(usize, usize, Vec<f32>)>>,
+}
+
+impl CausalLM for RollLM {
+    fn new_state(&self) -> anyhow::Result<Box<dyn ModelState>> {
+        Ok(Box::new(RollState {
+            kv: self.kv,
+            toks: Vec::new(),
+            h: ROLL_SEED,
+            ckpt: None,
+        }))
+    }
+    fn forward(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut dyn ModelState,
+    ) -> anyhow::Result<Logits> {
+        let st = downcast_state::<RollState>(state)?;
+        anyhow::ensure!(pos == st.toks.len(), "pos {pos} != fed {}", st.toks.len());
+        for &t in tokens {
+            st.toks.push(t);
+            st.h = roll(st.h, t);
+        }
+        let l: Vec<f32> = (0..self.vocab as u32)
+            .map(|i| (roll(st.h, i) >> 40) as f32)
+            .collect();
+        self.log
+            .lock()
+            .unwrap()
+            .push((pos, tokens.len(), l.clone()));
+        Ok(l)
+    }
+    fn vocab_size(&self) -> usize {
+        self.vocab
+    }
+    fn max_seq_len(&self) -> usize {
+        4096
+    }
+    fn eos_token_ids(&self) -> &[u32] {
+        &[]
+    }
+    fn bos_token_id(&self) -> Option<u32> {
+        None
+    }
+}
+
+/// Runs `prompt` on `g`; returns the output tokens, the cached count and
+/// the logits of the last prefill chunk followed by every decode step.
+fn roll_run(
+    g: &mut Generator,
+    model: &RollLM,
+    prompt: &[u32],
+    p: &GenerationParams,
+) -> (Vec<u32>, usize, Vec<Vec<f32>>) {
+    model.log.lock().unwrap().clear();
+    let out = g
+        .generate_from_tokens(prompt, p, |_| ControlFlow::Continue(()))
+        .unwrap();
+    let log = model.log.lock().unwrap();
+    let first = log
+        .iter()
+        .position(|(pos, len, _)| pos + len == prompt.len())
+        .expect("last prefill chunk");
+    let logits = log[first..].iter().map(|(_, _, l)| l.clone()).collect();
+    assert_eq!(out.usage.prompt_tokens, prompt.len());
+    assert_eq!(
+        out.timings.prefill_tokens,
+        prompt.len() - out.usage.cached_prompt_tokens
+    );
+    (out.tokens, out.usage.cached_prompt_tokens, logits)
+}
+
+#[test]
+fn prefix_reuse_rolls_back_and_matches_fresh_prefill() {
+    for kv in [true, false] {
+        let model = Arc::new(RollLM {
+            kv,
+            vocab: 259,
+            log: Mutex::new(Vec::new()),
+        });
+        let p = greedy(6).with_prefill_chunk_size(4);
+        let mut g = Generator::new(model.clone(), sp_tokenizer());
+        let fresh = |prompt: &[u32]| {
+            let mut cold = Generator::new(model.clone(), sp_tokenizer());
+            cold.set_prefix_caching(false);
+            roll_run(&mut cold, &model, prompt, &p)
+        };
+
+        let p1: Vec<u32> = (0..10).map(|i| byte(b'a' + i)).collect();
+        let (out1, c1, _) = roll_run(&mut g, &model, &p1, &p);
+        assert_eq!(c1, 0);
+        assert_eq!(out1.len(), 6);
+
+        // Turn 2 keeps 2 of the generated tokens, then diverges (the chat
+        // template re-rendered the reply differently).
+        let mut p2 = p1.clone();
+        p2.extend_from_slice(&out1[..2]);
+        p2.extend_from_slice(&[byte(b'x'), byte(b'y'), byte(b'z')]);
+        // Turn 3 diverges inside turn 2's prompt, before its checkpoint.
+        let mut p3 = p2[..5].to_vec();
+        p3.extend_from_slice(&[byte(b'q'), byte(b'r')]);
+        // Turn 4 extends turn 3's prompt (pure extension, no rollback).
+        let mut p4 = p3.clone();
+        p4.push(byte(b's'));
+        // Turn 5 diverges right after turn 4's prompt: the checkpoint.
+        let mut p5 = p4.clone();
+        p5.extend_from_slice(&[byte(b't'), byte(b'u')]);
+        // Turn 6 repeats turn 5 exactly: one token must still be prefilled.
+        let p6 = p5.clone();
+
+        let cases: [(&[u32], usize, usize); 5] = [
+            // (prompt, cached with a KV state, cached with a recurrent state)
+            (&p2, 12, 10),
+            (&p3, 5, 0),
+            (&p4, p3.len(), p3.len()),
+            (&p5, p4.len(), p4.len()),
+            (&p6, p6.len() - 1, 0),
+        ];
+        for (i, (prompt, want_kv, want_rec)) in cases.into_iter().enumerate() {
+            let (toks, cached, logits) = roll_run(&mut g, &model, prompt, &p);
+            let want = if kv { want_kv } else { want_rec };
+            assert_eq!(cached, want, "kv={kv} turn {}", i + 2);
+            let (ftoks, fcached, flogits) = fresh(prompt);
+            assert_eq!(fcached, 0);
+            assert_eq!(toks, ftoks, "kv={kv} turn {}", i + 2);
+            assert_eq!(logits, flogits, "kv={kv} turn {}: logits differ", i + 2);
+        }
+    }
+}
+
+#[test]
+fn chat_checkpoint_at_history_end_for_recurrent_state() {
+    // The generation prompt `<think>\n\n</think>\n\n` is not reproduced when
+    // the reply is re-rendered, so the next prompt diverges *before* the end
+    // of this one: a recurrent state must checkpoint at the end of the
+    // conversation history instead.
+    let (tok, ..) = thinking_tokenizer();
+    let model = Arc::new(RollLM {
+        kv: false,
+        vocab: tok.get_vocab_size(true),
+        log: Mutex::new(Vec::new()),
+    });
+    let template = || ChatTemplate::new(THINKING_TEMPLATE, "", "<|im_end|>").unwrap();
+    let mut g = Generator::new(model.clone(), tok.clone()).with_chat_template(template());
+    let p = greedy(5).with_enable_thinking(false);
+    let mut msgs = vec![ChatMessage::user("hello")];
+    let mut prev_hist = 0;
+    for turn in 0..4 {
+        let hist = g
+            .apply_chat_template_with_kwargs(&msgs, false, &p.chat_template_kwargs)
+            .unwrap();
+        let hist_len = g.encode(&hist, false).unwrap().len();
+        let out = g.chat(&msgs, &p).unwrap();
+        let mut cold = Generator::new(model.clone(), tok.clone()).with_chat_template(template());
+        cold.set_prefix_caching(false);
+        let fresh = cold.chat(&msgs, &p).unwrap();
+        assert_eq!(out.tokens, fresh.tokens, "turn {turn}");
+        // Everything up to the previous turn's generation prompt is reused.
+        assert_eq!(out.usage.cached_prompt_tokens, prev_hist, "turn {turn}");
+        prev_hist = hist_len;
+        msgs.push(ChatMessage::assistant(format!("reply {turn}")));
+        msgs.push(ChatMessage::user(format!("again {turn}")));
+    }
+}

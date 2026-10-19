@@ -170,3 +170,32 @@ fn cache_write_correctness() {
     assert_eq!(cache.k_buffers[0][0], 5.0);
     assert_eq!(cache.k_buffers[0][1], 6.0);
 }
+
+#[test]
+fn growable_cache_matches_preallocated() {
+    // Crosses the initial capacity and two doublings; mixes prefill chunks
+    // and single-token steps, then rolls back (truncate = rewrite from pos).
+    let (layers, heads, kv_heads, hd, max) = (2, 4, 2, 8, 1200);
+    let mut fixed = CpuRingCache::new(layers, kv_heads, max, hd, true);
+    let mut grow = CpuRingCache::growable(layers, kv_heads, max, hd, true);
+    assert_eq!(grow.bytes(), 0);
+    let val = |pos: usize, i: usize| ((pos * 31 + i * 7) % 97) as f32 * 0.01 - 0.4;
+    let mut steps: Vec<(usize, usize)> = vec![(0, 200), (200, 1), (201, 150), (351, 300)];
+    steps.extend((651..700).map(|p| (p, 1)));
+    steps.push((400, 30)); // rollback: positions >= 400 are rewritten
+    for (pos, n) in steps {
+        let mk = |h: usize, salt: usize| {
+            let data = (0..h * n * hd).map(|i| val(pos + salt, i)).collect();
+            FastTensor::new(data, vec![1, h, n, hd])
+        };
+        for layer in 0..layers {
+            let (q, k, v) = (mk(heads, layer), mk(kv_heads, 3 + layer), mk(kv_heads, 9));
+            let a =
+                fast_attention(&q, &k, &v, layer, pos, &mut fixed, heads, kv_heads, hd).unwrap();
+            let b = fast_attention(&q, &k, &v, layer, pos, &mut grow, heads, kv_heads, hd).unwrap();
+            assert_eq!(a.data, b.data, "pos {pos} n {n} layer {layer}");
+        }
+    }
+    assert_eq!(grow.max_seq_len, 1024, "256 -> 512 -> 1024");
+    assert!(grow.bytes() < fixed.bytes());
+}

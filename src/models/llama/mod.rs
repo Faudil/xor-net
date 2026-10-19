@@ -17,6 +17,7 @@ use crate::loader::{SafeTensorLoader, sparse_loader::SparseFile};
 use crate::nn::{CpuRingCache, DynamicLinear, FastRmsNorm, LmHeadConfig, QuantizationConfig};
 use crate::tensor::FastTensor;
 use std::f32::consts::PI;
+use std::sync::Arc;
 
 use crate::nn::dynamic_linear::LinearKind;
 use rayon::prelude::*;
@@ -204,12 +205,26 @@ impl Config {
 // KV-cache + RoPE tables
 // ---------------------------------------------------------------------------
 
+/// Per-sequence state of a [`Llama`]: the KV cache plus (shared) RoPE tables.
+///
+/// The KV cache starts empty and grows geometrically as positions are fed
+/// (up to `max_position_embeddings`), so an idle or short sequence does not
+/// pay for the whole context window. The RoPE tables are immutable and
+/// shared between caches via `Arc` (see [`RopeTables`]).
 #[derive(Debug, Clone)]
 pub struct Cache {
     pub use_kv_cache: bool,
     pub ring_cache: Option<CpuRingCache>,
-    pub cos: FastTensor,
-    pub sin: FastTensor,
+    pub cos: Arc<FastTensor>,
+    pub sin: Arc<FastTensor>,
+}
+
+/// RoPE `cos`/`sin` tables, `[max_position_embeddings, head_dim / 2]` each.
+/// Computed once per model and shared by every [`Cache`].
+#[derive(Debug, Clone)]
+pub struct RopeTables {
+    pub cos: Arc<FastTensor>,
+    pub sin: Arc<FastTensor>,
 }
 
 fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
@@ -220,8 +235,8 @@ fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
         .collect()
 }
 
-impl Cache {
-    pub fn new(use_kv_cache: bool, config: &Config) -> anyhow::Result<Self> {
+impl RopeTables {
+    pub fn new(config: &Config) -> Self {
         let theta = match &config.rope_scaling {
             None
             | Some(Llama3RopeConfig {
@@ -266,28 +281,51 @@ impl Cache {
         let cos_data = idx_theta_data.iter().map(|&x| x.cos()).collect::<Vec<_>>();
         let sin_data = idx_theta_data.iter().map(|&x| x.sin()).collect::<Vec<_>>();
 
-        let cos = FastTensor::new(cos_data, vec![config.max_position_embeddings, half_dim]);
-        let sin = FastTensor::new(sin_data, vec![config.max_position_embeddings, half_dim]);
+        let shape = vec![config.max_position_embeddings, half_dim];
+        Self {
+            cos: Arc::new(FastTensor::new(cos_data, shape.clone())),
+            sin: Arc::new(FastTensor::new(sin_data, shape)),
+        }
+    }
+}
 
-        let ring_cache = if use_kv_cache {
-            let num_kv_heads = config.num_key_value_heads;
-            let head_dim = config.hidden_size / config.num_attention_heads;
-            Some(CpuRingCache::new(
+impl Cache {
+    /// A cache with its own RoPE tables. Prefer [`Cache::with_rope`] when
+    /// creating several caches for one model.
+    pub fn new(use_kv_cache: bool, config: &Config) -> anyhow::Result<Self> {
+        Self::with_rope(use_kv_cache, config, &RopeTables::new(config))
+    }
+
+    /// A cache sharing precomputed RoPE tables. The KV cache is allocated
+    /// lazily (it grows as positions are fed).
+    pub fn with_rope(
+        use_kv_cache: bool,
+        config: &Config,
+        rope: &RopeTables,
+    ) -> anyhow::Result<Self> {
+        let head_dim = config.hidden_size / config.num_attention_heads;
+        anyhow::ensure!(
+            rope.cos.shape == [config.max_position_embeddings, head_dim / 2]
+                && rope.sin.shape == rope.cos.shape,
+            "RoPE tables do not match the config"
+        );
+        // No u8 shadow copy: nothing reads it, it only cost memory and a
+        // quantisation per stored K/V row.
+        let ring_cache = use_kv_cache.then(|| {
+            CpuRingCache::growable(
                 config.num_hidden_layers,
-                num_kv_heads,
+                config.num_key_value_heads,
                 config.max_position_embeddings,
                 head_dim,
-                true,
-            ))
-        } else {
-            None
-        };
+                false,
+            )
+        });
 
         Ok(Self {
             use_kv_cache,
             ring_cache,
-            cos,
-            sin,
+            cos: Arc::clone(&rope.cos),
+            sin: Arc::clone(&rope.sin),
         })
     }
 }
@@ -296,18 +334,80 @@ impl Cache {
 // Token embedding
 // ---------------------------------------------------------------------------
 
+/// Token embedding table `[vocab, hidden]`.
+///
+/// Checkpoints often store bf16-trained embeddings widened to f32; when every
+/// value is exactly representable in bf16 the table is kept as bf16 (half the
+/// memory, bit-identical lookups). Otherwise it stays f32.
 #[derive(Debug, Clone)]
 pub struct FastEmbedding {
-    pub weight: FastTensor,
+    store: EmbeddingStore,
+    vocab: usize,
+    hidden: usize,
+}
+
+#[derive(Debug, Clone)]
+enum EmbeddingStore {
+    F32(FastTensor),
+    /// Upper 16 bits of each f32 (lossless by construction, see `new`).
+    Bf16(Vec<u16>),
 }
 
 impl FastEmbedding {
     pub fn new(weight: FastTensor) -> Self {
-        Self { weight }
+        assert_eq!(weight.shape.len(), 2, "embedding weight must be 2-D");
+        let (vocab, hidden) = (weight.shape[0], weight.shape[1]);
+        let lossless = weight.data.iter().all(|v| v.to_bits() & 0xffff == 0);
+        let store = if lossless {
+            EmbeddingStore::Bf16(
+                weight
+                    .data
+                    .iter()
+                    .map(|v| (v.to_bits() >> 16) as u16)
+                    .collect(),
+            )
+        } else {
+            EmbeddingStore::F32(weight)
+        };
+        Self {
+            store,
+            vocab,
+            hidden,
+        }
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.hidden
+    }
+
+    /// Bytes held by the table.
+    pub fn bytes(&self) -> usize {
+        match &self.store {
+            EmbeddingStore::F32(t) => t.data.len() * 4,
+            EmbeddingStore::Bf16(v) => v.len() * 2,
+        }
     }
 
     pub fn forward(&self, x: &[u32]) -> anyhow::Result<FastTensor> {
-        FastTensor::embedding(x, &self.weight)
+        match &self.store {
+            EmbeddingStore::F32(w) => FastTensor::embedding(x, w),
+            EmbeddingStore::Bf16(w) => {
+                let h = self.hidden;
+                let mut out = crate::tensor::workspace::get_pooled_buffer(x.len() * h);
+                for (&id, dst) in x.iter().zip(out.chunks_exact_mut(h)) {
+                    let id = id as usize;
+                    anyhow::ensure!(
+                        id < self.vocab,
+                        "embedding index out of bounds: id {id} >= vocab_size {}",
+                        self.vocab
+                    );
+                    for (d, &b) in dst.iter_mut().zip(&w[id * h..(id + 1) * h]) {
+                        *d = f32::from_bits((b as u32) << 16);
+                    }
+                }
+                Ok(FastTensor::new(out, vec![1, x.len(), h]))
+            }
+        }
     }
 }
 
@@ -422,7 +522,7 @@ impl Llama {
     }
 
     pub fn hidden_size(&self) -> usize {
-        self.wte.weight.shape[1]
+        self.wte.hidden_size()
     }
 
     pub fn forward_input_embed(
@@ -524,11 +624,20 @@ impl Llama {
         cfg: &Config,
         sparse: Option<&SparseFile>,
     ) -> anyhow::Result<Self> {
+        // The f32 weights are transient: never recycle them into the
+        // thread-local scratch pools (that kept ~10 GB alive on BitNet-2B).
+        crate::tensor::workspace::without_pooling(|| Self::load_inner(loader, cfg, sparse))
+    }
+
+    fn load_inner(
+        loader: &SafeTensorLoader,
+        cfg: &Config,
+        sparse: Option<&SparseFile>,
+    ) -> anyhow::Result<Self> {
         let wte_weight = loader.get(
             &[cfg.vocab_size, cfg.hidden_size],
             "model.embed_tokens.weight",
         )?;
-        let wte = FastEmbedding::new(wte_weight);
         // When the LM head is tied to the word embedding we control its
         // precision directly from `LmHeadConfig`. Ternary/int4 shrink the
         // per-token weight stream (102 MB → 25/13 MB) which is the real lever
@@ -545,20 +654,20 @@ impl Llama {
         let lm_head = if cfg.tie_word_embeddings {
             match lm_head_cfg {
                 LmHeadConfig::Int8 => {
-                    DynamicLinear::new_int8(&wte.weight.data, cfg.vocab_size, cfg.hidden_size)
+                    DynamicLinear::new_int8(&wte_weight.data, cfg.vocab_size, cfg.hidden_size)
                 }
                 LmHeadConfig::Int4 => {
-                    DynamicLinear::new_int4(&wte.weight.data, cfg.vocab_size, cfg.hidden_size)
+                    DynamicLinear::new_int4(&wte_weight.data, cfg.vocab_size, cfg.hidden_size)
                 }
                 LmHeadConfig::Ternary => DynamicLinear::new_ternary(
                     cfg.hidden_size,
                     cfg.vocab_size,
-                    &wte.weight.data,
+                    &wte_weight.data,
                     pack_type,
                     None,
                 )?,
                 LmHeadConfig::F16 | LmHeadConfig::F32 => {
-                    DynamicLinear::new_int8(&wte.weight.data, cfg.vocab_size, cfg.hidden_size)
+                    DynamicLinear::new_int8(&wte_weight.data, cfg.vocab_size, cfg.hidden_size)
                 }
             }
         } else {
@@ -571,6 +680,7 @@ impl Llama {
                 sparse,
             )?
         };
+        let wte = FastEmbedding::new(wte_weight);
         let ln_f = FastRmsNorm::load(
             cfg.hidden_size,
             cfg.rms_norm_eps as f32,
@@ -578,7 +688,11 @@ impl Llama {
         )?;
         let blocks: Result<Vec<_>, _> = (0..cfg.num_hidden_layers)
             .into_par_iter()
-            .map(|i| Block::load(loader.pp(format!("model.layers.{i}")), cfg, sparse))
+            .map(|i| {
+                crate::tensor::workspace::without_pooling(|| {
+                    Block::load(loader.pp(format!("model.layers.{i}")), cfg, sparse)
+                })
+            })
             .collect();
         let blocks = blocks?;
 

@@ -12,11 +12,34 @@
 //! sizes recur, so the zero-fill path is rarely taken and costs a short
 //! `memset` when it is.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 thread_local! {
     static F32_BUFFER_POOL: RefCell<Vec<Vec<f32>>> = RefCell::new(Vec::with_capacity(32));
     static I8_BUFFER_POOL: RefCell<Vec<Vec<i8>>> = RefCell::new(Vec::with_capacity(32));
+    static POOLING_DISABLED: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Run `f` with buffer recycling disabled on this thread: buffers returned
+/// meanwhile are freed instead of pooled. Model loaders wrap their work in
+/// this so the transient f32 weight tensors (tens of MB each, dropped as
+/// `FastTensor`s once packed) are not parked in every loader thread's pool
+/// for the life of the process.
+pub fn without_pooling<R>(f: impl FnOnce() -> R) -> R {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            POOLING_DISABLED.with(|d| d.set(d.get() - 1));
+        }
+    }
+    POOLING_DISABLED.with(|d| d.set(d.get() + 1));
+    let _g = Guard;
+    f()
+}
+
+#[inline(always)]
+fn pooling_enabled() -> bool {
+    POOLING_DISABLED.with(|d| d.get() == 0)
 }
 
 #[inline(always)]
@@ -44,7 +67,7 @@ pub fn get_pooled_buffer(size: usize) -> Vec<f32> {
 
 #[inline(always)]
 pub fn return_pooled_buffer(buf: Vec<f32>) {
-    if buf.capacity() >= 1024 && buf.capacity() <= 1024 * 1024 * 100 {
+    if buf.capacity() >= 1024 && buf.capacity() <= 1024 * 1024 * 100 && pooling_enabled() {
         F32_BUFFER_POOL.with(|pool| {
             let mut p = pool.borrow_mut();
             if p.len() < 64 {
@@ -64,7 +87,7 @@ pub fn get_pooled_buffer_i8(size: usize) -> Vec<i8> {
 
 #[inline(always)]
 pub fn return_pooled_buffer_i8(buf: Vec<i8>) {
-    if buf.capacity() >= 1024 && buf.capacity() <= 1024 * 1024 * 100 {
+    if buf.capacity() >= 1024 && buf.capacity() <= 1024 * 1024 * 100 && pooling_enabled() {
         I8_BUFFER_POOL.with(|pool| {
             let mut p = pool.borrow_mut();
             if p.len() < 64 {

@@ -122,6 +122,10 @@ impl ModelState for Qwen3State {
         // Positions are overwritten before they are read.
         Ok(())
     }
+    fn truncate(&mut self, _len: usize) -> bool {
+        // Pure KV cache: positions `>= len` are rewritten before being read.
+        true
+    }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }

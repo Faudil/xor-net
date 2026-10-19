@@ -11,7 +11,7 @@ use xor_net::models::q1::qwen35::{
     AttnMixer, GdnMixer, Mixer, Qwen35Config, Qwen35Layer, Qwen35Model,
 };
 use xor_net::models::q1::{Embedding, Linear, ModelAssets, Yarn};
-use xor_net::models::traits::CausalLM;
+use xor_net::models::traits::{CausalLM, ModelState};
 
 struct Rng(u64);
 impl Rng {
@@ -350,4 +350,53 @@ fn generator_runs_on_tiny_model() {
         )
         .unwrap();
     assert!(!out.tokens.is_empty() && out.tokens.len() <= 5);
+}
+
+/// Feed `chunks` of `toks` into `st` starting at `pos`; last logits.
+fn feed(m: &dyn CausalLM, st: &mut dyn ModelState, toks: &[u32], pos: usize) -> Vec<f32> {
+    m.forward(toks, pos, st).unwrap()
+}
+
+#[test]
+fn truncate_and_checkpoint_match_fresh_prefill() {
+    let a = tokens(12);
+    let b: Vec<u32> = (0..8).map(|i| (i * 11 + 5) % 300).collect();
+    let c: Vec<u32> = (0..6).map(|i| (i * 53 + 7) % 300).collect();
+    // Fresh: a then c, same chunking as the reused state below.
+    let fresh = |m: &dyn CausalLM, prefix: &[u32]| {
+        let mut st = m.new_state().unwrap();
+        feed(m, st.as_mut(), prefix, 0);
+        feed(m, st.as_mut(), &c, prefix.len())
+    };
+
+    // Recurrent hybrid: only the checkpoint (or 0 / current length) works.
+    let m = tiny_qwen35(&mut Rng(7));
+    let mut st = m.new_state().unwrap();
+    feed(&m, st.as_mut(), &a, 0);
+    st.checkpoint();
+    assert_eq!(st.checkpoint_len(), Some(a.len()));
+    feed(&m, st.as_mut(), &b, a.len());
+    assert!(!st.truncate(5), "recurrent state cannot roll back to 5");
+    assert!(!st.truncate(a.len() + 3), "nor past the checkpoint");
+    assert!(st.truncate(a.len() + b.len()), "current length is a no-op");
+    assert!(
+        m.forward(&c, 3, st.as_mut()).is_err(),
+        "a position that does not match the state is rejected"
+    );
+    assert!(st.truncate(a.len()));
+    let got = feed(&m, st.as_mut(), &c, a.len());
+    assert_eq!(got, fresh(&m, &a), "qwen35: checkpoint restore");
+    // The checkpoint survives a restore and can be used again.
+    assert!(st.truncate(a.len()));
+    assert_eq!(feed(&m, st.as_mut(), &c, a.len()), got);
+    st.reset().unwrap();
+    assert_eq!(st.checkpoint_len(), None, "reset drops the checkpoint");
+
+    // Dense KV-only model: any prefix.
+    let m = tiny_qwen3(&mut Rng(8), 32);
+    let mut st = m.new_state().unwrap();
+    feed(&m, st.as_mut(), &a, 0);
+    feed(&m, st.as_mut(), &b, a.len());
+    assert!(st.truncate(7));
+    assert_eq!(feed(&m, st.as_mut(), &c, 7), fresh(&m, &a[..7]), "qwen3");
 }

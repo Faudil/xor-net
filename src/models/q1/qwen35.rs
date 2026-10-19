@@ -181,7 +181,36 @@ pub struct Qwen35State {
     conv: Vec<Vec<f32>>,
     /// Per layer: `[v_heads][head_v_dim][head_k_dim]` (row = value dim).
     ssm: Vec<Vec<f32>>,
+    /// Positions fed so far.
+    len: usize,
+    /// Saved recurrent state (see [`ModelState::checkpoint`]).
+    ckpt: RecurrentCheckpoint,
     s: Scratch,
+}
+
+/// Copy of every recurrent layer's conv history and DeltaNet state at
+/// position `len` (valid when `len` is `Some`). The buffers are kept across
+/// checkpoints so re-checkpointing does not allocate.
+#[derive(Default)]
+struct RecurrentCheckpoint {
+    len: Option<usize>,
+    conv: Vec<Vec<f32>>,
+    ssm: Vec<Vec<f32>>,
+}
+
+fn copy_layers(dst: &mut Vec<Vec<f32>>, src: &[Vec<f32>]) {
+    dst.resize_with(src.len(), Vec::new);
+    for (d, s) in dst.iter_mut().zip(src) {
+        d.clear();
+        d.extend_from_slice(s);
+    }
+}
+
+impl Qwen35State {
+    /// Bytes held by one checkpoint (recurrent conv + DeltaNet state).
+    pub fn checkpoint_bytes(&self) -> usize {
+        self.conv.iter().chain(&self.ssm).map(|v| v.len() * 4).sum()
+    }
 }
 
 #[derive(Default)]
@@ -204,7 +233,44 @@ impl ModelState for Qwen35State {
         for v in self.conv.iter_mut().chain(self.ssm.iter_mut()) {
             v.fill(0.0);
         }
+        self.len = 0;
+        self.ckpt.len = None;
         Ok(())
+    }
+
+    /// KV caches roll back to any length; the recurrent state only to the
+    /// current length, 0 or the checkpoint.
+    fn truncate(&mut self, len: usize) -> bool {
+        if len == self.len {
+            true
+        } else if len == 0 {
+            self.reset().is_ok()
+        } else if len < self.len && self.ckpt.len == Some(len) {
+            for (d, s) in self.conv.iter_mut().zip(&self.ckpt.conv) {
+                d.copy_from_slice(s);
+            }
+            for (d, s) in self.ssm.iter_mut().zip(&self.ckpt.ssm) {
+                d.copy_from_slice(s);
+            }
+            self.len = len;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn checkpoint(&mut self) {
+        copy_layers(&mut self.ckpt.conv, &self.conv);
+        copy_layers(&mut self.ckpt.ssm, &self.ssm);
+        self.ckpt.len = Some(self.len);
+    }
+
+    fn checkpoint_len(&self) -> Option<usize> {
+        self.ckpt.len
+    }
+
+    fn needs_checkpoint(&self) -> bool {
+        true
     }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
@@ -647,6 +713,8 @@ impl Qwen35Model {
             kv,
             conv,
             ssm,
+            len: 0,
+            ckpt: RecurrentCheckpoint::default(),
             s: Scratch::default(),
         }
     }
@@ -665,6 +733,12 @@ impl Qwen35Model {
             "forward: positions {pos}..{} exceed context {}",
             pos + n,
             c.context_length
+        );
+        // The recurrent state has no positions: it must be fed in order.
+        anyhow::ensure!(
+            pos == state.len,
+            "forward: pos {pos} but the state holds {} positions",
+            state.len
         );
         for kv in state.kv.iter_mut().flatten() {
             kv.reserve(pos + n, pos)?;
@@ -722,6 +796,7 @@ impl Qwen35Model {
         logits.truncate(c.vocab);
         state.s.x = x;
         state.s.h = hbuf;
+        state.len = pos + n;
         Ok(logits)
     }
 }

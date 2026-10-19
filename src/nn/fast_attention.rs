@@ -15,17 +15,30 @@ pub struct U8CacheLayer {
     pub v_scales: Vec<f32>,
 }
 
+/// Per-layer K/V storage `[num_kv_heads][max_seq_len][head_dim]`.
+///
+/// `max_seq_len` is the *current* capacity (and the per-head row stride).
+/// A cache built with [`CpuRingCache::new`] is allocated at full size and
+/// wraps positions modulo its capacity (ring). One built with
+/// [`CpuRingCache::growable`] starts empty and doubles on demand (amortised
+/// copy) up to `max_capacity` before it would ever wrap, so a short sequence
+/// only pays for the positions it uses.
 #[derive(Debug, Clone)]
 pub struct CpuRingCache {
     pub k_buffers: Vec<Vec<f32>>,
     pub v_buffers: Vec<Vec<f32>>,
     pub max_seq_len: usize,
+    /// Upper bound for growth (`== max_seq_len` for a fixed-size cache).
+    pub max_capacity: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
     /// Optional U8-persistent cache for memory-efficient long-context.
     /// When set, K/V are stored in u8 and lazily dequantized into k_buffers/v_buffers.
     pub u8_buffers: Vec<U8CacheLayer>,
 }
+
+/// First allocation of a growable cache, in positions.
+pub const RING_CACHE_INITIAL_CAPACITY: usize = 256;
 
 impl CpuRingCache {
     pub fn new(
@@ -35,31 +48,102 @@ impl CpuRingCache {
         head_dim: usize,
         use_u8: bool,
     ) -> Self {
-        let size = num_kv_heads * max_seq_len * head_dim;
-        let mut k_buffers = Vec::with_capacity(num_layers);
-        let mut v_buffers = Vec::with_capacity(num_layers);
-        let mut u8_buffers = Vec::with_capacity(num_layers);
-        for _ in 0..num_layers {
-            k_buffers.push(vec![0.0f32; size]);
-            v_buffers.push(vec![0.0f32; size]);
-            if use_u8 {
-                let scale_size = num_kv_heads * max_seq_len;
-                u8_buffers.push(U8CacheLayer {
-                    u8_k: vec![128u8; size],
-                    u8_v: vec![128u8; size],
-                    k_scales: vec![0.0f32; scale_size],
-                    v_scales: vec![0.0f32; scale_size],
-                });
-            }
-        }
+        let mut c = Self::growable(num_layers, num_kv_heads, max_seq_len, head_dim, use_u8);
+        c.grow_to(max_seq_len);
+        c
+    }
+
+    /// An empty cache that grows on demand up to `max_capacity` positions.
+    pub fn growable(
+        num_layers: usize,
+        num_kv_heads: usize,
+        max_capacity: usize,
+        head_dim: usize,
+        use_u8: bool,
+    ) -> Self {
+        let empty_u8 = || U8CacheLayer {
+            u8_k: Vec::new(),
+            u8_v: Vec::new(),
+            k_scales: Vec::new(),
+            v_scales: Vec::new(),
+        };
         Self {
-            k_buffers,
-            v_buffers,
-            max_seq_len,
+            k_buffers: vec![Vec::new(); num_layers],
+            v_buffers: vec![Vec::new(); num_layers],
+            max_seq_len: 0,
+            max_capacity,
             num_kv_heads,
             head_dim,
-            u8_buffers,
+            u8_buffers: if use_u8 {
+                (0..num_layers).map(|_| empty_u8()).collect()
+            } else {
+                Vec::new()
+            },
         }
+    }
+
+    /// Make room for positions `< len` (geometric growth, capped at
+    /// `max_capacity`; beyond that the cache wraps as a ring).
+    pub fn reserve(&mut self, len: usize) {
+        if len > self.max_seq_len && self.max_seq_len < self.max_capacity {
+            let cap = len
+                .max(self.max_seq_len * 2)
+                .max(RING_CACHE_INITIAL_CAPACITY)
+                .min(self.max_capacity);
+            self.grow_to(cap);
+        }
+    }
+
+    /// Re-lay every buffer out with capacity `new_cap`, keeping the stored
+    /// positions of each head.
+    fn grow_to(&mut self, new_cap: usize) {
+        let (old_cap, hd, heads) = (self.max_seq_len, self.head_dim, self.num_kv_heads);
+        if new_cap <= old_cap {
+            return;
+        }
+        fn regrow<T: Copy>(
+            buf: &mut Vec<T>,
+            fill: T,
+            heads: usize,
+            old: usize,
+            new: usize,
+            w: usize,
+        ) {
+            let mut out = vec![fill; heads * new * w];
+            if !buf.is_empty() {
+                for h in 0..heads {
+                    out[h * new * w..(h * new + old) * w]
+                        .copy_from_slice(&buf[h * old * w..(h + 1) * old * w]);
+                }
+            }
+            *buf = out;
+        }
+        for b in self.k_buffers.iter_mut().chain(self.v_buffers.iter_mut()) {
+            regrow(b, 0.0f32, heads, old_cap, new_cap, hd);
+        }
+        for u in &mut self.u8_buffers {
+            regrow(&mut u.u8_k, 128u8, heads, old_cap, new_cap, hd);
+            regrow(&mut u.u8_v, 128u8, heads, old_cap, new_cap, hd);
+            regrow(&mut u.k_scales, 0.0f32, heads, old_cap, new_cap, 1);
+            regrow(&mut u.v_scales, 0.0f32, heads, old_cap, new_cap, 1);
+        }
+        self.max_seq_len = new_cap;
+    }
+
+    /// Bytes currently allocated for K/V (f32 plus the optional u8 copy).
+    pub fn bytes(&self) -> usize {
+        let f: usize = self
+            .k_buffers
+            .iter()
+            .chain(&self.v_buffers)
+            .map(|b| b.len() * 4)
+            .sum();
+        let u: usize = self
+            .u8_buffers
+            .iter()
+            .map(|u| u.u8_k.len() + u.u8_v.len() + (u.k_scales.len() + u.v_scales.len()) * 4)
+            .sum();
+        f + u
     }
 
     /// Quantize an f32 slice to u8 and store in the U8 buffer.
@@ -98,6 +182,7 @@ pub fn fast_attention(
         );
     }
 
+    cache.reserve(index_pos + seq_len);
     let q_data = &q.data;
     let k_data = &k.data;
     let v_data = &v.data;
