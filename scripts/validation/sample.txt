@@ -1,0 +1,11 @@
+The Industrial Revolution began in Great Britain in the late 18th century and spread to Europe and North America over the following decades. Steam engines, improved by James Watt in 1776, powered textile mills, mines and, later, railways. By 1850 Britain had more than 6,000 miles of railway track. Historians still debate why it started in Britain rather than in France or China: cheap coal, high wages, secure property rights and a culture of tinkering are all common explanations.
+
+def fibonacci(n):
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+
+print([fibonacci(i) for i in range(10)])  # [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+
+La Révolution française a commencé en 1789 et a profondément transformé la société.

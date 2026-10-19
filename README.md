@@ -26,14 +26,20 @@ channel), single stream, decode with 6-8 threads.
 
 | Model | Type | File | Decode | Prefill | Peak RSS |
 |-------|------|------|-------:|--------:|---------:|
-| [Bonsai 1.7B](https://huggingface.co/prism-ml/Bonsai-1.7B-gguf) | 1-bit Q1_0, Qwen3 dense | 248 MB | **150-164 tok/s** | 300-380 tok/s | 300-350 MB |
-| [Bonsai 4B](https://huggingface.co/prism-ml/Bonsai-4B-gguf) | 1-bit Q1_0, Qwen3 dense | 572 MB | **~64 tok/s** | not measured | not measured |
-| [Bonsai 8B](https://huggingface.co/prism-ml/Bonsai-8B-gguf) | 1-bit Q1_0, Qwen3 dense | 1.16 GB | **41-44 tok/s** | not measured | 1.1-1.4 GB |
-| [Bonsai 27B](https://huggingface.co/prism-ml/Bonsai-27B-gguf) | 1-bit Q1_0, Qwen3.5 hybrid (attention + Gated DeltaNet) | 3.8 GB | **11-12 tok/s** | not measured | 3.7 GB |
-| [BitNet b1.58 2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | 1.58-bit ternary, Llama-style | safetensors | **~74 tok/s** | not measured | not measured |
+| [Bonsai 1.7B](https://huggingface.co/prism-ml/Bonsai-1.7B-gguf) | 1-bit Q1_0, Qwen3 dense | 248 MB | **146-174 tok/s** | ~990 tok/s | 340-490 MB |
+| [Bonsai 4B](https://huggingface.co/prism-ml/Bonsai-4B-gguf) | 1-bit Q1_0, Qwen3 dense | 572 MB | **~64 tok/s** | not measured | ~630 MB |
+| [Bonsai 8B](https://huggingface.co/prism-ml/Bonsai-8B-gguf) | 1-bit Q1_0, Qwen3 dense | 1.16 GB | **41-44 tok/s** | ~250 tok/s | 1.1-1.4 GB |
+| [Bonsai 27B](https://huggingface.co/prism-ml/Bonsai-27B-gguf) | 1-bit Q1_0, Qwen3.5 hybrid (attention + Gated DeltaNet) | 3.8 GB | **~13.4 tok/s** | ~65 tok/s | 3.7-4.1 GB |
+| [BitNet b1.58 2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | 1.58-bit ternary, Llama-style | safetensors | **~75 tok/s** | ~145 tok/s | ~1.5 GB |
 | [BitNet b1.58 3B](https://huggingface.co/1bitLLM/bitnet_b1_58-3B) | 1.58-bit ternary | safetensors | not measured | | |
 | [Llama3-8B-1.58](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) | 1.58-bit ternary | safetensors | not measured | | |
 | QuickNet (Larq Zoo) | binary CNN, ImageNet top-1 63.3% | 4.4 MB | **~0.7 ms / image** (6 threads, ~10x faster than TF/Larq) | | ~15 MB |
+
+Prefill figures use a ~500-token prompt. Bonsai outputs are validated against
+PrismML's llama.cpp on identical tokens: identical tokenization, perplexity
+within 0.25%, top-1 agreement 99-100% (the disagreements are exact near-ties).
+On the same machine llama.cpp measures 1.7B 349 / 144 tok/s and 27B 23.2 /
+12.05 tok/s (prefill / decode). See [docs/validation.md](docs/validation.md).
 
 Bonsai models load from the published `.gguf` or from xor-net's `.xq1`
 format (same weights, bit for bit, mmapped for near-instant start-up; see
@@ -229,6 +235,7 @@ contention. Use physical cores, not SMT siblings.
 - [docs/python.md](docs/python.md): Python API
 - [docs/formats.md](docs/formats.md): Q1_0, `.xq1`, XorSparse, vision files
 - [docs/architecture.md](docs/architecture.md): code map and design rules
+- [docs/validation.md](docs/validation.md): accuracy and speed vs llama.cpp, how to reproduce
 - [OPTIMISATION.md](OPTIMISATION.md): performance investigation and measurements
 
 ## Development
