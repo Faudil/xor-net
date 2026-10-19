@@ -68,7 +68,7 @@ jobs:
       - name: CPU features
         run: grep -m1 -o -w 'avx2\|avx512f\|avx512bw\|avx512_vnni' /proc/cpuinfo | sort -u || true
       - name: Tests (debug)
-        run: cargo test --all-targets
+        run: scripts/ci/cargo-test.sh --all-targets
       - name: Doc tests
         if: matrix.isa == 'native'
         run: cargo test --doc
@@ -103,7 +103,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
-      - run: cargo test
+      - run: scripts/ci/cargo-test.sh
+        shell: bash
 
   windows:
     name: build (windows-msvc)
