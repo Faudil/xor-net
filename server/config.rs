@@ -3,11 +3,17 @@
 
 use std::time::Duration;
 
+use xor_net::generation::ReasoningFormat;
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub model: String,
     pub model_id: Option<String>,
+    /// Explicit tokenizer.json (overrides the model's own).
+    pub tokenizer: Option<String>,
     pub tokenizer_repo: String,
+    /// `None` = auto: separate when the chat template has `<think>`.
+    pub reasoning_format: Option<ReasoningFormat>,
     pub host: String,
     pub port: u16,
     pub slots: usize,
@@ -29,17 +35,21 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn defaults() -> Self {
-        let logical = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8);
+        let (slots, threads_per_slot) = default_parallelism(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8),
+        );
         Self {
             model: "models/bitnet-2b".into(),
             model_id: None,
+            tokenizer: None,
+            reasoning_format: None,
             tokenizer_repo: "microsoft/bitnet-b1.58-2B-4T".into(),
             host: "127.0.0.1".into(),
             port: 8080,
-            slots: (logical / 2).max(1),
-            threads_per_slot: 1,
+            slots,
+            threads_per_slot,
             max_connections: 256,
             max_queue: 64,
             max_body_bytes: 4 * 1024 * 1024,
@@ -56,6 +66,19 @@ impl ServerConfig {
     }
 }
 
+/// Default `(slots, threads_per_slot)` for `logical` CPUs (assumes SMT-2,
+/// i.e. `logical / 2` physical cores). Decode is memory-bound, so splitting
+/// the cores over a few slots raises aggregate throughput while one slot
+/// with every core gives the lowest single-request latency. Measured on a
+/// 6-core Zen 5 with Bonsai-1.7B (decode tok/s, aggregate / single request):
+/// 1x6 155/155, 2x3 190/115, 3x2 215/90, 6x1 264/50. Two slots keep most of
+/// the single-stream speed while serving two clients at once.
+pub fn default_parallelism(logical: usize) -> (usize, usize) {
+    let physical = (logical / 2).max(1);
+    let slots = if physical >= 4 { 2 } else { 1 };
+    (slots, (physical / slots).max(1))
+}
+
 pub const USAGE: &str = "\
 xor-net-server: OpenAI / llama.cpp compatible HTTP server for xor-net
 
@@ -65,14 +88,24 @@ USAGE:
 Each option falls back to the environment variable shown, then the default.
 
 OPTIONS:
-    -m, --model <PATH|REPO>      model dir or HF repo id   [XORNET_MODEL] (models/bitnet-2b)
-        --model-id <ID>          id reported by the API     [XORNET_MODEL_ID] (model dir name)
-        --tokenizer-repo <REPO>  HF repo for tokenizer.json if the model dir has none
+    -m, --model <PATH|REPO>      Bonsai .gguf / .xq1 file, safetensors dir (Llama/BitNet)
+                                 or HF repo id              [XORNET_MODEL] (models/bitnet-2b)
+        --model-id <ID>          id reported by the API     [XORNET_MODEL_ID] (file stem / dir name)
+        --tokenizer <PATH>       tokenizer.json to use instead of the model's own
+                                                            [XORNET_TOKENIZER] (none)
+        --tokenizer-repo <REPO>  HF repo for tokenizer.json if a model dir has none
                                                             [XORNET_TOKENIZER_REPO] (microsoft/bitnet-b1.58-2B-4T)
+        --reasoning-format <F>   auto | none | separate: with `separate`, <think> blocks go to
+                                 message.reasoning_content / delta.reasoning_content (chat only);
+                                 auto = separate iff the chat template has <think>
+                                                            [XORNET_REASONING_FORMAT] (auto)
         --host <HOST>            bind host                  [XORNET_SERVER_HOST] (127.0.0.1)
     -p, --port <PORT>            bind port                  [XORNET_SERVER_PORT] (8080)
-        --slots <N>              concurrent decode slots    [XORNET_SLOTS] (logical cores / 2)
-        --threads-per-slot <N>   rayon threads per slot     [XORNET_THREADS_PER_SLOT] (1)
+        --slots <N>              concurrent decode slots    [XORNET_SLOTS] (2 if >= 4 physical cores, else 1)
+        --threads-per-slot <N>   rayon threads per slot     [XORNET_THREADS_PER_SLOT] (physical cores / slots)
+                                 Decode is memory-bound: 1 slot x all cores = lowest latency,
+                                 more slots = more aggregate tok/s (6-core Zen 5, Bonsai-1.7B:
+                                 1x6 155, 2x3 190, 3x2 215, 6x1 264 tok/s aggregate).
         --max-connections <N>    open connection cap (503)  [XORNET_MAX_CONNECTIONS] (256)
         --max-queue <N>          queued jobs cap (503)      [XORNET_MAX_QUEUE] (64)
         --max-body-bytes <N>     request body cap (413)     [XORNET_MAX_BODY_BYTES] (4194304)
@@ -111,6 +144,16 @@ const OPTS: &[Opt] = &[
         long: "model-id",
         short: None,
         env: "XORNET_MODEL_ID",
+    },
+    Opt {
+        long: "tokenizer",
+        short: None,
+        env: "XORNET_TOKENIZER",
+    },
+    Opt {
+        long: "reasoning-format",
+        short: None,
+        env: "XORNET_REASONING_FORMAT",
     },
     Opt {
         long: "tokenizer-repo",
@@ -263,6 +306,15 @@ pub fn parse(
         match n {
             "model" => c.model = v,
             "model-id" => c.model_id = Some(v),
+            "tokenizer" => c.tokenizer = Some(v),
+            "reasoning-format" => {
+                c.reasoning_format = match v.trim() {
+                    "auto" => None,
+                    other => Some(other.parse().map_err(|_| {
+                        format!("invalid value for --{n}: {v:?} (auto | none | separate)")
+                    })?),
+                }
+            }
             "tokenizer-repo" => c.tokenizer_repo = v,
             "host" => c.host = v,
             "port" => c.port = num(n, &v)?,
@@ -336,5 +388,31 @@ mod tests {
         assert!(run(&["--slots", "0"], &[]).is_err());
         assert!(run(&[], &[("XORNET_SLOTS", "abc")]).is_err());
         assert!(run(&["--read-timeout", "0"], &[]).is_err());
+        assert!(run(&["--reasoning-format", "maybe"], &[]).is_err());
+    }
+
+    #[test]
+    fn default_parallelism_splits_physical_cores() {
+        assert_eq!(default_parallelism(12), (2, 3));
+        assert_eq!(default_parallelism(16), (2, 4));
+        assert_eq!(default_parallelism(4), (1, 2));
+        assert_eq!(default_parallelism(1), (1, 1));
+    }
+
+    #[test]
+    fn reasoning_and_tokenizer_flags() {
+        let c = run(&[], &[]).unwrap();
+        assert_eq!((c.reasoning_format, c.tokenizer), (None, None));
+        let c = run(
+            &["--reasoning-format", "none", "--tokenizer", "t.json"],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.reasoning_format, Some(ReasoningFormat::None));
+        assert_eq!(c.tokenizer.as_deref(), Some("t.json"));
+        let c = run(&[], &[("XORNET_REASONING_FORMAT", "separate")]).unwrap();
+        assert_eq!(c.reasoning_format, Some(ReasoningFormat::Separate));
+        let c = run(&["--reasoning-format=auto"], &[]).unwrap();
+        assert_eq!(c.reasoning_format, None);
     }
 }

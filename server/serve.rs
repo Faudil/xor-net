@@ -16,6 +16,7 @@ use crate::api::{self, Api, ApiError, RespMeta};
 use crate::config::ServerConfig;
 use crate::engine::{Engine, GenRequest, GenResult};
 use crate::http::{self, Limits, Request, Response, TimedReader};
+use xor_net::generation::{ReasoningFormat, StreamEvent};
 
 /// How often a waiting connection checks whether its client went away.
 const POLL: Duration = Duration::from_millis(200);
@@ -26,6 +27,8 @@ const POLL: Duration = Duration::from_millis(200);
 
 pub enum Event {
     Delta(String),
+    /// Reasoning (`<think>`) delta; only with reasoning separation.
+    Reasoning(String),
     Done(GenResult),
     Error(String),
 }
@@ -68,10 +71,10 @@ impl JobQueue {
     }
 
     /// Enqueue, or give the job back if the queue is full / shut down.
-    pub fn try_push(&self, job: Job) -> Result<(), Job> {
+    pub fn try_push(&self, job: Job) -> Result<(), Box<Job>> {
         let mut g = self.lock();
         if g.shutdown || g.jobs.len() >= self.cap {
-            return Err(job);
+            return Err(Box::new(job));
         }
         g.jobs.push_back(job);
         drop(g);
@@ -118,6 +121,9 @@ impl JobQueue {
 
 pub struct App {
     pub engine: Arc<dyn Engine>,
+    /// Chat responses carry `reasoning_content` (resolved from
+    /// `--reasoning-format` and the model's template).
+    pub reasoning: bool,
     pub queue: JobQueue,
     pub cfg: ServerConfig,
     pub limits: Limits,
@@ -127,8 +133,13 @@ pub struct App {
 
 impl App {
     pub fn new(engine: Arc<dyn Engine>, cfg: ServerConfig) -> Self {
+        let reasoning = match cfg.reasoning_format {
+            Some(f) => f == ReasoningFormat::Separate,
+            None => engine.chat_template_has_thinking(),
+        };
         Self {
             engine,
+            reasoning,
             queue: JobQueue::new(cfg.max_queue),
             limits: Limits {
                 max_line: cfg.max_header_line,
@@ -167,30 +178,35 @@ pub fn spawn_workers(app: &Arc<App>) -> anyhow::Result<Vec<thread::JoinHandle<()
         let app = Arc::clone(app);
         let h = thread::Builder::new()
             .name(format!("slot{slot}"))
-            .spawn(move || worker(&app, &pool))?;
+            .spawn(move || worker(&app, slot, &pool))?;
         handles.push(h);
     }
     Ok(handles)
 }
 
-fn worker(app: &App, pool: &rayon::ThreadPool) {
+fn worker(app: &App, slot: usize, pool: &rayon::ThreadPool) {
     while let Some(job) = app.queue.pop() {
         if !job.cancel.load(Ordering::Relaxed) {
-            run_job(app.engine.as_ref(), &job, pool);
+            run_job(app.engine.as_ref(), slot, &job, pool);
         }
         app.queue.finish();
     }
 }
 
-fn run_job(engine: &dyn Engine, job: &Job, pool: &rayon::ThreadPool) {
+fn run_job(engine: &dyn Engine, slot: usize, job: &Job, pool: &rayon::ThreadPool) {
     let tx = &job.tx;
     let cancel = &job.cancel;
     let res = pool.install(|| {
-        engine.generate(&job.req, &mut |delta: &str| {
+        engine.generate(slot, &job.req, &mut |ev: StreamEvent<'_>| {
             if cancel.load(Ordering::Relaxed) {
                 return ControlFlow::Break(());
             }
-            if !delta.is_empty() && tx.send(Event::Delta(delta.to_string())).is_err() {
+            let msg = match ev {
+                StreamEvent::Text(d) if !d.is_empty() => Event::Delta(d.to_string()),
+                StreamEvent::Reasoning(d) if !d.is_empty() => Event::Reasoning(d.to_string()),
+                _ => return ControlFlow::Continue(()),
+            };
+            if tx.send(msg).is_err() {
                 return ControlFlow::Break(());
             }
             ControlFlow::Continue(())
@@ -518,16 +534,18 @@ fn generate(
 ) -> Result<bool, ApiError> {
     let engine = app.engine.as_ref();
     let p = api::parse_request(api, &req.body, app.cfg.max_tokens_cap)?;
-    let prompt_ids = engine.encode(&p.prompt).map_err(|m| {
-        ApiError::invalid(
-            if api == Api::Chat {
-                "messages"
-            } else {
-                "prompt"
-            },
-            m,
-        )
-    })?;
+    let prompt_ids = engine
+        .encode(&p.prompt, &p.chat_template_kwargs)
+        .map_err(|m| {
+            ApiError::invalid(
+                if api == Api::Chat {
+                    "messages"
+                } else {
+                    "prompt"
+                },
+                m,
+            )
+        })?;
     let max_tokens = api::resolve_max_tokens(
         p.max_tokens,
         prompt_ids.len(),
@@ -554,6 +572,7 @@ fn generate(
             max_tokens,
             sampling,
             stop: p.stop.clone(),
+            reasoning: api == Api::Chat && app.reasoning,
         },
         tx,
         cancel,
@@ -586,6 +605,7 @@ fn generate(
         Ok(false)
     } else {
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut watch = PeerWatch::new(stream);
         loop {
             match rx.recv_timeout(POLL) {
@@ -595,8 +615,15 @@ fn generate(
                         return Ok(false);
                     }
                 }
+                Ok(Event::Reasoning(d)) => {
+                    reasoning.push_str(&d);
+                    if watch.gone() {
+                        return Ok(false);
+                    }
+                }
                 Ok(Event::Done(res)) => {
-                    let body = api::full_body(api, &meta, &text, &res);
+                    let r = (api == Api::Chat && app.reasoning).then_some(reasoning.as_str());
+                    let body = api::full_body(api, &meta, &text, r, &res);
                     return Ok(Response::json(200, &body).write_to(w, keep, &cors).is_ok());
                 }
                 Ok(Event::Error(e)) => {
@@ -641,6 +668,14 @@ fn stream_events(
         match rx.recv_timeout(POLL) {
             Ok(Event::Delta(d)) => {
                 sse_json(w, &api::delta_chunk(api, meta, &d, false, p.include_usage))?;
+                if watch.gone() {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "client closed"));
+                }
+            }
+            Ok(Event::Reasoning(d)) => {
+                if api == Api::Chat {
+                    sse_json(w, &api::reasoning_chunk(meta, &d, p.include_usage))?;
+                }
                 if watch.gone() {
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "client closed"));
                 }

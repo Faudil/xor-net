@@ -5,14 +5,19 @@
 //!   * OpenAI surface: `GET /v1/models`, `POST /v1/completions`,
 //!     `POST /v1/chat/completions` (streaming + non-streaming), llama.cpp
 //!     `POST /completion` and `GET /health`.
-//!   * Aggregate throughput comes from physical cores: `--slots` worker
-//!     threads each run one decode inside their own (default 1-thread) rayon
-//!     pool. See `OPTIMISATION.md`.
+//!   * `--slots` worker threads each run one decode inside their own rayon
+//!     pool of `--threads-per-slot` threads, sharing one `Arc` model; each
+//!     slot owns a `Generator` fork (state / KV cache, sampler). Defaults
+//!     split the physical cores over 2 slots (see `config::default_parallelism`).
 //!   * Hand-rolled, defensive HTTP/1.1 (no async runtime): thread per
 //!     connection with a connection cap, bounded job queue, size limits and
 //!     timeouts everywhere. The release profile uses `panic = "abort"`, so
 //!     request paths must never panic.
-//!   * All model interaction goes through the `engine::Engine` trait.
+//!   * All model interaction goes through the `engine::Engine` trait,
+//!     implemented by `GeneratorEngine` on top of `xor_net::Generator`
+//!     (real chat templates, `chat_template_kwargs`, reasoning separation).
+//!   * Models: Bonsai `.gguf` / `.xq1` files (`AutoModelForCausalLM::
+//!     from_file`), Llama / BitNet safetensors dirs, or an HF repo id.
 //!
 //! Run `xor-net-server --help` for options.
 
@@ -21,7 +26,6 @@ mod config;
 mod engine;
 mod http;
 mod serve;
-mod text;
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -30,11 +34,13 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use tokenizers::Tokenizer;
+use xor_net::generation::Generator;
+use xor_net::models::traits::CausalLM;
 use xor_net::nn::LmHeadConfig;
-use xor_net::{AutoModelForCausalLM, QuantizationConfig, TernaryPackType};
+use xor_net::{AutoModelForCausalLM, LlamaCausalLM, QuantizationConfig, TernaryPackType};
 
 use crate::config::{Parsed, ServerConfig};
-use crate::engine::{Engine, LlamaEngine};
+use crate::engine::{Engine, GeneratorEngine};
 use crate::serve::App;
 
 fn hub_file(repo_id: &str, file: &str) -> anyhow::Result<PathBuf> {
@@ -44,39 +50,97 @@ fn hub_file(repo_id: &str, file: &str) -> anyhow::Result<PathBuf> {
         .map_err(|e| anyhow!("{repo_id}/{file}: {e}"))
 }
 
-/// tokenizer.json from the model dir (or hub repo), falling back to
-/// `fallback_repo` only when it is missing.
-fn load_tokenizer(
-    model_dir: Option<&Path>,
-    hub_id: Option<&str>,
-    fallback_repo: &str,
-) -> anyhow::Result<Tokenizer> {
-    let path = if let Some(p) = model_dir
-        .map(|d| d.join("tokenizer.json"))
-        .filter(|p| p.is_file())
-    {
-        p
-    } else if let Some(p) = hub_id.and_then(|id| hub_file(id, "tokenizer.json").ok()) {
-        p
-    } else {
-        eprintln!("warning: no tokenizer.json with the model; downloading from {fallback_repo}");
-        hub_file(fallback_repo, "tokenizer.json")?
-    };
+fn read_tokenizer(path: &Path) -> anyhow::Result<Tokenizer> {
     println!("Tokenizer: {}", path.display());
-    Tokenizer::from_file(&path).map_err(|e| anyhow!("tokenizer {}: {e}", path.display()))
+    Tokenizer::from_file(path).map_err(|e| anyhow!("tokenizer {}: {e}", path.display()))
 }
 
-fn model_id(cfg: &ServerConfig, model_dir: Option<&Path>) -> String {
-    if let Some(id) = &cfg.model_id {
-        return id.clone();
+/// What `--model` points at.
+enum Source<'a> {
+    /// Bonsai `.gguf` / `.xq1`.
+    File(&'a Path),
+    /// HF-style safetensors directory (Llama / BitNet).
+    Dir(&'a Path),
+    /// HF hub repo id.
+    Hub(&'a str),
+}
+
+fn source(model: &str) -> Source<'_> {
+    let p = Path::new(model);
+    if p.is_dir() {
+        Source::Dir(p)
+    } else if p.is_file() {
+        Source::File(p)
+    } else {
+        Source::Hub(model)
     }
-    if let Some(dir) = model_dir {
-        let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-        if let Some(name) = canon.file_name().and_then(|s| s.to_str()) {
-            return name.to_string();
+}
+
+/// Load the model and wrap it in a `Generator` (tokenizer, chat template,
+/// EOS ids). Returns the generator and the default model id.
+fn load(cfg: &ServerConfig) -> anyhow::Result<(Generator, String)> {
+    let explicit_tok = cfg.tokenizer.as_deref().map(Path::new);
+    let quant = || QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, true);
+    match source(&cfg.model) {
+        Source::File(path) => {
+            println!("Loading Bonsai model file: {}", path.display());
+            let g = AutoModelForCausalLM::generator_from_file(path, explicit_tok)?;
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&cfg.model)
+                .to_string();
+            Ok((g, id))
+        }
+        Source::Dir(dir) => {
+            println!("Loading from local directory: {}", dir.display());
+            let model: Arc<dyn CausalLM> = Arc::new(LlamaCausalLM::from_local(dir, quant())?);
+            let g = if let Some(t) = explicit_tok {
+                Generator::from_dir_with_tokenizer(model, dir, read_tokenizer(t)?)?
+            } else if dir.join("tokenizer.json").is_file() {
+                println!("Tokenizer: {}", dir.join("tokenizer.json").display());
+                Generator::from_dir(model, dir)?
+            } else {
+                eprintln!(
+                    "warning: no tokenizer.json with the model; downloading from {}",
+                    cfg.tokenizer_repo
+                );
+                let tok = read_tokenizer(&hub_file(&cfg.tokenizer_repo, "tokenizer.json")?)?;
+                Generator::from_dir_with_tokenizer(model, dir, tok)?
+            };
+            let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+            let id = canon
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&cfg.model)
+                .to_string();
+            Ok((g, id))
+        }
+        Source::Hub(repo) => {
+            println!("Loading from HuggingFace: {repo}");
+            let model: Arc<dyn CausalLM> = Arc::new(LlamaCausalLM::from_pretrained(repo, quant())?);
+            // hf-hub puts every file of a revision in one snapshot dir, so
+            // fetching the configs next to tokenizer.json lets from_dir find
+            // the chat template and EOS ids.
+            let tok_path = match hub_file(repo, "tokenizer.json") {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!(
+                        "warning: {repo} has no tokenizer.json; using {}",
+                        cfg.tokenizer_repo
+                    );
+                    hub_file(&cfg.tokenizer_repo, "tokenizer.json")?
+                }
+            };
+            for f in ["tokenizer_config.json", "generation_config.json"] {
+                let _ = hub_file(repo, f);
+            }
+            let tok = read_tokenizer(explicit_tok.unwrap_or(&tok_path))?;
+            let snapshot = tok_path.parent().unwrap_or(Path::new("."));
+            let g = Generator::from_dir_with_tokenizer(model, snapshot, tok)?;
+            Ok((g, repo.to_string()))
         }
     }
-    cfg.model.clone()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -92,32 +156,23 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    xor_net::init_threads(cfg.slots).map_err(|e| anyhow!(e.to_string()))?;
+    // The global pool only serves loading; decoding runs in per-slot pools.
+    xor_net::init_threads(cfg.slots * cfg.threads_per_slot).map_err(|e| anyhow!(e.to_string()))?;
 
-    let quant = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, true);
-    let local = Path::new(&cfg.model).is_dir();
-    let model_dir = local.then(|| Path::new(&cfg.model));
-    let (model, mconfig) = if let Some(dir) = model_dir {
-        println!("Loading from local directory: {}", dir.display());
-        AutoModelForCausalLM::from_local(dir, quant)?
-    } else {
-        println!("Loading from HuggingFace: {}", cfg.model);
-        AutoModelForCausalLM::from_pretrained(&cfg.model, quant)?
-    };
+    let (generator, default_id) = load(&cfg)?;
     println!("Model loaded.");
-
-    let tokenizer = load_tokenizer(
-        model_dir,
-        (!local).then_some(cfg.model.as_str()),
-        &cfg.tokenizer_repo,
-    )?;
-    let id = model_id(&cfg, model_dir);
-    let engine = LlamaEngine::new(model, mconfig, tokenizer, model_dir, id);
+    let id = cfg.model_id.clone().unwrap_or(default_id);
+    let engine = GeneratorEngine::new(generator, cfg.slots, id);
     println!(
-        "Model id: {}, context: {}, EOS ids: {:?}",
+        "Model id: {}, context: {}, EOS ids: {:?}, chat template: {}",
         engine.model_id(),
         engine.context_length(),
-        engine.eos_ids()
+        engine.eos_ids(),
+        if engine.has_chat_template() {
+            "model"
+        } else {
+            "fallback (System:/User:/Assistant:)"
+        }
     );
     if engine.eos_ids().is_empty() {
         eprintln!(
@@ -130,8 +185,12 @@ fn main() -> anyhow::Result<()> {
     let app = Arc::new(App::new(Arc::new(engine), cfg));
     let workers = serve::spawn_workers(&app)?;
     println!(
-        "Server: {} worker slots, {} thread(s)/slot, listening on {}:{}",
-        app.cfg.slots, app.cfg.threads_per_slot, app.cfg.host, app.cfg.port
+        "Server: {} worker slots, {} thread(s)/slot, reasoning separation {}, listening on {}:{}",
+        app.cfg.slots,
+        app.cfg.threads_per_slot,
+        if app.reasoning { "on" } else { "off" },
+        app.cfg.host,
+        app.cfg.port
     );
 
     serve::serve(listener, Arc::clone(&app));

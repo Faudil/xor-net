@@ -19,7 +19,7 @@ pub use bit1_58::layers::TernaryLinear;
 pub use bit1_58::quantization::TernaryPackType;
 pub use generation::{
     ChatMessage, ChatTemplate, FinishReason, Generation, GenerationError, GenerationParams,
-    Generator, Timings, Usage,
+    Generator, ReasoningFormat, StreamEvent, Timings, Usage,
 };
 pub use loader::gguf::{BonsaiConfig, GgufFile, is_prism_dtype};
 pub use loader::{SafeTensorLoader, SafeTensorRepo};

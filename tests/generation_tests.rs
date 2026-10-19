@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
 use xor_net::generation::{
     ChatMessage, ChatTemplate, FinishReason, GenerationError, GenerationParams, Generator,
-    StreamDecoder,
+    ReasoningFormat, StreamDecoder, StreamEvent,
 };
 use xor_net::models::traits::{CausalLM, Logits, ModelState, downcast_state};
 use xor_net::sampler::SamplingParams;
@@ -621,4 +621,216 @@ fn from_dir_loads_template_and_eos_and_chats() {
         .apply_chat_template(&[ChatMessage::system("S"), ChatMessage::user("U")], true)
         .unwrap();
     assert_eq!(s, "<s>System: S\nUser: U\nAssistant:");
+}
+
+// ---------------------------------------------------------------------------
+// Chat template kwargs and reasoning separation
+// ---------------------------------------------------------------------------
+
+/// Qwen3.5-style template: thinking on unless `enable_thinking` is false.
+const THINKING_TEMPLATE: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}\
+{% if add_generation_prompt %}<|im_start|>assistant\n\
+{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}\
+{% endif %}";
+
+/// Byte-level tokenizer plus non-special `<think>` / `</think>` tokens and
+/// a special `<|im_end|>` (the EOS).
+fn thinking_tokenizer() -> (Tokenizer, u32, u32, u32) {
+    use tokenizers::AddedToken;
+    let mut tok = byte_level_tokenizer();
+    tok.add_tokens([
+        AddedToken::from("<think>", false),
+        AddedToken::from("</think>", false),
+    ])
+    .unwrap();
+    tok.add_special_tokens([AddedToken::from("<|im_end|>", true)])
+        .unwrap();
+    let id = |s: &str| tok.token_to_id(s).unwrap();
+    let (open, close, end) = (id("<think>"), id("</think>"), id("<|im_end|>"));
+    (tok, open, close, end)
+}
+
+fn bytes(s: &str) -> Vec<u32> {
+    s.bytes().map(u32::from).collect()
+}
+
+fn thinking_generator(script: Vec<u32>) -> Generator {
+    let (tok, ..) = thinking_tokenizer();
+    // Scripted output ends with id 1, the mock EOS.
+    let m = MockLM::scripted(tok.get_vocab_size(true), script);
+    Generator::new(Arc::new(m), tok)
+        .with_chat_template(ChatTemplate::new(THINKING_TEMPLATE, "", "<|im_end|>").unwrap())
+}
+
+/// Collect `(text deltas, reasoning deltas)` of a streaming chat.
+fn chat_events(
+    g: &mut Generator,
+    p: &GenerationParams,
+) -> (xor_net::Generation, Vec<String>, Vec<String>) {
+    let (mut text, mut reasoning) = (Vec::new(), Vec::new());
+    let out = g
+        .chat_stream_events(&[ChatMessage::user("2+2?")], p, |ev| {
+            match ev {
+                StreamEvent::Text(s) => text.push(s.to_owned()),
+                StreamEvent::Reasoning(s) => reasoning.push(s.to_owned()),
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    (out, text, reasoning)
+}
+
+#[test]
+fn chat_template_kwargs_enable_thinking() {
+    let g = thinking_generator(vec![]);
+    let msgs = [ChatMessage::user("hi")];
+    let on = g.apply_chat_template(&msgs, true).unwrap();
+    assert!(on.ends_with("<|im_start|>assistant\n<think>\n"), "{on:?}");
+    let p = GenerationParams::default().with_enable_thinking(false);
+    assert_eq!(
+        p.chat_template_kwargs["enable_thinking"],
+        serde_json::json!(false)
+    );
+    let off = g
+        .apply_chat_template_with_kwargs(&msgs, true, &p.chat_template_kwargs)
+        .unwrap();
+    assert!(
+        off.ends_with("assistant\n<think>\n\n</think>\n\n"),
+        "{off:?}"
+    );
+    // Arbitrary kwargs reach the template; fixed variables can't be overridden.
+    let t = ChatTemplate::new(
+        "{{ greeting }} {{ messages|length }} {{ add_generation_prompt }}",
+        "",
+        "",
+    )
+    .unwrap();
+    let kw = GenerationParams::default()
+        .with_chat_template_kwarg("greeting", "yo")
+        .with_chat_template_kwarg("add_generation_prompt", "hijack")
+        .chat_template_kwargs;
+    let s = t.render_with_kwargs(&msgs, true, &kw).unwrap();
+    assert!(s.starts_with("yo 1 ") && !s.contains("hijack"), "{s:?}");
+    let think = ChatTemplate::new(THINKING_TEMPLATE, "", "").unwrap();
+    assert!(!t.has_thinking() && think.has_thinking() && think.supports_enable_thinking());
+}
+
+#[test]
+fn reasoning_separated_when_prompt_opens_think() {
+    let (_, _, close, _) = thinking_tokenizer();
+    let mut script = bytes("Let me think.\nOK.\n");
+    script.push(close);
+    script.extend(bytes("\n\nThe answer is 4."));
+
+    // Separate: reasoning split off, no tags anywhere, streams consistent.
+    let mut g = thinking_generator(script.clone());
+    let p = greedy(100).with_reasoning_format(ReasoningFormat::Separate);
+    let (out, text, reasoning) = chat_events(&mut g, &p);
+    assert_eq!(out.finish_reason, FinishReason::Stop);
+    assert_eq!(out.text, "The answer is 4.");
+    assert_eq!(out.reasoning.as_deref(), Some("Let me think.\nOK."));
+    assert_eq!(text.concat(), out.text);
+    assert_eq!(reasoning.concat(), "Let me think.\nOK.");
+    assert!(
+        text.iter()
+            .chain(&reasoning)
+            .all(|d| !d.is_empty() && !d.contains("think>"))
+    );
+    assert!(
+        reasoning.len() > 3,
+        "reasoning streams incrementally: {reasoning:?}"
+    );
+
+    // The old text-only callback sees just the answer.
+    let mut g = thinking_generator(script.clone());
+    let mut seen = String::new();
+    let out = g
+        .chat_stream(&[ChatMessage::user("2+2?")], &p, |d| {
+            seen.push_str(d);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(seen, "The answer is 4.");
+    assert_eq!(out.text, seen);
+
+    // None: raw text including the closing tag, no reasoning.
+    let mut g = thinking_generator(script);
+    let (out, text, reasoning) = chat_events(&mut g, &greedy(100));
+    assert_eq!(out.text, "Let me think.\nOK.\n</think>\n\nThe answer is 4.");
+    assert_eq!(out.reasoning, None);
+    assert!(reasoning.is_empty());
+    assert_eq!(text.concat(), out.text);
+}
+
+#[test]
+fn reasoning_tags_split_across_byte_tokens() {
+    // The model spells the tags byte by byte (no dedicated tokens) and the
+    // prompt has thinking disabled (closed block).
+    let script = bytes("<think>\nhmm <b>\n</think>\n\nHi <thin");
+    let mut g = thinking_generator(script);
+    let p = greedy(100)
+        .with_reasoning_format(ReasoningFormat::Separate)
+        .with_enable_thinking(false);
+    let (out, text, reasoning) = chat_events(&mut g, &p);
+    assert_eq!(out.reasoning.as_deref(), Some("hmm <b>"));
+    // After the first block, tag-like text is ordinary text.
+    assert_eq!(out.text, "Hi <thin");
+    assert_eq!(text.concat(), out.text);
+    assert_eq!(reasoning.concat(), "hmm <b>");
+
+    // A partial open tag that never completes is released at the end.
+    let mut g = thinking_generator(bytes("a <thi"));
+    let (out, text, _) = chat_events(&mut g, &p);
+    assert_eq!(out.text, "a <thi");
+    assert_eq!(text, ["a", " ", "<thi"]);
+
+    // No think block at all: everything is text, reasoning None.
+    let mut g = thinking_generator(bytes("Plain answer."));
+    let (out, _, reasoning) = chat_events(&mut g, &p);
+    assert_eq!((out.text.as_str(), out.reasoning), ("Plain answer.", None));
+    assert!(reasoning.is_empty());
+}
+
+#[test]
+fn reasoning_with_stop_string_length_and_abort() {
+    let (_, _, close, _) = thinking_tokenizer();
+    let mut script = bytes("plan");
+    script.push(close);
+    script.extend(bytes("Answer. END tail"));
+    let p = greedy(100).with_reasoning_format(ReasoningFormat::Separate);
+
+    let mut g = thinking_generator(script.clone());
+    let (out, ..) = chat_events(&mut g, &p.clone().with_stop(["END"]));
+    assert_eq!(out.finish_reason, FinishReason::StopString);
+    assert_eq!(
+        (out.text.as_str(), out.reasoning.as_deref()),
+        ("Answer. ", Some("plan"))
+    );
+
+    // Length limit inside the reasoning: no text, reasoning so far.
+    let mut g = thinking_generator(script.clone());
+    let (out, text, _) = chat_events(&mut g, &p.clone().with_max_tokens(3));
+    assert_eq!(out.finish_reason, FinishReason::Length);
+    assert_eq!(
+        (out.text.as_str(), out.reasoning.as_deref()),
+        ("", Some("pla"))
+    );
+    assert!(text.is_empty());
+
+    // Abort from a reasoning event.
+    let mut g = thinking_generator(script);
+    let mut n = 0;
+    let out = g
+        .chat_stream_events(&[ChatMessage::user("x")], &p, |ev| {
+            assert!(matches!(ev, StreamEvent::Reasoning(_)));
+            n += 1;
+            if n == 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+    assert_eq!(out.finish_reason, FinishReason::Aborted);
+    assert_eq!(out.reasoning.as_deref(), Some("pl"));
 }

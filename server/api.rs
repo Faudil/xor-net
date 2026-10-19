@@ -81,6 +81,9 @@ pub struct ParsedRequest {
     pub stop: Vec<String>,
     pub stream: bool,
     pub include_usage: bool,
+    /// Extra chat template variables: vLLM-style `chat_template_kwargs`
+    /// plus a top-level `enable_thinking` (chat only).
+    pub chat_template_kwargs: Map<String, Value>,
 }
 
 pub const MAX_STOP_STRINGS: usize = 16;
@@ -203,7 +206,21 @@ fn parse_messages(o: &Map<String, Value>) -> Result<Vec<ChatMessage>, ApiError> 
             }
         };
         let content = parse_content(m.get("content").unwrap_or(&Value::Null), i)?;
-        out.push(ChatMessage { role, content });
+        let reasoning_content = match m.get("reasoning_content") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(r)) => Some(r.clone()),
+            Some(_) => {
+                return Err(ApiError::invalid(
+                    &format!("messages[{i}].reasoning_content"),
+                    "'reasoning_content' must be a string",
+                ));
+            }
+        };
+        out.push(ChatMessage {
+            role,
+            content,
+            reasoning_content,
+        });
     }
     Ok(out)
 }
@@ -398,6 +415,26 @@ pub fn parse_request(
         seed: seed.map(|s| s as u64).unwrap_or(0),
     };
 
+    let mut chat_template_kwargs = Map::new();
+    if api == Api::Chat {
+        match o.get("chat_template_kwargs") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(kw)) => chat_template_kwargs = kw.clone(),
+            Some(_) => {
+                return Err(ApiError::invalid(
+                    "chat_template_kwargs",
+                    "'chat_template_kwargs' must be an object",
+                ));
+            }
+        }
+        if let Some(on) = get_bool(o, "enable_thinking")? {
+            // An explicit chat_template_kwargs entry wins.
+            chat_template_kwargs
+                .entry("enable_thinking")
+                .or_insert(Value::Bool(on));
+        }
+    }
+
     Ok(ParsedRequest {
         prompt,
         max_tokens,
@@ -406,6 +443,7 @@ pub fn parse_request(
         stop: parse_stop(o)?,
         stream,
         include_usage,
+        chat_template_kwargs,
     })
 }
 
@@ -475,22 +513,56 @@ pub struct RespMeta<'a> {
     pub prompt_tokens: usize,
 }
 
-pub fn full_body(api: Api, m: &RespMeta, text: &str, res: &GenResult) -> Value {
-    let finish = finish_reason(res.finish);
-    match api {
-        Api::Chat => json!({
-            "id": m.id,
-            "object": "chat.completion",
-            "created": m.created,
-            "model": m.model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "logprobs": Value::Null,
-                "finish_reason": finish,
-            }],
-            "usage": usage(m.prompt_tokens, res.completion_tokens),
+/// llama.cpp-style `timings` object.
+fn timings(res: &GenResult) -> Value {
+    match &res.timings {
+        Some(t) => json!({
+            "prompt_n": t.prefill_tokens,
+            "prompt_ms": t.prefill_ms(),
+            "prompt_per_second": t.prefill_tok_per_s(),
+            "predicted_n": t.decode_tokens,
+            "predicted_ms": t.decode.as_secs_f64() * 1e3,
+            "predicted_per_second": t.decode_tok_per_s(),
         }),
+        None => Value::Null,
+    }
+}
+
+/// Non-streaming response body. `reasoning` is `Some` when reasoning
+/// separation is on (chat only): it becomes `message.reasoning_content`
+/// (`null` when the model produced none).
+pub fn full_body(
+    api: Api,
+    m: &RespMeta,
+    text: &str,
+    reasoning: Option<&str>,
+    res: &GenResult,
+) -> Value {
+    let finish = finish_reason(res.finish);
+    let mut v = match api {
+        Api::Chat => {
+            let mut msg = json!({"role": "assistant", "content": text});
+            if let Some(r) = reasoning {
+                msg["reasoning_content"] = if r.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(r.to_owned())
+                };
+            }
+            json!({
+                "id": m.id,
+                "object": "chat.completion",
+                "created": m.created,
+                "model": m.model,
+                "choices": [{
+                    "index": 0,
+                    "message": msg,
+                    "logprobs": Value::Null,
+                    "finish_reason": finish,
+                }],
+                "usage": usage(m.prompt_tokens, res.completion_tokens),
+            })
+        }
         Api::Completions => json!({
             "id": m.id,
             "object": "text_completion",
@@ -504,8 +576,12 @@ pub fn full_body(api: Api, m: &RespMeta, text: &str, res: &GenResult) -> Value {
             }],
             "usage": usage(m.prompt_tokens, res.completion_tokens),
         }),
-        Api::LlamaCpp => llama_final(m, text, res),
+        Api::LlamaCpp => return llama_final(m, text, res),
+    };
+    if res.timings.is_some() {
+        v["timings"] = timings(res);
     }
+    v
 }
 
 fn llama_final(m: &RespMeta, text: &str, res: &GenResult) -> Value {
@@ -515,7 +591,7 @@ fn llama_final(m: &RespMeta, text: &str, res: &GenResult) -> Value {
         FinishReason::Length => "limit",
         FinishReason::Cancelled => "none",
     };
-    json!({
+    let mut v = json!({
         "content": text,
         "stop": true,
         "model": m.model,
@@ -524,7 +600,27 @@ fn llama_final(m: &RespMeta, text: &str, res: &GenResult) -> Value {
         "stop_type": stop_type,
         "stopping_word": res.stop_word.clone().unwrap_or_default(),
         "truncated": false,
-    })
+    });
+    if res.timings.is_some() {
+        v["timings"] = timings(res);
+    }
+    v
+}
+
+/// Chat streaming chunk carrying a reasoning delta
+/// (`delta.reasoning_content`, DeepSeek / vLLM convention).
+pub fn reasoning_chunk(m: &RespMeta, delta: &str, include_usage: bool) -> Value {
+    let mut v = json!({
+        "id": m.id,
+        "object": "chat.completion.chunk",
+        "created": m.created,
+        "model": m.model,
+        "choices": [{"index": 0, "delta": {"reasoning_content": delta}, "logprobs": Value::Null, "finish_reason": Value::Null}],
+    });
+    if include_usage {
+        v["usage"] = Value::Null;
+    }
+    v
 }
 
 /// Streaming chunk carrying `delta`. `first` adds the assistant role for chat.
@@ -637,14 +733,8 @@ mod tests {
         assert_eq!(
             r.prompt,
             Prompt::Chat(vec![
-                ChatMessage {
-                    role: "system".into(),
-                    content: "s".into()
-                },
-                ChatMessage {
-                    role: "user".into(),
-                    content: "ab".into()
-                },
+                ChatMessage::new("system", "s"),
+                ChatMessage::new("user", "ab"),
             ])
         );
         let s = &r.sampling;
@@ -829,6 +919,95 @@ mod tests {
     }
 
     #[test]
+    fn chat_template_kwargs_and_enable_thinking() {
+        let r = chat(r#"{"messages":[{"role":"user","content":"x"}]}"#).unwrap();
+        assert!(r.chat_template_kwargs.is_empty());
+        let r = chat(
+            r#"{"messages":[{"role":"user","content":"x"}],"enable_thinking":false,
+            "chat_template_kwargs":{"foo":[1]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Value::Object(r.chat_template_kwargs),
+            json!({"foo":[1],"enable_thinking":false})
+        );
+        // chat_template_kwargs wins over the top-level flag.
+        let r = chat(
+            r#"{"messages":[{"role":"user","content":"x"}],"enable_thinking":false,
+            "chat_template_kwargs":{"enable_thinking":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(r.chat_template_kwargs["enable_thinking"], true);
+        assert_eq!(
+            err_param(chat(
+                r#"{"messages":[{"role":"user","content":"x"}],"chat_template_kwargs":[]}"#
+            ))
+            .as_deref(),
+            Some("chat_template_kwargs")
+        );
+        assert_eq!(
+            err_param(chat(
+                r#"{"messages":[{"role":"user","content":"x"}],"enable_thinking":"no"}"#
+            ))
+            .as_deref(),
+            Some("enable_thinking")
+        );
+        // History reasoning is passed through to the template.
+        let r =
+            chat(r#"{"messages":[{"role":"assistant","content":"4","reasoning_content":"2+2"}]}"#)
+                .unwrap();
+        let Prompt::Chat(m) = r.prompt else { panic!() };
+        assert_eq!(m[0].reasoning_content.as_deref(), Some("2+2"));
+        assert!(
+            chat(r#"{"messages":[{"role":"assistant","content":"4","reasoning_content":1}]}"#)
+                .is_err()
+        );
+        // Ignored on the completions API.
+        assert!(
+            cmpl(r#"{"prompt":"a","chat_template_kwargs":5}"#)
+                .unwrap()
+                .chat_template_kwargs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reasoning_in_bodies() {
+        let m = RespMeta {
+            id: "x",
+            created: 1,
+            model: "m",
+            prompt_tokens: 3,
+        };
+        let res = GenResult {
+            finish: FinishReason::Eos,
+            completion_tokens: 2,
+            stop_word: None,
+            timings: None,
+        };
+        let v = full_body(Api::Chat, &m, "4", Some("2+2"), &res);
+        assert_eq!(v["choices"][0]["message"]["reasoning_content"], "2+2");
+        assert_eq!(v["choices"][0]["message"]["content"], "4");
+        let v = full_body(Api::Chat, &m, "4", Some(""), &res);
+        assert!(v["choices"][0]["message"]["reasoning_content"].is_null());
+        assert!(
+            v["choices"][0]["message"]
+                .get("reasoning_content")
+                .is_some()
+        );
+        let v = full_body(Api::Chat, &m, "4", None, &res);
+        assert!(
+            v["choices"][0]["message"]
+                .get("reasoning_content")
+                .is_none()
+        );
+        assert!(v.get("timings").is_none());
+        let c = reasoning_chunk(&m, "hm", false);
+        assert_eq!(c["choices"][0]["delta"]["reasoning_content"], "hm");
+        assert!(c["choices"][0]["delta"].get("content").is_none());
+    }
+
+    #[test]
     fn error_body_shape() {
         let e = ApiError::invalid("top_p", "bad");
         assert_eq!(
@@ -849,6 +1028,7 @@ mod tests {
             finish: FinishReason::Length,
             completion_tokens: 2,
             stop_word: None,
+            timings: None,
         };
         let c = final_chunks(Api::Chat, &m, &res, true);
         assert_eq!(c.len(), 2);

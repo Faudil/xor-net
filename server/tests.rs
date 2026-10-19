@@ -564,3 +564,213 @@ fn connection_cap_returns_503() {
     let r = read_resp(&mut BufReader::new(connect(addr)));
     assert_eq!(r.status, 503);
 }
+
+fn thinking_engine(script: &str) -> MockEngine {
+    let mut e = MockEngine::new(script);
+    e.has_thinking = true;
+    e
+}
+
+const THINK_SCRIPT: &str = "<think>\nadd 2+2\n</think>\n\nIt is 4.";
+
+#[test]
+fn chat_reasoning_content_non_stream() {
+    let (addr, engine, app) = start(thinking_engine(THINK_SCRIPT), test_cfg());
+    assert!(app.reasoning, "auto: template has <think>");
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        r#"{"messages":[{"role":"user","content":"x"}],"enable_thinking":true,
+            "chat_template_kwargs":{"custom":1}}"#,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    let msg = &v["choices"][0]["message"];
+    assert_eq!(msg["content"], "It is 4.");
+    assert_eq!(msg["reasoning_content"], "add 2+2");
+    assert_eq!(v["usage"]["completion_tokens"], THINK_SCRIPT.len());
+    let kw = engine.last_kwargs.lock().unwrap().clone();
+    assert_eq!(
+        Value::Object(kw),
+        serde_json::json!({"custom":1,"enable_thinking":true})
+    );
+
+    // No reasoning produced: reasoning_content is null.
+    let (addr, _, _) = start(thinking_engine("plain"), test_cfg());
+    let v = post(
+        addr,
+        "/v1/chat/completions",
+        r#"{"messages":[{"role":"user","content":"x"}]}"#,
+    )
+    .json();
+    assert_eq!(v["choices"][0]["message"]["content"], "plain");
+    assert!(v["choices"][0]["message"]["reasoning_content"].is_null());
+
+    // Completions never split.
+    let (addr, _, _) = start(thinking_engine(THINK_SCRIPT), test_cfg());
+    let v = post(addr, "/v1/completions", r#"{"prompt":"x","max_tokens":60}"#).json();
+    assert_eq!(v["choices"][0]["text"], THINK_SCRIPT);
+}
+
+#[test]
+fn chat_reasoning_content_stream() {
+    let (addr, _, _) = start(thinking_engine(THINK_SCRIPT), test_cfg());
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        r#"{"messages":[{"role":"user","content":"x"}],"stream":true}"#,
+    );
+    let ev = sse_events(&r.body);
+    assert_eq!(ev.last().unwrap(), "[DONE]");
+    let (mut content, mut reasoning) = (String::new(), String::new());
+    for e in &ev[1..ev.len() - 2] {
+        let c: Value = serde_json::from_str(e).unwrap();
+        let d = &c["choices"][0]["delta"];
+        match (d.get("content"), d.get("reasoning_content")) {
+            (Some(t), None) => content.push_str(t.as_str().unwrap()),
+            (None, Some(t)) => reasoning.push_str(t.as_str().unwrap()),
+            _ => panic!("bad delta {d}"),
+        }
+    }
+    assert_eq!(
+        (content.as_str(), reasoning.as_str()),
+        ("It is 4.", "add 2+2")
+    );
+}
+
+#[test]
+fn reasoning_format_none_keeps_raw_text() {
+    let mut cfg = test_cfg();
+    cfg.reasoning_format = Some(xor_net::generation::ReasoningFormat::None);
+    let (addr, _, app) = start(thinking_engine(THINK_SCRIPT), cfg);
+    assert!(!app.reasoning);
+    let v = post(
+        addr,
+        "/v1/chat/completions",
+        r#"{"messages":[{"role":"user","content":"x"}]}"#,
+    )
+    .json();
+    assert_eq!(v["choices"][0]["message"]["content"], THINK_SCRIPT);
+    assert!(
+        v["choices"][0]["message"]
+            .get("reasoning_content")
+            .is_none()
+    );
+
+    // Forced on for a template without <think>.
+    let mut cfg = test_cfg();
+    cfg.reasoning_format = Some(xor_net::generation::ReasoningFormat::Separate);
+    let (_, _, app) = start(MockEngine::new("x"), cfg);
+    assert!(app.reasoning);
+    let (_, _, app) = start(MockEngine::new("x"), test_cfg());
+    assert!(!app.reasoning);
+}
+
+/// End-to-end over HTTP with a real Bonsai model. Run with
+/// `BONSAI_XQ1=models/bonsai/Bonsai-1.7B.xq1 cargo test --release --bin xor-net-server -- --ignored bonsai`
+/// (inside a memory cap: `systemd-run --user --scope -p MemoryMax=4G ...`).
+#[test]
+#[ignore]
+fn bonsai_e2e() {
+    use crate::engine::GeneratorEngine;
+    use xor_net::generation::{ChatTemplate, GenerationParams, ReasoningFormat};
+
+    let Ok(path) = std::env::var("BONSAI_XQ1") else {
+        eprintln!("BONSAI_XQ1 not set; skipping");
+        return;
+    };
+    let g = xor_net::AutoModelForCausalLM::generator_from_file(&path, None).unwrap();
+
+    // Reasoning separation on real tokens: the Bonsai 1.7B template always
+    // disables thinking, so use a Qwen3.5-style template that opens <think>
+    // in the prompt unless enable_thinking is false.
+    let qwen3 = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}\
+{% if add_generation_prompt %}<|im_start|>assistant\n\
+{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}";
+    let mut think = g
+        .fork()
+        .with_chat_template(ChatTemplate::new(qwen3, "", "<|im_end|>").unwrap());
+    let p = GenerationParams::default()
+        .with_max_tokens(400)
+        .with_sampling(xor_net::SamplingParams::greedy())
+        .with_reasoning_format(ReasoningFormat::Separate);
+    let msgs = [xor_net::ChatMessage::user("What is 17 + 25?")];
+    let raw = think
+        .chat(
+            &msgs,
+            &p.clone().with_reasoning_format(ReasoningFormat::None),
+        )
+        .unwrap();
+    let out = think.chat(&msgs, &p).unwrap();
+    eprintln!(
+        "raw: {:?}\nsplit: {:?} / {:?}",
+        raw.text, out.reasoning, out.text
+    );
+    // Bonsai-1.7B is a no-think model: it usually closes the block at once,
+    // but the tag must never reach the visible text.
+    let (r, t) = raw
+        .text
+        .split_once("</think>")
+        .expect("model closes <think>");
+    assert_eq!(out.reasoning.as_deref().unwrap_or(""), r.trim_matches('\n'));
+    assert_eq!(out.text, t.trim_start_matches('\n'));
+    let out = think
+        .chat(&msgs, &p.clone().with_enable_thinking(false))
+        .unwrap();
+    assert_eq!(out.reasoning, None, "{out:?}");
+    assert!(out.text.contains("42"), "{:?}", out.text);
+
+    let engine = GeneratorEngine::new(g, 2, "bonsai".into());
+    let mut cfg = test_cfg();
+    cfg.slots = 2;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Arc::new(App::new(Arc::new(engine), cfg));
+    assert!(app.reasoning, "the Bonsai template has <think>");
+    serve::spawn_workers(&app).unwrap();
+    let app2 = Arc::clone(&app);
+    std::thread::spawn(move || serve::serve(listener, app2));
+
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        r#"{"messages":[{"role":"user","content":"What is the capital of France? One word."}],"max_tokens":20,"temperature":0}"#,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(content.contains("Paris"), "{content:?}");
+    assert!(!content.contains("<think>") && !content.contains("<|im_end|>"));
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        r#"{"messages":[{"role":"user","content":"Say hi."}],"max_tokens":16,"stream":true,"enable_thinking":false}"#,
+    );
+    let ev = sse_events(&r.body);
+    assert_eq!(ev.last().unwrap(), "[DONE]");
+    assert!(ev.len() > 3);
+
+    let r = post(
+        addr,
+        "/v1/completions",
+        r#"{"prompt":"The capital of France is","max_tokens":4,"temperature":0}"#,
+    );
+    let v = r.json();
+    assert!(
+        v["choices"][0]["text"].as_str().unwrap().contains("Paris"),
+        "{v}"
+    );
+    assert_eq!(v["usage"]["completion_tokens"], 4);
+
+    // Token prompts are range-checked against the vocabulary.
+    let r = post(
+        addr,
+        "/v1/completions",
+        r#"{"prompt":[9707,11],"max_tokens":2}"#,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = post(addr, "/v1/completions", r#"{"prompt":[999999999]}"#);
+    assert_eq!(r.status, 400);
+}

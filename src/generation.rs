@@ -55,6 +55,47 @@ pub struct GenerationParams {
     pub add_special_tokens: bool,
     /// Prompts longer than this are prefilled in chunks of this size.
     pub prefill_chunk_size: usize,
+    /// Extra variables for the chat template render context (HF
+    /// `apply_chat_template(**kwargs)` / vLLM `chat_template_kwargs`), e.g.
+    /// `enable_thinking`. They never override `messages`,
+    /// `add_generation_prompt`, `bos_token` or `eos_token`.
+    pub chat_template_kwargs: serde_json::Map<String, serde_json::Value>,
+    /// How `<think>…</think>` blocks in the output are reported.
+    pub reasoning_format: ReasoningFormat,
+}
+
+/// How reasoning (`<think>…</think>`) in the model output is handled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningFormat {
+    /// Leave the tags and their content in [`Generation::text`].
+    #[default]
+    None,
+    /// Strip the tags; the content inside goes to [`Generation::reasoning`]
+    /// and is streamed as [`StreamEvent::Reasoning`]. A prompt that ends
+    /// inside an open `<think>` (e.g. the Qwen3.5 template with thinking on)
+    /// starts the output in reasoning mode.
+    Separate,
+}
+
+impl std::str::FromStr for ReasoningFormat {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "raw" | "off" => Ok(Self::None),
+            "separate" | "deepseek" | "on" => Ok(Self::Separate),
+            other => anyhow::bail!("unknown reasoning format {other:?} (none | separate)"),
+        }
+    }
+}
+
+/// One streamed piece of output, see [`Generator::generate_stream_events`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEvent<'a> {
+    /// Visible answer text.
+    Text(&'a str),
+    /// Text inside a `<think>` block (only with [`ReasoningFormat::Separate`]).
+    Reasoning(&'a str),
 }
 
 impl Default for GenerationParams {
@@ -67,6 +108,8 @@ impl Default for GenerationParams {
             ignore_eos: false,
             add_special_tokens: true,
             prefill_chunk_size: 512,
+            chat_template_kwargs: serde_json::Map::new(),
+            reasoning_format: ReasoningFormat::None,
         }
     }
 }
@@ -98,6 +141,27 @@ impl GenerationParams {
     }
     pub fn with_prefill_chunk_size(mut self, n: usize) -> Self {
         self.prefill_chunk_size = n;
+        self
+    }
+    /// Set one chat template variable (see [`Self::chat_template_kwargs`]).
+    pub fn with_chat_template_kwarg(
+        mut self,
+        key: &str,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.chat_template_kwargs
+            .insert(key.to_owned(), value.into());
+        self
+    }
+    /// Shorthand for `with_chat_template_kwarg("enable_thinking", on)`.
+    /// Only templates that read `enable_thinking` honour it (Bonsai 27B /
+    /// Qwen3.5 and upstream Qwen3 do; the Bonsai 1.7B/4B/8B templates
+    /// always emit an empty think block, i.e. thinking is always off).
+    pub fn with_enable_thinking(self, on: bool) -> Self {
+        self.with_chat_template_kwarg("enable_thinking", on)
+    }
+    pub fn with_reasoning_format(mut self, f: ReasoningFormat) -> Self {
+        self.reasoning_format = f;
         self
     }
 }
@@ -168,8 +232,15 @@ fn rate(n: usize, d: Duration) -> f64 {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Generation {
     /// Completion text only (never the prompt); identical to the
-    /// concatenation of all streamed deltas.
+    /// concatenation of all streamed text deltas. With
+    /// [`ReasoningFormat::Separate`] it excludes the reasoning.
     pub text: String,
+    /// Reasoning content (concatenation of the [`StreamEvent::Reasoning`]
+    /// deltas). `None` unless [`ReasoningFormat::Separate`] is used and the
+    /// model produced non-empty reasoning.
+    pub reasoning: Option<String>,
+    /// The stop string that ended generation ([`FinishReason::StopString`]).
+    pub stop_string: Option<String>,
     /// Completion token ids, excluding a terminating EOS / stop token.
     pub tokens: Vec<u32>,
     pub finish_reason: FinishReason,
@@ -336,14 +407,41 @@ impl ChatTemplate {
         messages: &[M],
         add_generation_prompt: bool,
     ) -> anyhow::Result<String> {
+        self.render_with_kwargs(messages, add_generation_prompt, &serde_json::Map::new())
+    }
+
+    /// Like [`render`](Self::render) with extra template variables (e.g.
+    /// `enable_thinking`, `tools`). The fixed variables win on a clash.
+    pub fn render_with_kwargs<M: Serialize>(
+        &self,
+        messages: &[M],
+        add_generation_prompt: bool,
+        kwargs: &serde_json::Map<String, serde_json::Value>,
+    ) -> anyhow::Result<String> {
         let tmpl = self.env.get_template("chat")?;
-        tmpl.render(minijinja::context! {
+        let fixed = minijinja::context! {
             messages => messages,
             add_generation_prompt => add_generation_prompt,
             bos_token => self.bos_token.as_str(),
             eos_token => self.eos_token.as_str(),
-        })
-        .map_err(|e| anyhow::anyhow!("chat template render failed: {e:#}"))
+        };
+        let ctx = if kwargs.is_empty() {
+            fixed
+        } else {
+            minijinja::context! { ..fixed, ..minijinja::Value::from_serialize(kwargs) }
+        };
+        tmpl.render(ctx)
+            .map_err(|e| anyhow::anyhow!("chat template render failed: {e:#}"))
+    }
+
+    /// The template knows about `<think>` blocks (reasoning models).
+    pub fn has_thinking(&self) -> bool {
+        self.source.contains("<think>")
+    }
+
+    /// The template reads an `enable_thinking` variable.
+    pub fn supports_enable_thinking(&self) -> bool {
+        self.source.contains("enable_thinking")
     }
 }
 
@@ -481,6 +579,7 @@ fn diff_suffix<'a>(prefix: &str, full: &'a str) -> &'a str {
 pub struct StopMatcher {
     stops: Vec<String>,
     pending: String,
+    matched: Option<usize>,
 }
 
 impl StopMatcher {
@@ -488,6 +587,7 @@ impl StopMatcher {
         Self {
             stops: stops.iter().filter(|s| !s.is_empty()).cloned().collect(),
             pending: String::new(),
+            matched: None,
         }
     }
 
@@ -502,9 +602,11 @@ impl StopMatcher {
         let hit = self
             .stops
             .iter()
-            .filter_map(|s| self.pending.find(s.as_str()))
+            .enumerate()
+            .filter_map(|(i, s)| self.pending.find(s.as_str()).map(|at| (at, i)))
             .min();
-        if let Some(at) = hit {
+        if let Some((at, i)) = hit {
+            self.matched = Some(i);
             let out = self.pending[..at].to_owned();
             self.pending.clear();
             return (out, true);
@@ -528,6 +630,198 @@ impl StopMatcher {
     /// Release held-back text (generation ended for another reason).
     pub fn flush(&mut self) -> String {
         std::mem::take(&mut self.pending)
+    }
+
+    /// The stop string that matched, if any.
+    pub fn matched(&self) -> Option<&str> {
+        self.matched.map(|i| self.stops[i].as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning splitter
+// ---------------------------------------------------------------------------
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Splits streamed text into visible text and the content of the first
+/// `<think>…</think>` block, holding back tags split across deltas. Newlines
+/// right after a tag and right before `</think>` are dropped (Qwen3 /
+/// DeepSeek-R1 put `\n` / `\n\n` around the reasoning). A redundant `<think>`
+/// at the very start of a block the prompt already opened is dropped. Tags
+/// after the first block are left in the text.
+#[derive(Debug, Clone)]
+pub struct ReasoningSplitter {
+    in_reasoning: bool,
+    done: bool,
+    strip_leading: bool,
+    /// In reasoning, nothing emitted yet: a leading `<think>` is redundant.
+    at_block_start: bool,
+    pending: String,
+}
+
+impl ReasoningSplitter {
+    /// `start_in_reasoning`: the prompt ended inside an open `<think>`.
+    pub fn new(start_in_reasoning: bool) -> Self {
+        Self {
+            in_reasoning: start_in_reasoning,
+            done: false,
+            strip_leading: start_in_reasoning,
+            at_block_start: start_in_reasoning,
+            pending: String::new(),
+        }
+    }
+
+    /// Whether `prompt` ends inside an unclosed `<think>` block.
+    pub fn prompt_opens_reasoning(prompt: &str) -> bool {
+        match (prompt.rfind(THINK_OPEN), prompt.rfind(THINK_CLOSE)) {
+            (Some(o), Some(c)) => o > c,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    pub fn in_reasoning(&self) -> bool {
+        self.in_reasoning
+    }
+
+    /// Feed text; appends `(is_reasoning, piece)` pairs (non-empty) to `out`.
+    pub fn push(&mut self, text: &str, out: &mut Vec<(bool, String)>) {
+        if self.done && self.pending.is_empty() && !self.strip_leading {
+            if !text.is_empty() {
+                out.push((false, text.to_owned()));
+            }
+            return;
+        }
+        self.pending.push_str(text);
+        loop {
+            if self.strip_leading {
+                let n = self.pending.len() - self.pending.trim_start_matches('\n').len();
+                self.pending.drain(..n);
+                if self.pending.is_empty() {
+                    return;
+                }
+                self.strip_leading = false;
+            }
+            if self.done {
+                out.push((false, std::mem::take(&mut self.pending)));
+                return;
+            }
+            if self.at_block_start {
+                if self.pending.starts_with(THINK_OPEN) {
+                    self.pending.drain(..THINK_OPEN.len());
+                    self.at_block_start = false;
+                    self.strip_leading = true;
+                    continue;
+                }
+                if THINK_OPEN.starts_with(self.pending.as_str()) {
+                    return; // could still become a redundant `<think>`
+                }
+                self.at_block_start = false;
+            }
+            let tag = if self.in_reasoning {
+                THINK_CLOSE
+            } else {
+                THINK_OPEN
+            };
+            if let Some(i) = self.pending.find(tag) {
+                let mut before = &self.pending[..i];
+                if self.in_reasoning {
+                    before = before.trim_end_matches('\n');
+                }
+                if !before.is_empty() {
+                    out.push((self.in_reasoning, before.to_owned()));
+                }
+                self.pending.drain(..i + tag.len());
+                if self.in_reasoning {
+                    self.done = true;
+                }
+                self.in_reasoning = !self.in_reasoning;
+                self.strip_leading = true;
+                self.at_block_start = false;
+                continue;
+            }
+            // Hold back a possible tag prefix (and, in reasoning, the
+            // newlines before it).
+            let mut hold = (1..tag.len().min(self.pending.len() + 1))
+                .rev()
+                .find(|&k| self.pending.ends_with(&tag[..k]))
+                .unwrap_or(0);
+            if self.in_reasoning {
+                let rest = &self.pending[..self.pending.len() - hold];
+                hold += rest.len() - rest.trim_end_matches('\n').len();
+            }
+            let cut = self.pending.len() - hold;
+            if cut > 0 {
+                let piece: String = self.pending.drain(..cut).collect();
+                out.push((self.in_reasoning, piece));
+            }
+            return;
+        }
+    }
+
+    /// End of output: release held-back text (a partial tag stays text of
+    /// the current kind; trailing reasoning newlines are dropped).
+    pub fn flush(&mut self, out: &mut Vec<(bool, String)>) {
+        let mut rest = std::mem::take(&mut self.pending);
+        if self.in_reasoning {
+            rest.truncate(rest.trim_end_matches('\n').len());
+        }
+        if !rest.is_empty() {
+            out.push((self.in_reasoning, rest));
+        }
+    }
+}
+
+/// Accumulates output and forwards it to the stream callback, splitting
+/// reasoning off when requested.
+struct OutputSink<'a> {
+    splitter: Option<ReasoningSplitter>,
+    text: String,
+    reasoning: String,
+    buf: Vec<(bool, String)>,
+    on_event: &'a mut dyn FnMut(StreamEvent<'_>) -> ControlFlow<()>,
+}
+
+impl OutputSink<'_> {
+    fn dispatch(&mut self) -> ControlFlow<()> {
+        let mut flow = ControlFlow::Continue(());
+        for (reasoning, piece) in self.buf.drain(..) {
+            if piece.is_empty() {
+                continue;
+            }
+            let ev = if reasoning {
+                self.reasoning.push_str(&piece);
+                StreamEvent::Reasoning(&piece)
+            } else {
+                self.text.push_str(&piece);
+                StreamEvent::Text(&piece)
+            };
+            // Keep accounting for the rest of the batch even after a Break.
+            if flow.is_continue() {
+                flow = (self.on_event)(ev);
+            }
+        }
+        flow
+    }
+
+    fn push(&mut self, s: &str) -> ControlFlow<()> {
+        if s.is_empty() {
+            return ControlFlow::Continue(());
+        }
+        match &mut self.splitter {
+            Some(sp) => sp.push(s, &mut self.buf),
+            None => self.buf.push((false, s.to_owned())),
+        }
+        self.dispatch()
+    }
+
+    fn finish(&mut self) {
+        if let Some(sp) = &mut self.splitter {
+            sp.flush(&mut self.buf);
+            let _ = self.dispatch();
+        }
     }
 }
 
@@ -575,6 +869,18 @@ impl Generator {
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| {
             anyhow::anyhow!("loading {}: {e}", dir.join("tokenizer.json").display())
         })?;
+        Self::from_dir_with_tokenizer(model, dir, tokenizer)
+    }
+
+    /// Like [`from_dir`](Self::from_dir) with an explicit tokenizer (the
+    /// directory need not contain `tokenizer.json`); the chat template and
+    /// EOS ids still come from the directory's config files when present.
+    pub fn from_dir_with_tokenizer(
+        model: Arc<dyn CausalLM>,
+        dir: impl AsRef<Path>,
+        tokenizer: impl Into<Arc<Tokenizer>>,
+    ) -> anyhow::Result<Self> {
+        let dir = dir.as_ref();
         let mut g = Self::new(model, tokenizer);
 
         let read_json = |name: &str| -> anyhow::Result<Option<serde_json::Value>> {
@@ -713,10 +1019,25 @@ impl Generator {
         messages: &[M],
         add_generation_prompt: bool,
     ) -> anyhow::Result<String> {
+        self.apply_chat_template_with_kwargs(
+            messages,
+            add_generation_prompt,
+            &serde_json::Map::new(),
+        )
+    }
+
+    /// [`apply_chat_template`](Self::apply_chat_template) with extra
+    /// template variables (e.g. `enable_thinking`).
+    pub fn apply_chat_template_with_kwargs<M: Serialize>(
+        &self,
+        messages: &[M],
+        add_generation_prompt: bool,
+        kwargs: &serde_json::Map<String, serde_json::Value>,
+    ) -> anyhow::Result<String> {
         match &self.chat_template {
-            Some(t) => t.render(messages, add_generation_prompt),
+            Some(t) => t.render_with_kwargs(messages, add_generation_prompt, kwargs),
             None => ChatTemplate::fallback(self.default_bos_str(), self.default_eos_str())
-                .render(messages, add_generation_prompt),
+                .render_with_kwargs(messages, add_generation_prompt, kwargs),
         }
     }
 
@@ -730,16 +1051,30 @@ impl Generator {
     }
 
     /// Like [`generate`](Self::generate), calling `on_text` with each new
-    /// piece of text. Returning `ControlFlow::Break(())` stops generation
-    /// (finish reason [`FinishReason::Aborted`]).
+    /// piece of visible text (reasoning deltas are not passed; see
+    /// [`generate_stream_events`](Self::generate_stream_events)). Returning
+    /// `ControlFlow::Break(())` stops generation (finish reason
+    /// [`FinishReason::Aborted`]).
     pub fn generate_stream(
         &mut self,
         prompt: &str,
         params: &GenerationParams,
         on_text: impl FnMut(&str) -> ControlFlow<()>,
     ) -> anyhow::Result<Generation> {
+        self.generate_stream_events(prompt, params, text_only(on_text))
+    }
+
+    /// Like [`generate_stream`](Self::generate_stream), reporting text and
+    /// reasoning deltas separately.
+    pub fn generate_stream_events(
+        &mut self,
+        prompt: &str,
+        params: &GenerationParams,
+        on_event: impl FnMut(StreamEvent<'_>) -> ControlFlow<()>,
+    ) -> anyhow::Result<Generation> {
         let ids = self.encode(prompt, params.add_special_tokens)?;
-        self.generate_from_tokens(&ids, params, on_text)
+        let starts_in_reasoning = ReasoningSplitter::prompt_opens_reasoning(prompt);
+        self.generate_impl(&ids, params, starts_in_reasoning, on_event)
     }
 
     /// Chat completion: renders `messages` with `add_generation_prompt`
@@ -752,23 +1087,64 @@ impl Generator {
         self.chat_stream(messages, params, |_| ControlFlow::Continue(()))
     }
 
+    /// Streaming [`chat`](Self::chat); `on_text` sees visible text only.
     pub fn chat_stream<M: Serialize>(
         &mut self,
         messages: &[M],
         params: &GenerationParams,
         on_text: impl FnMut(&str) -> ControlFlow<()>,
     ) -> anyhow::Result<Generation> {
-        let prompt = self.apply_chat_template(messages, true)?;
-        let ids = self.encode(&prompt, false)?;
-        self.generate_from_tokens(&ids, params, on_text)
+        self.chat_stream_events(messages, params, text_only(on_text))
     }
 
-    /// Core decode loop on an already tokenised prompt.
+    /// Streaming [`chat`](Self::chat) with text and reasoning events. The
+    /// template is rendered with `params.chat_template_kwargs`.
+    pub fn chat_stream_events<M: Serialize>(
+        &mut self,
+        messages: &[M],
+        params: &GenerationParams,
+        on_event: impl FnMut(StreamEvent<'_>) -> ControlFlow<()>,
+    ) -> anyhow::Result<Generation> {
+        let prompt =
+            self.apply_chat_template_with_kwargs(messages, true, &params.chat_template_kwargs)?;
+        let ids = self.encode(&prompt, false)?;
+        let starts_in_reasoning = ReasoningSplitter::prompt_opens_reasoning(&prompt);
+        self.generate_impl(&ids, params, starts_in_reasoning, on_event)
+    }
+
+    /// Core decode loop on an already tokenised prompt (`on_text` sees
+    /// visible text only).
     pub fn generate_from_tokens(
         &mut self,
         prompt: &[u32],
         params: &GenerationParams,
-        mut on_text: impl FnMut(&str) -> ControlFlow<()>,
+        on_text: impl FnMut(&str) -> ControlFlow<()>,
+    ) -> anyhow::Result<Generation> {
+        self.generate_from_tokens_events(prompt, params, text_only(on_text))
+    }
+
+    /// [`generate_from_tokens`](Self::generate_from_tokens) with text and
+    /// reasoning events. Whether the output starts inside a `<think>`
+    /// block is detected from the last 64 prompt tokens.
+    pub fn generate_from_tokens_events(
+        &mut self,
+        prompt: &[u32],
+        params: &GenerationParams,
+        on_event: impl FnMut(StreamEvent<'_>) -> ControlFlow<()>,
+    ) -> anyhow::Result<Generation> {
+        let starts_in_reasoning = params.reasoning_format == ReasoningFormat::Separate && {
+            let tail = &prompt[prompt.len().saturating_sub(64)..];
+            ReasoningSplitter::prompt_opens_reasoning(&self.decode(tail, false)?)
+        };
+        self.generate_impl(prompt, params, starts_in_reasoning, on_event)
+    }
+
+    fn generate_impl(
+        &mut self,
+        prompt: &[u32],
+        params: &GenerationParams,
+        starts_in_reasoning: bool,
+        mut on_event: impl FnMut(StreamEvent<'_>) -> ControlFlow<()>,
     ) -> anyhow::Result<Generation> {
         // --- validation ------------------------------------------------------
         let bos_only;
@@ -801,6 +1177,8 @@ impl Generator {
         if params.max_tokens == 0 {
             return Ok(Generation {
                 text: String::new(),
+                reasoning: None,
+                stop_string: None,
                 tokens: Vec::new(),
                 finish_reason: FinishReason::Length,
                 usage: Usage {
@@ -832,6 +1210,14 @@ impl Generator {
         }
         usage.cached_prompt_tokens = fed.len();
 
+        let mut sink = OutputSink {
+            splitter: (params.reasoning_format == ReasoningFormat::Separate)
+                .then(|| ReasoningSplitter::new(starts_in_reasoning)),
+            text: String::new(),
+            reasoning: String::new(),
+            buf: Vec::new(),
+            on_event: &mut on_event,
+        };
         let result = self.run(
             prompt,
             params,
@@ -840,16 +1226,18 @@ impl Generator {
             &mut usage,
             &mut timings,
             vocab,
-            &mut on_text,
+            &mut sink,
         );
         // The state is valid for `fed` only if every forward succeeded.
         self.state = Some(state);
         match result {
-            Ok((text, tokens, finish_reason)) => {
+            Ok((tokens, finish_reason, stop_string)) => {
                 self.fed = fed;
                 usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
                 Ok(Generation {
-                    text,
+                    text: sink.text,
+                    reasoning: (!sink.reasoning.is_empty()).then_some(sink.reasoning),
+                    stop_string,
                     tokens,
                     finish_reason,
                     usage,
@@ -870,8 +1258,8 @@ impl Generator {
         usage: &mut Usage,
         timings: &mut Timings,
         vocab: usize,
-        on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
-    ) -> anyhow::Result<(String, Vec<u32>, FinishReason)> {
+        sink: &mut OutputSink<'_>,
+    ) -> anyhow::Result<(Vec<u32>, FinishReason, Option<String>)> {
         let model = self.model.clone();
         let check = |l: &Vec<f32>| -> anyhow::Result<()> {
             anyhow::ensure!(
@@ -899,17 +1287,9 @@ impl Generator {
         self.sampler.set_params(params.sampling.clone());
         let mut detok = StreamDecoder::new(prompt, true);
         let mut stops = StopMatcher::new(&params.stop);
-        let mut text = String::new();
         let mut out: Vec<u32> = Vec::with_capacity(params.max_tokens);
         let is_stop_id = |t: u32| {
             params.stop_token_ids.contains(&t) || (!params.ignore_eos && self.eos_ids.contains(&t))
-        };
-        let mut emit = |s: &str, text: &mut String| -> ControlFlow<()> {
-            if s.is_empty() {
-                return ControlFlow::Continue(());
-            }
-            text.push_str(s);
-            on_text(s)
         };
 
         let finish = loop {
@@ -921,7 +1301,7 @@ impl Generator {
             out.push(tok);
             if let Some(delta) = detok.push(&self.tokenizer, tok)? {
                 let (safe, hit) = stops.push(&delta);
-                if emit(&safe, &mut text).is_break() {
+                if sink.push(&safe).is_break() {
                     break FinishReason::Aborted;
                 }
                 if hit {
@@ -940,19 +1320,33 @@ impl Generator {
             // Release text held back by the detokenizer / stop matcher.
             if let Some(rest) = detok.flush(&self.tokenizer)? {
                 let (safe, hit) = stops.push(&rest);
-                let _ = emit(&safe, &mut text);
+                let _ = sink.push(&safe);
                 if hit {
+                    sink.finish();
                     timings.decode = t1.elapsed();
                     timings.decode_tokens = usage.completion_tokens;
-                    return Ok((text, out, FinishReason::StopString));
+                    let stop = stops.matched().map(str::to_owned);
+                    return Ok((out, FinishReason::StopString, stop));
                 }
             }
             let rest = stops.flush();
-            let _ = emit(&rest, &mut text);
+            let _ = sink.push(&rest);
+        }
+        if finish != FinishReason::Aborted {
+            sink.finish();
         }
         timings.decode = t1.elapsed();
         timings.decode_tokens = usage.completion_tokens;
-        Ok((text, out, finish))
+        Ok((out, finish, stops.matched().map(str::to_owned)))
+    }
+}
+
+fn text_only(
+    mut on_text: impl FnMut(&str) -> ControlFlow<()>,
+) -> impl FnMut(StreamEvent<'_>) -> ControlFlow<()> {
+    move |ev| match ev {
+        StreamEvent::Text(s) => on_text(s),
+        StreamEvent::Reasoning(_) => ControlFlow::Continue(()),
     }
 }
 
@@ -979,6 +1373,67 @@ mod tests {
         assert_eq!(m.push("caf"), ("caf".to_string(), false));
         assert_eq!(m.push("é"), (String::new(), false));
         assert_eq!(m.push("!"), (String::new(), true));
+    }
+
+    fn split_all(start: bool, pieces: &[&str]) -> (String, String) {
+        let mut sp = ReasoningSplitter::new(start);
+        let mut out = Vec::new();
+        for p in pieces {
+            sp.push(p, &mut out);
+        }
+        sp.flush(&mut out);
+        let mut t = String::new();
+        let mut r = String::new();
+        for (is_r, s) in out {
+            assert!(!s.is_empty());
+            if is_r { r.push_str(&s) } else { t.push_str(&s) }
+        }
+        (t, r)
+    }
+
+    #[test]
+    fn reasoning_splitter_any_chunking() {
+        let cases: &[(bool, &str, &str, &str)] = &[
+            (
+                false,
+                "<think>\nabc\n\n</think>\n\nanswer\n",
+                "answer\n",
+                "abc",
+            ),
+            (
+                true,
+                "\nx<y\n</think>\n\nz </think> <think>",
+                "z </think> <think>",
+                "x<y",
+            ),
+            (false, "no tags <thin", "no tags <thin", ""),
+            (true, "unterminated\n\n", "", "unterminated"),
+            (false, "pre<think>a\nb</think>", "pre", "a\nb"),
+            (false, "é<think>ü</think>ß", "éß", "ü"),
+            // The prompt opened the block and the model repeats the tag.
+            (true, "<think>\n</think>\n\nok", "ok", ""),
+            (true, "\n<think>\nr</think>t", "t", "r"),
+            (true, "<thin", "", "<thin"),
+            (true, "a<think>b</think>", "", "a<think>b"),
+        ];
+        for &(start, input, text, reasoning) in cases {
+            let whole = split_all(start, &[input]);
+            assert_eq!(
+                whole,
+                (text.to_string(), reasoning.to_string()),
+                "{input:?}"
+            );
+            let chars: Vec<String> = input.chars().map(String::from).collect();
+            let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+            assert_eq!(split_all(start, &refs), whole, "char-by-char {input:?}");
+        }
+        assert!(ReasoningSplitter::prompt_opens_reasoning(
+            "a</think>b<think>\n"
+        ));
+        assert!(!ReasoningSplitter::prompt_opens_reasoning(
+            "<think>\n\n</think>\n\n"
+        ));
+        assert!(!ReasoningSplitter::prompt_opens_reasoning("plain"));
     }
 
     #[test]
