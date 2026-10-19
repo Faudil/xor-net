@@ -9,6 +9,9 @@ use crate::bit1_58::quantization::{pack_1_58bit_4pack, pack_1_58bit_5pack, unpac
 pub mod sparse_loader;
 pub use sparse_loader::SparseFile;
 
+pub mod gguf;
+pub use gguf::{GgufFile, GgufMetadata, GgufTensorInfo, BonsaiConfig, dequantize_data};
+
 fn convert_to_f32_vec(bytes: &[u8], dtype: Dtype) -> anyhow::Result<Vec<f32>> {
     match dtype {
         Dtype::F32 => {

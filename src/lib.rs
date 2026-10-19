@@ -20,6 +20,9 @@ pub use bit1_58::quantization::TernaryPackType;
 pub use models::auto::AutoModelForCausalLM;
 pub use nn::{QuantizationConfig, DynamicLinear};
 pub use models::llama::{Cache, Config, Llama, LlamaConfig, Activation};
+pub use models::bonsai::{BonsaiModel, BonsaiCache};
+pub use models::bonsai_qwen35::{BonsaiQwen35Model, BonsaiQwen35Cache, BonsaiQwen35Config};
+pub use loader::gguf::{BonsaiConfig, GgufFile, is_prism_dtype};
 pub use sampler::Sampler;
 
 pub fn init_threads(num_threads: usize) -> Result<(), Box<dyn std::error::Error>> {
