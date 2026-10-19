@@ -9,6 +9,7 @@ pub mod nn;
 pub mod sampler;
 pub mod tensor;
 pub mod util;
+pub mod vision;
 
 #[cfg(feature = "python")]
 pub mod python;

@@ -86,6 +86,14 @@ path = "examples/bench_runner.rs"
 name = "test_prompt"
 path = "examples/test_prompt.rs"
 
+[[example]]
+name = "classify"
+path = "examples/classify.rs"
+
+[[example]]
+name = "classify_kernels"
+path = "examples/classify_kernels.rs"
+
 [[bench]]
 name = "bench_simd"
 harness = false
@@ -120,6 +128,8 @@ pyo3 ={ version = "0.23", features = ["extension-module", "abi3-py310", "generat
 [dev-dependencies]
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
+# Image decoding for the `classify` example only; the library takes raw RGB.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 # jemalloc is only used as the global allocator by some examples; the library
 # never installs it. Keeping it out of [dependencies] spares downstream crates
