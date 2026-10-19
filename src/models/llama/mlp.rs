@@ -1,11 +1,11 @@
 //! SwiGLU/ReLU² feed-forward MLP. Selects a fused ternary fast path at runtime
 //! (see `forward` for the dispatch logic) to avoid extra quantize/allocate work.
 
-use crate::tensor::FastTensor;
-use crate::nn::{DynamicLinear, FastRmsNorm};
-use crate::nn::dynamic_linear::LinearKind;
 use crate::loader::{SafeTensorLoader, sparse_loader::SparseFile};
 use crate::models::llama::{Activation, Config, TIME_MLP_DOWN};
+use crate::nn::dynamic_linear::LinearKind;
+use crate::nn::{DynamicLinear, FastRmsNorm};
+use crate::tensor::FastTensor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Issue a non-temporal prefetch for the leading cache line of a projection's
@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn prefetch_proj(lin: &DynamicLinear) {
     if let LinearKind::Ternary(t) = &lin.inner {
         if let Some(ptr) = t.prefetch_ptr() {
-            unsafe { crate::models::llama::prefetch_weight(ptr); }
+            unsafe {
+                crate::models::llama::prefetch_weight(ptr);
+            }
         }
     }
 }
@@ -54,8 +56,10 @@ impl Mlp {
                 (&self.c_fc1.inner, &self.c_fc2.inner)
             {
                 let in_row = &x.data[0..gate_lin.in_dim];
-                let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(gate_lin.in_dim);
-                let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
+                let mut quantized_in =
+                    crate::tensor::workspace::get_pooled_buffer_i8(gate_lin.in_dim);
+                let inv_scale =
+                    crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
                 let use_silu = matches!(self.hidden_act, Activation::Silu);
 
                 if let LinearKind::Ternary(down_lin) = &self.c_proj.inner {
@@ -98,8 +102,10 @@ impl Mlp {
         let (h1, h2) = match (&self.c_fc1.inner, &self.c_fc2.inner) {
             (LinearKind::Ternary(fc1_lin), LinearKind::Ternary(fc2_lin)) if b_size == 1 => {
                 let in_row = &x.data[0..fc1_lin.in_dim];
-                let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(fc1_lin.in_dim);
-                let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
+                let mut quantized_in =
+                    crate::tensor::workspace::get_pooled_buffer_i8(fc1_lin.in_dim);
+                let inv_scale =
+                    crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
                 let res = crate::bit1_58::layers::TernaryLinear::fused_forward_mlp(
                     x,
                     &quantized_in,
@@ -144,19 +150,49 @@ impl Mlp {
         proj_bytes(&self.c_fc1) + proj_bytes(&self.c_fc2) + proj_bytes(&self.c_proj)
     }
 
-    pub(crate) fn load(loader: SafeTensorLoader, cfg: &Config, sparse: Option<&SparseFile>) -> anyhow::Result<Self> {
+    pub(crate) fn load(
+        loader: SafeTensorLoader,
+        cfg: &Config,
+        sparse: Option<&SparseFile>,
+    ) -> anyhow::Result<Self> {
         let h_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
-        let c_fc1 =
-            DynamicLinear::load(h_size, i_size, &loader.pp("gate_proj"), "weight", cfg.quantization_config, sparse)?;
-        let c_fc2 =
-            DynamicLinear::load(h_size, i_size, &loader.pp("up_proj"), "weight", cfg.quantization_config, sparse)?;
-        let c_proj =
-            DynamicLinear::load(i_size, h_size, &loader.pp("down_proj"), "weight", cfg.quantization_config, sparse)?;
+        let c_fc1 = DynamicLinear::load(
+            h_size,
+            i_size,
+            &loader.pp("gate_proj"),
+            "weight",
+            cfg.quantization_config,
+            sparse,
+        )?;
+        let c_fc2 = DynamicLinear::load(
+            h_size,
+            i_size,
+            &loader.pp("up_proj"),
+            "weight",
+            cfg.quantization_config,
+            sparse,
+        )?;
+        let c_proj = DynamicLinear::load(
+            i_size,
+            h_size,
+            &loader.pp("down_proj"),
+            "weight",
+            cfg.quantization_config,
+            sparse,
+        )?;
         let ffn_layernorm = if loader.pp("ffn_layernorm").has_tensor("weight") {
-            Some(FastRmsNorm::load(i_size, cfg.rms_norm_eps as f32, &loader.pp("ffn_layernorm"))?)
+            Some(FastRmsNorm::load(
+                i_size,
+                cfg.rms_norm_eps as f32,
+                &loader.pp("ffn_layernorm"),
+            )?)
         } else if loader.pp("ffn_sub_norm").has_tensor("weight") {
-            Some(FastRmsNorm::load(i_size, cfg.rms_norm_eps as f32, &loader.pp("ffn_sub_norm"))?)
+            Some(FastRmsNorm::load(
+                i_size,
+                cfg.rms_norm_eps as f32,
+                &loader.pp("ffn_sub_norm"),
+            )?)
         } else {
             None
         };
@@ -185,7 +221,11 @@ impl Mlp {
             super::linear_kind_tag(&self.c_fc1.inner),
             super::linear_kind_tag(&self.c_fc2.inner),
             super::linear_kind_tag(&self.c_proj.inner),
-            if self.ffn_layernorm.is_some() { "Some" } else { "None" },
+            if self.ffn_layernorm.is_some() {
+                "Some"
+            } else {
+                "None"
+            },
         );
     }
 }

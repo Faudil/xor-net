@@ -1,13 +1,14 @@
-use xor_net::{AutoModelForCausalLM, QuantizationConfig, Cache, Config};
+use std::time::Instant;
 use xor_net::bit1_58::quantization::TernaryPackType;
 use xor_net::nn::LmHeadConfig;
-use std::time::Instant;
+use xor_net::{AutoModelForCausalLM, Cache, Config, QuantizationConfig};
 
 fn main() {
     let (model, config) = AutoModelForCausalLM::from_pretrained(
-        "1bitLLM/bitnet_b1_58-3B", 
-        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8, true)
-    ).unwrap();
+        "1bitLLM/bitnet_b1_58-3B",
+        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int8, true),
+    )
+    .unwrap();
 
     let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 

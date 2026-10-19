@@ -22,9 +22,9 @@
 //!   XORNET_SLOTS          worker slots   (default = logical/2)
 //!   XORNET_THREADS_PER_SLOT  rayon threads per slot (default 1 -> 110 tok/s)
 
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::net::{TcpListener, TcpStream};
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -32,16 +32,14 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokenizers::Tokenizer;
 
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::Api};
 use xor_net::models::llama::{Cache, Config, Llama};
 use xor_net::nn::LmHeadConfig;
 use xor_net::sampler::Sampler;
-use xor_net::{
-    AutoModelForCausalLM, QuantizationConfig, TernaryPackType,
-};
+use xor_net::{AutoModelForCausalLM, QuantizationConfig, TernaryPackType};
 
 const EOS: &[u32] = &[2, 128001, 128009];
 const DEFAULT_MODEL_ID: &str = "bitnet-b1.58-2B-4T";
@@ -61,8 +59,14 @@ struct GenParams {
 }
 
 enum GenEvent {
-    Token { id: u32, text: String },
-    Done { stopped: bool, completion_tokens: usize },
+    Token {
+        id: u32,
+        text: String,
+    },
+    Done {
+        stopped: bool,
+        completion_tokens: usize,
+    },
     Error(String),
 }
 
@@ -107,12 +111,7 @@ fn generate(
     } else {
         Some(params.top_p)
     };
-    let mut sampler = Sampler::new(
-        params.seed,
-        temperature,
-        top_p,
-        params.repetition_penalty,
-    );
+    let mut sampler = Sampler::new(params.seed, temperature, top_p, params.repetition_penalty);
 
     let mut toks = prompt_ids.to_vec();
     let mut index_pos = 0usize;
@@ -142,9 +141,7 @@ fn generate(
         index_pos += ctx;
         ng += 1;
 
-        let text = tokenizer
-            .decode(&[nt], false)
-            .unwrap_or_default();
+        let text = tokenizer.decode(&[nt], false).unwrap_or_default();
         if tx.send(GenEvent::Token { id: nt, text }).is_err() {
             return; // client disconnected
         }
@@ -196,16 +193,7 @@ fn worker(
                 tx,
             }) => {
                 let _ = slot;
-                pool.install(|| {
-                    generate(
-                        &model,
-                        &config,
-                        &tokenizer,
-                        &prompt_ids,
-                        &params,
-                        &tx,
-                    )
-                });
+                pool.install(|| generate(&model, &config, &tokenizer, &prompt_ids, &params, &tx));
             }
         }
     }
@@ -250,11 +238,7 @@ fn read_request(r: &mut impl BufRead) -> anyhow::Result<(String, Vec<String>, Ve
     Ok((request_line, headers, body))
 }
 
-fn build_prompt_ids(
-    route: &str,
-    v: &Value,
-    tokenizer: &Tokenizer,
-) -> anyhow::Result<Vec<u32>> {
+fn build_prompt_ids(route: &str, v: &Value, tokenizer: &Tokenizer) -> anyhow::Result<Vec<u32>> {
     let prompt: String = if route == "chat" {
         // Minimal chat template: role: content, then an assistant prompt.
         let mut p = String::new();
@@ -289,19 +273,10 @@ fn build_prompt_ids(
 }
 
 fn gen_params(v: &Value) -> GenParams {
-    let max_tokens = v
-        .get("max_tokens")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(256) as usize;
+    let max_tokens = v.get("max_tokens").and_then(|x| x.as_u64()).unwrap_or(256) as usize;
     let max_tokens = max_tokens.max(1).min(4096);
-    let temperature = v
-        .get("temperature")
-        .and_then(|x| x.as_f64())
-        .unwrap_or(1.0) as f32;
-    let top_p = v
-        .get("top_p")
-        .and_then(|x| x.as_f64())
-        .unwrap_or(1.0) as f32;
+    let temperature = v.get("temperature").and_then(|x| x.as_f64()).unwrap_or(1.0) as f32;
+    let top_p = v.get("top_p").and_then(|x| x.as_f64()).unwrap_or(1.0) as f32;
     let repetition_penalty = v
         .get("repetition_penalty")
         .and_then(|x| x.as_f64())
@@ -587,8 +562,8 @@ fn handle(
 // ---------------------------------------------------------------------------
 
 fn main() -> anyhow::Result<()> {
-    let model_path = std::env::var("XORNET_MODEL")
-        .unwrap_or_else(|_| "models/bitnet-2b".to_string());
+    let model_path =
+        std::env::var("XORNET_MODEL").unwrap_or_else(|_| "models/bitnet-2b".to_string());
     let host = std::env::var("XORNET_SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port: u16 = std::env::var("XORNET_SERVER_PORT")
         .ok()
@@ -628,9 +603,7 @@ fn main() -> anyhow::Result<()> {
     let tok_path = repo
         .get("tokenizer.json")
         .map_err(|e| anyhow!(e.to_string()))?;
-    let tokenizer = Arc::new(
-        Tokenizer::from_file(tok_path).map_err(|e| anyhow!(e.to_string()))?,
-    );
+    let tokenizer = Arc::new(Tokenizer::from_file(tok_path).map_err(|e| anyhow!(e.to_string()))?);
 
     let model = Arc::new(model);
     let config = Arc::new(config);

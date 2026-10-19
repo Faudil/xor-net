@@ -1,16 +1,19 @@
-use std::collections::HashMap;
-use std::path::Path;
-use std::fs::File;
-use safetensors::Dtype;
-use memmap2::Mmap;
+use crate::bit1_58::quantization::{
+    TernaryPackType, pack_1_58bit_4pack, pack_1_58bit_5pack, unpack_1_58bit_4pack,
+    unpack_1_58bit_5pack,
+};
 use crate::tensor::FastTensor;
-use crate::bit1_58::quantization::{pack_1_58bit_4pack, pack_1_58bit_5pack, unpack_1_58bit_4pack, unpack_1_58bit_5pack, TernaryPackType};
+use memmap2::Mmap;
+use safetensors::Dtype;
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::Path;
 
 pub mod sparse_loader;
 pub use sparse_loader::SparseFile;
 
 pub mod gguf;
-pub use gguf::{GgufFile, GgufMetadata, GgufTensorInfo, BonsaiConfig, dequantize_data};
+pub use gguf::{BonsaiConfig, GgufFile, GgufMetadata, GgufTensorInfo, dequantize_data};
 
 fn convert_to_f32_vec(bytes: &[u8], dtype: Dtype) -> anyhow::Result<Vec<f32>> {
     match dtype {
@@ -56,7 +59,7 @@ fn convert_to_f32_vec(bytes: &[u8], dtype: Dtype) -> anyhow::Result<Vec<f32>> {
                 let sign = (f16_val & 0x8000) as u32;
                 let exp = (f16_val & 0x7c00) >> 10;
                 let mant = f16_val & 0x03ff;
-                
+
                 let f32_bits = if exp == 0 {
                     if mant == 0 {
                         sign << 16
@@ -109,13 +112,23 @@ pub fn load_packed_ternary_weight(
     expected_shape: &[usize],
     pack_type: TernaryPackType,
 ) -> anyhow::Result<FastTensor> {
-    let info = repo.tensors.get(weight_name)
+    let info = repo
+        .tensors
+        .get(weight_name)
         .ok_or_else(|| anyhow::anyhow!("Packed weight tensor not found: {}", weight_name))?;
-    
-    let scale_key = format!("{}.weight_scale", weight_name.strip_suffix(".weight").unwrap_or(weight_name));
-    let sinfo = repo.tensors.get(&scale_key)
-        .ok_or_else(|| anyhow::anyhow!("Packed weight '{}' has no companion weight_scale '{}'", weight_name, scale_key))?;
-    
+
+    let scale_key = format!(
+        "{}.weight_scale",
+        weight_name.strip_suffix(".weight").unwrap_or(weight_name)
+    );
+    let sinfo = repo.tensors.get(&scale_key).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Packed weight '{}' has no companion weight_scale '{}'",
+            weight_name,
+            scale_key
+        )
+    })?;
+
     let weight_bytes = &repo.buffers[info.file_idx][info.start..info.end];
     let scale_bytes = &repo.buffers[sinfo.file_idx][sinfo.start..sinfo.end];
     let scale_data = convert_to_f32_vec(scale_bytes, sinfo.dtype)?;
@@ -180,21 +193,26 @@ impl SafeTensorRepo {
                 let view_start_ptr = view.data().as_ptr() as usize;
                 let start = view_start_ptr - file_start_ptr;
                 let end = start + view.data().len();
-                tensors.insert(name.clone(), RawTensorInfo {
-                    file_idx,
-                    dtype: view.dtype(),
-                    shape: view.shape().to_vec(),
-                    start,
-                    end,
-                });
+                tensors.insert(
+                    name.clone(),
+                    RawTensorInfo {
+                        file_idx,
+                        dtype: view.dtype(),
+                        shape: view.shape().to_vec(),
+                        start,
+                        end,
+                    },
+                );
             }
             buffers.push(mmap);
         }
         Ok(Self { buffers, tensors })
     }
-    
+
     pub fn get(&self, name: &str) -> anyhow::Result<FastTensor> {
-        let info = self.tensors.get(name)
+        let info = self
+            .tensors
+            .get(name)
             .ok_or_else(|| anyhow::anyhow!("Tensor not found: {}", name))?;
         let bytes = &self.buffers[info.file_idx][info.start..info.end];
         let mut data = convert_to_f32_vec(bytes, info.dtype)?;
@@ -206,8 +224,13 @@ impl SafeTensorRepo {
             } else {
                 format!("{}.weight_scale", name)
             };
-            let sinfo = self.tensors.get(&scale_key)
-                .ok_or_else(|| anyhow::anyhow!("U8 tensor '{}' has no companion weight_scale '{}'", name, scale_key))?;
+            let sinfo = self.tensors.get(&scale_key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "U8 tensor '{}' has no companion weight_scale '{}'",
+                    name,
+                    scale_key
+                )
+            })?;
             let sbytes = &self.buffers[sinfo.file_idx][sinfo.start..sinfo.end];
             let scale_data = convert_to_f32_vec(sbytes, sinfo.dtype)?;
             let inv_scale = 1.0 / scale_data[0];
@@ -314,7 +337,10 @@ impl<'a> SafeTensorLoader<'a> {
             format!("{}.{}", self.prefix, name)
         };
 
-        let info = self.repo.tensors.get(&key)
+        let info = self
+            .repo
+            .tensors
+            .get(&key)
             .ok_or_else(|| anyhow::anyhow!("Tensor '{}' not found", key))?;
         let stored_shape = &info.shape;
         let expected_out = expected_shape[0];
@@ -336,9 +362,17 @@ impl<'a> SafeTensorLoader<'a> {
         let weight_bytes = &self.repo.buffers[info.file_idx][info.start..info.end];
         let packed_data: Vec<u8> = weight_bytes.to_vec();
 
-        let scale_key = format!("{}.weight_scale", key.strip_suffix(".weight").unwrap_or(&key));
-        let sinfo = self.repo.tensors.get(&scale_key)
-            .ok_or_else(|| anyhow::anyhow!("Packed weight '{}' has no companion weight_scale '{}'", key, scale_key))?;
+        let scale_key = format!(
+            "{}.weight_scale",
+            key.strip_suffix(".weight").unwrap_or(&key)
+        );
+        let sinfo = self.repo.tensors.get(&scale_key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Packed weight '{}' has no companion weight_scale '{}'",
+                key,
+                scale_key
+            )
+        })?;
         let sbytes = &self.repo.buffers[sinfo.file_idx][sinfo.start..sinfo.end];
         let scale_data = convert_to_f32_vec(sbytes, sinfo.dtype)?;
         // The stored weight_scale is the actual multiplier (γ) for official checkpoints,
@@ -409,31 +443,31 @@ impl<'a> SafeTensorLoader<'a> {
         } else {
             format!("{}.{}", self.prefix, name)
         };
-        
+
         // Try to get the tensor - it might be packed or full size
         if let Some(info) = self.repo.tensors.get(&key) {
             let stored_shape = &info.shape;
             let expected_out = expected_shape[0];
             let expected_in = expected_shape[1];
-            
+
             // Check if it's packed ternary: U8 dtype, stored_out * 4 == expected_out, stored_in == expected_in
             let is_packed = info.dtype == Dtype::U8
-                && stored_shape.len() == 2 
-                && stored_shape[1] == expected_in 
+                && stored_shape.len() == 2
+                && stored_shape[1] == expected_in
                 && stored_shape[0] * 4 == expected_out;
-            
+
             if is_packed {
                 // It's packed! Load and unpack
                 return load_packed_ternary_weight(self.repo, &key, expected_shape, pack_type);
             }
-            
+
             // Not packed, try normal load
             let t = self.repo.get(&key)?;
             if t.shape == expected_shape {
                 return Ok(t);
             }
         }
-        
+
         anyhow::bail!(
             "Tensor '{}' not found or shape mismatch: expected {:?}",
             key,

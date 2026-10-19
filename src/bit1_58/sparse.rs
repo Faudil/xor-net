@@ -87,11 +87,7 @@ pub fn encode_sparse_row_into(buf: &mut Vec<u8>, vals: &[i8], in_dim: usize) {
 
 /// Build a full sparse tensor from a flat `[out_dim * in_dim]` slice of ternary
 /// values (each in `{-1, 0, +1}`). Returns `(blob, row_offsets)`.
-pub fn encode_sparse_tensor(
-    vals: &[i8],
-    in_dim: usize,
-    out_dim: usize,
-) -> (Vec<u8>, Vec<usize>) {
+pub fn encode_sparse_tensor(vals: &[i8], in_dim: usize, out_dim: usize) -> (Vec<u8>, Vec<usize>) {
     debug_assert!(vals.len() >= in_dim * out_dim);
     let mut blob = Vec::new();
     let mut row_offsets = Vec::with_capacity(out_dim);
@@ -139,8 +135,7 @@ impl SparseTernary {
         let mut num_blocks = 0usize;
         let mut p = 0usize;
         for _ in 0..out_dim {
-            let nb =
-                u32::from_le_bytes([blob[p], blob[p + 1], blob[p + 2], blob[p + 3]]) as usize;
+            let nb = u32::from_le_bytes([blob[p], blob[p + 1], blob[p + 2], blob[p + 3]]) as usize;
             if num_blocks == 0 {
                 num_blocks = nb;
             }
@@ -206,13 +201,12 @@ impl SparseTernary {
     /// Used by tests/validation to confirm the format is lossless.
     pub fn decode_row(&self, row: usize, in_dim: usize) -> Vec<i8> {
         let off = self.row_offsets[row];
-        let num_blocks =
-            u32::from_le_bytes([
-                self.blob[off],
-                self.blob[off + 1],
-                self.blob[off + 2],
-                self.blob[off + 3],
-            ]) as usize;
+        let num_blocks = u32::from_le_bytes([
+            self.blob[off],
+            self.blob[off + 1],
+            self.blob[off + 2],
+            self.blob[off + 3],
+        ]) as usize;
         let mut p = off + 4;
         let mut out = vec![0i8; in_dim];
         for b in 0..num_blocks {

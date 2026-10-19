@@ -1,9 +1,9 @@
-use rayon::prelude::*;
-use crate::tensor::FastTensor;
 use crate::bit1::layers::BitLinear;
 use crate::bit1_58::layers::{TernaryLinear, TernaryRep};
 use crate::bit1_58::quantization::TernaryPackType;
 use crate::loader::{SafeTensorLoader, sparse_loader::SparseFile};
+use crate::tensor::FastTensor;
+use rayon::prelude::*;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
@@ -18,7 +18,7 @@ pub unsafe fn dot_product_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     let mut sum2 = _mm256_setzero_ps();
     let mut sum3 = _mm256_setzero_ps();
     let mut i = 0;
-    
+
     while i + 32 <= n {
         let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
         let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
@@ -28,33 +28,33 @@ pub unsafe fn dot_product_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
         let vb2 = _mm256_loadu_ps(b.as_ptr().add(i + 16));
         let va3 = _mm256_loadu_ps(a.as_ptr().add(i + 24));
         let vb3 = _mm256_loadu_ps(b.as_ptr().add(i + 24));
-        
+
         sum0 = _mm256_fmadd_ps(va0, vb0, sum0);
         sum1 = _mm256_fmadd_ps(va1, vb1, sum1);
         sum2 = _mm256_fmadd_ps(va2, vb2, sum2);
         sum3 = _mm256_fmadd_ps(va3, vb3, sum3);
-        
+
         i += 32;
     }
-    
+
     let mut sum8 = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
-    
+
     while i + 8 <= n {
         let va = _mm256_loadu_ps(a.as_ptr().add(i));
         let vb = _mm256_loadu_ps(b.as_ptr().add(i));
         sum8 = _mm256_fmadd_ps(va, vb, sum8);
         i += 8;
     }
-    
+
     let mut temp = [0.0f32; 8];
     _mm256_storeu_ps(temp.as_mut_ptr(), sum8);
     let mut total = temp[0] + temp[1] + temp[2] + temp[3] + temp[4] + temp[5] + temp[6] + temp[7];
-    
+
     while i < n {
         total += a[i] * b[i];
         i += 1;
     }
-    
+
     total
 }
 
@@ -66,7 +66,7 @@ pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
             return unsafe { dot_product_f32_avx2(a, b) };
         }
     }
-    
+
     let mut sum = 0.0f32;
     for i in 0..a.len() {
         sum += a[i] * b[i];
@@ -122,14 +122,8 @@ pub unsafe fn dot_product_i8_avx512(a: &[i8], b: &[i8]) -> i32 {
         let a1 = _mm256_loadu_si256(a.as_ptr().add(i + 32) as *const __m256i);
         let b1 = _mm256_loadu_si256(b.as_ptr().add(i + 32) as *const __m256i);
 
-        let s0 = _mm512_madd_epi16(
-            _mm512_cvtepi8_epi16(a0),
-            _mm512_cvtepi8_epi16(b0),
-        );
-        let s1 = _mm512_madd_epi16(
-            _mm512_cvtepi8_epi16(a1),
-            _mm512_cvtepi8_epi16(b1),
-        );
+        let s0 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(a0), _mm512_cvtepi8_epi16(b0));
+        let s1 = _mm512_madd_epi16(_mm512_cvtepi8_epi16(a1), _mm512_cvtepi8_epi16(b1));
         acc = _mm512_add_epi32(acc, _mm512_add_epi32(s0, s1));
         i += 64;
     }
@@ -138,14 +132,8 @@ pub unsafe fn dot_product_i8_avx512(a: &[i8], b: &[i8]) -> i32 {
         let b0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(b.as_ptr().add(i) as *const __m128i));
         let a1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(a.as_ptr().add(i + 16) as *const __m128i));
         let b1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(b.as_ptr().add(i + 16) as *const __m128i));
-        let s = _mm256_add_epi32(
-            _mm256_madd_epi16(a0, b0),
-            _mm256_madd_epi16(a1, b1),
-        );
-        acc = _mm512_add_epi32(
-            acc,
-            _mm512_inserti32x8(_mm512_setzero_si512(), s, 0)
-        );
+        let s = _mm256_add_epi32(_mm256_madd_epi16(a0, b0), _mm256_madd_epi16(a1, b1));
+        acc = _mm512_add_epi32(acc, _mm512_inserti32x8(_mm512_setzero_si512(), s, 0));
         i += 32;
     }
 
@@ -251,7 +239,7 @@ impl Int8Linear {
         let mut scales = Vec::with_capacity(out_dim);
         let mut weight_row_sum = Vec::with_capacity(out_dim);
         for r in 0..out_dim {
-            let row = &weights_f32[r * in_dim .. (r + 1) * in_dim];
+            let row = &weights_f32[r * in_dim..(r + 1) * in_dim];
             let max_abs = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
             scales.push(scale);
@@ -263,7 +251,13 @@ impl Int8Linear {
             }
             weight_row_sum.push(ssum);
         }
-        Self { weight_i8, scales, in_dim, out_dim, weight_row_sum }
+        Self {
+            weight_i8,
+            scales,
+            in_dim,
+            out_dim,
+            weight_row_sum,
+        }
     }
 
     pub fn forward(&self, xs: &FastTensor) -> anyhow::Result<FastTensor> {
@@ -284,7 +278,10 @@ impl Int8Linear {
 
         if b_size == 1 {
             let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(in_dim);
-            let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(&xs.data[..in_dim], &mut quantized_in);
+            let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(
+                &xs.data[..in_dim],
+                &mut quantized_in,
+            );
 
             let use_vnni = is_x86_feature_detected!("avx512vnni");
             // Reinterpret the i8 activation as u8 with a +128 zero-point so it
@@ -299,46 +296,60 @@ impl Int8Linear {
             let num_threads = crate::util::get_num_threads();
             let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
 
-            out_data.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
-                let start_o = chunk_idx * chunk_size;
-                for (i, out_val) in out_chunk.iter_mut().enumerate() {
-                    let o = start_o + i;
-                    let w_row = &self.weight_i8[o * in_dim .. (o + 1) * in_dim];
-                    let dot = if use_vnni {
-                        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                        unsafe {
-                            std::arch::x86_64::_mm_prefetch(
-                                w_row.as_ptr().add(64) as *const i8,
-                                std::arch::x86_64::_MM_HINT_NTA,
-                            );
-                        }
-                        unsafe { dot_product_i8_avx512_vnni(&act_u8, w_row, self.weight_row_sum[o]) }
-                    } else {
-                        dot_product_i8(&quantized_in, w_row)
-                    };
-                    *out_val = dot as f32 * inv_scale * self.scales[o];
-                }
-            });
+            out_data
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(chunk_idx, out_chunk)| {
+                    let start_o = chunk_idx * chunk_size;
+                    for (i, out_val) in out_chunk.iter_mut().enumerate() {
+                        let o = start_o + i;
+                        let w_row = &self.weight_i8[o * in_dim..(o + 1) * in_dim];
+                        let dot = if use_vnni {
+                            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                            unsafe {
+                                std::arch::x86_64::_mm_prefetch(
+                                    w_row.as_ptr().add(64) as *const i8,
+                                    std::arch::x86_64::_MM_HINT_NTA,
+                                );
+                            }
+                            unsafe {
+                                dot_product_i8_avx512_vnni(&act_u8, w_row, self.weight_row_sum[o])
+                            }
+                        } else {
+                            dot_product_i8(&quantized_in, w_row)
+                        };
+                        *out_val = dot as f32 * inv_scale * self.scales[o];
+                    }
+                });
 
             crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
         } else {
-            out_data.par_chunks_mut(out_dim).enumerate().for_each(|(b, out_row)| {
-                let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(in_dim);
-                let in_row = &xs.data[b * in_dim .. (b + 1) * in_dim];
-                let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
-                for o in 0..out_dim {
-                    let w_row = &self.weight_i8[o * in_dim .. (o + 1) * in_dim];
-                    let dot = dot_product_i8(&quantized_in, w_row);
-                    out_row[o] = dot as f32 * inv_scale * self.scales[o];
-                }
-                crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
-            });
+            out_data
+                .par_chunks_mut(out_dim)
+                .enumerate()
+                .for_each(|(b, out_row)| {
+                    let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(in_dim);
+                    let in_row = &xs.data[b * in_dim..(b + 1) * in_dim];
+                    let inv_scale =
+                        crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
+                    for o in 0..out_dim {
+                        let w_row = &self.weight_i8[o * in_dim..(o + 1) * in_dim];
+                        let dot = dot_product_i8(&quantized_in, w_row);
+                        out_row[o] = dot as f32 * inv_scale * self.scales[o];
+                    }
+                    crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
+                });
         }
 
         Ok(FastTensor::new(out_data, out_shape))
     }
 
-    pub fn forward_with_quantized(&self, xs: &FastTensor, quantized_in: &[i8], inv_scale: f32) -> anyhow::Result<FastTensor> {
+    pub fn forward_with_quantized(
+        &self,
+        xs: &FastTensor,
+        quantized_in: &[i8],
+        inv_scale: f32,
+    ) -> anyhow::Result<FastTensor> {
         let mut out_shape = xs.shape.clone();
         let rank = xs.shape.len();
         if rank == 0 {
@@ -364,26 +375,31 @@ impl Int8Linear {
         let num_threads = crate::util::get_num_threads();
         let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
 
-        out_data.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
-            let start_o = chunk_idx * chunk_size;
-            for (i, out_val) in out_chunk.iter_mut().enumerate() {
-                let o = start_o + i;
-                let w_row = &self.weight_i8[o * in_dim .. (o + 1) * in_dim];
-                let dot = if use_vnni {
-                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                    unsafe {
-                        std::arch::x86_64::_mm_prefetch(
-                            w_row.as_ptr().add(64) as *const i8,
-                            std::arch::x86_64::_MM_HINT_NTA,
-                        );
-                    }
-                    unsafe { dot_product_i8_avx512_vnni(&act_u8, w_row, self.weight_row_sum[o]) }
-                } else {
-                    dot_product_i8(quantized_in, w_row)
-                };
-                *out_val = dot as f32 * inv_scale * self.scales[o];
-            }
-        });
+        out_data
+            .par_chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(chunk_idx, out_chunk)| {
+                let start_o = chunk_idx * chunk_size;
+                for (i, out_val) in out_chunk.iter_mut().enumerate() {
+                    let o = start_o + i;
+                    let w_row = &self.weight_i8[o * in_dim..(o + 1) * in_dim];
+                    let dot = if use_vnni {
+                        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                        unsafe {
+                            std::arch::x86_64::_mm_prefetch(
+                                w_row.as_ptr().add(64) as *const i8,
+                                std::arch::x86_64::_MM_HINT_NTA,
+                            );
+                        }
+                        unsafe {
+                            dot_product_i8_avx512_vnni(&act_u8, w_row, self.weight_row_sum[o])
+                        }
+                    } else {
+                        dot_product_i8(quantized_in, w_row)
+                    };
+                    *out_val = dot as f32 * inv_scale * self.scales[o];
+                }
+            });
 
         Ok(FastTensor::new(out_data, out_shape))
     }
@@ -402,23 +418,28 @@ impl Int4Linear {
         let mut weight_i4 = Vec::with_capacity((weights_f32.len() + 1) / 2);
         let mut scales = Vec::with_capacity(out_dim);
         for r in 0..out_dim {
-            let row = &weights_f32[r * in_dim .. (r + 1) * in_dim];
+            let row = &weights_f32[r * in_dim..(r + 1) * in_dim];
             let max_abs = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
             scales.push(scale);
-            
+
             for c in (0..in_dim).step_by(2) {
                 let w0 = row[c];
                 let w1 = if c + 1 < in_dim { row[c + 1] } else { 0.0 };
-                
+
                 let q0 = (w0 / scale).round().max(-8.0).min(7.0) as i8;
                 let q1 = (w1 / scale).round().max(-8.0).min(7.0) as i8;
-                
+
                 let packed = ((q0 as u8) & 0x0F) | ((q1 as u8) << 4);
                 weight_i4.push(packed);
             }
         }
-        Self { weight_i4, scales, in_dim, out_dim }
+        Self {
+            weight_i4,
+            scales,
+            in_dim,
+            out_dim,
+        }
     }
 
     pub fn forward(&self, xs: &FastTensor) -> anyhow::Result<FastTensor> {
@@ -439,60 +460,77 @@ impl Int4Linear {
 
         if b_size == 1 {
             let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(in_dim);
-            let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(&xs.data[..in_dim], &mut quantized_in);
+            let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(
+                &xs.data[..in_dim],
+                &mut quantized_in,
+            );
 
             let num_threads = crate::util::get_num_threads();
             let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
 
-            out_data.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
-                let start_o = chunk_idx * chunk_size;
-                for (i, out_val) in out_chunk.iter_mut().enumerate() {
-                    let o = start_o + i;
-                    let w_row_start = o * ((in_dim + 1) / 2);
-                    let w_row_end = w_row_start + ((in_dim + 1) / 2);
-                    let w_packed = &self.weight_i4[w_row_start .. w_row_end];
-                    
-                    let mut dot = 0i32;
-                    let q_in_chunks = quantized_in.chunks_exact(2);
-                    for (&b, in_chunk) in w_packed.iter().zip(q_in_chunks) {
-                        let q0 = ((b & 0x0F) as i8) << 4 >> 4;
-                        let q1 = ((b & 0xF0) as i8) >> 4;
-                        
-                        dot += (in_chunk[0] as i32) * (q0 as i32) + (in_chunk[1] as i32) * (q1 as i32);
+            out_data
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(chunk_idx, out_chunk)| {
+                    let start_o = chunk_idx * chunk_size;
+                    for (i, out_val) in out_chunk.iter_mut().enumerate() {
+                        let o = start_o + i;
+                        let w_row_start = o * ((in_dim + 1) / 2);
+                        let w_row_end = w_row_start + ((in_dim + 1) / 2);
+                        let w_packed = &self.weight_i4[w_row_start..w_row_end];
+
+                        let mut dot = 0i32;
+                        let q_in_chunks = quantized_in.chunks_exact(2);
+                        for (&b, in_chunk) in w_packed.iter().zip(q_in_chunks) {
+                            let q0 = ((b & 0x0F) as i8) << 4 >> 4;
+                            let q1 = ((b & 0xF0) as i8) >> 4;
+
+                            dot += (in_chunk[0] as i32) * (q0 as i32)
+                                + (in_chunk[1] as i32) * (q1 as i32);
+                        }
+                        *out_val = dot as f32 * inv_scale * self.scales[o];
                     }
-                    *out_val = dot as f32 * inv_scale * self.scales[o];
-                }
-            });
+                });
             crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
         } else {
-            out_data.par_chunks_mut(out_dim).enumerate().for_each(|(b, out_row)| {
-                let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(in_dim);
-                let in_row = &xs.data[b * in_dim .. (b + 1) * in_dim];
-                let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
+            out_data
+                .par_chunks_mut(out_dim)
+                .enumerate()
+                .for_each(|(b, out_row)| {
+                    let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(in_dim);
+                    let in_row = &xs.data[b * in_dim..(b + 1) * in_dim];
+                    let inv_scale =
+                        crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
 
-                for o in 0..out_dim {
-                    let w_row_start = o * ((in_dim + 1) / 2);
-                    let w_row_end = w_row_start + ((in_dim + 1) / 2);
-                    let w_packed = &self.weight_i4[w_row_start .. w_row_end];
-                    
-                    let mut dot = 0i32;
-                    let q_in_chunks = quantized_in.chunks_exact(2);
-                    for (&w_b, in_chunk) in w_packed.iter().zip(q_in_chunks) {
-                        let q0 = ((w_b & 0x0F) as i8) << 4 >> 4;
-                        let q1 = ((w_b & 0xF0) as i8) >> 4;
-                        
-                        dot += (in_chunk[0] as i32) * (q0 as i32) + (in_chunk[1] as i32) * (q1 as i32);
+                    for o in 0..out_dim {
+                        let w_row_start = o * ((in_dim + 1) / 2);
+                        let w_row_end = w_row_start + ((in_dim + 1) / 2);
+                        let w_packed = &self.weight_i4[w_row_start..w_row_end];
+
+                        let mut dot = 0i32;
+                        let q_in_chunks = quantized_in.chunks_exact(2);
+                        for (&w_b, in_chunk) in w_packed.iter().zip(q_in_chunks) {
+                            let q0 = ((w_b & 0x0F) as i8) << 4 >> 4;
+                            let q1 = ((w_b & 0xF0) as i8) >> 4;
+
+                            dot += (in_chunk[0] as i32) * (q0 as i32)
+                                + (in_chunk[1] as i32) * (q1 as i32);
+                        }
+                        out_row[o] = dot as f32 * inv_scale * self.scales[o];
                     }
-                    out_row[o] = dot as f32 * inv_scale * self.scales[o];
-                }
-                crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
-            });
+                    crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
+                });
         }
 
         Ok(FastTensor::new(out_data, out_shape))
     }
 
-    pub fn forward_with_quantized(&self, xs: &FastTensor, quantized_in: &[i8], inv_scale: f32) -> anyhow::Result<FastTensor> {
+    pub fn forward_with_quantized(
+        &self,
+        xs: &FastTensor,
+        quantized_in: &[i8],
+        inv_scale: f32,
+    ) -> anyhow::Result<FastTensor> {
         let mut out_shape = xs.shape.clone();
         let rank = xs.shape.len();
         if rank == 0 {
@@ -510,25 +548,29 @@ impl Int4Linear {
         let num_threads = crate::util::get_num_threads();
         let chunk_size = ((out_dim + num_threads - 1) / num_threads).max(128);
 
-        out_data.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
-            let start_o = chunk_idx * chunk_size;
-            for (i, out_val) in out_chunk.iter_mut().enumerate() {
-                let o = start_o + i;
-                let w_row_start = o * ((in_dim + 1) / 2);
-                let w_row_end = w_row_start + ((in_dim + 1) / 2);
-                let w_packed = &self.weight_i4[w_row_start .. w_row_end];
-                
-                let mut dot = 0i32;
-                let q_in_chunks = quantized_in.chunks_exact(2);
-                for (&b, in_chunk) in w_packed.iter().zip(q_in_chunks) {
-                    let q0 = ((b & 0x0F) as i8) << 4 >> 4;
-                    let q1 = ((b & 0xF0) as i8) >> 4;
-                    
-                    dot += (in_chunk[0] as i32) * (q0 as i32) + (in_chunk[1] as i32) * (q1 as i32);
+        out_data
+            .par_chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(chunk_idx, out_chunk)| {
+                let start_o = chunk_idx * chunk_size;
+                for (i, out_val) in out_chunk.iter_mut().enumerate() {
+                    let o = start_o + i;
+                    let w_row_start = o * ((in_dim + 1) / 2);
+                    let w_row_end = w_row_start + ((in_dim + 1) / 2);
+                    let w_packed = &self.weight_i4[w_row_start..w_row_end];
+
+                    let mut dot = 0i32;
+                    let q_in_chunks = quantized_in.chunks_exact(2);
+                    for (&b, in_chunk) in w_packed.iter().zip(q_in_chunks) {
+                        let q0 = ((b & 0x0F) as i8) << 4 >> 4;
+                        let q1 = ((b & 0xF0) as i8) >> 4;
+
+                        dot +=
+                            (in_chunk[0] as i32) * (q0 as i32) + (in_chunk[1] as i32) * (q1 as i32);
+                    }
+                    *out_val = dot as f32 * inv_scale * self.scales[o];
                 }
-                *out_val = dot as f32 * inv_scale * self.scales[o];
-            }
-        });
+            });
 
         Ok(FastTensor::new(out_data, out_shape))
     }
@@ -561,48 +603,58 @@ impl F32Linear {
     pub fn new(weight: FastTensor) -> Self {
         Self { weight }
     }
-    
+
     pub fn forward(&self, xs: &FastTensor) -> anyhow::Result<FastTensor> {
         let in_features = self.weight.shape[1];
         let out_features = self.weight.shape[0];
-        
+
         let rank = xs.shape.len();
         if rank == 0 {
             anyhow::bail!("Input must have at least 1 dim");
         }
         if xs.shape[rank - 1] != in_features {
-            anyhow::bail!("F32Linear shape mismatch: input last dim {}, expected {}", xs.shape[rank - 1], in_features);
+            anyhow::bail!(
+                "F32Linear shape mismatch: input last dim {}, expected {}",
+                xs.shape[rank - 1],
+                in_features
+            );
         }
-        
+
         let mut out_shape = xs.shape.clone();
         out_shape[rank - 1] = out_features;
-        
+
         let b_size: usize = xs.shape[..rank - 1].iter().product();
         let mut out_data = crate::tensor::workspace::get_pooled_buffer(b_size * out_features);
-        
+
         if b_size == 1 {
-            let in_row = &xs.data[0 .. in_features];
+            let in_row = &xs.data[0..in_features];
             let num_threads = crate::util::get_num_threads();
             let chunk_size = ((out_features + num_threads - 1) / num_threads).max(128);
-            
-            out_data.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
-                let start_o = chunk_idx * chunk_size;
-                for (i, out_val) in out_chunk.iter_mut().enumerate() {
-                    let o = start_o + i;
-                    let w_row = &self.weight.data[o * in_features .. (o + 1) * in_features];
-                    *out_val = dot_product_f32(in_row, w_row);
-                }
-            });
+
+            out_data
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(chunk_idx, out_chunk)| {
+                    let start_o = chunk_idx * chunk_size;
+                    for (i, out_val) in out_chunk.iter_mut().enumerate() {
+                        let o = start_o + i;
+                        let w_row = &self.weight.data[o * in_features..(o + 1) * in_features];
+                        *out_val = dot_product_f32(in_row, w_row);
+                    }
+                });
         } else {
-            out_data.par_chunks_mut(out_features).enumerate().for_each(|(b, out_row)| {
-                let in_row = &xs.data[b * in_features .. (b + 1) * in_features];
-                for o in 0..out_features {
-                    let w_row = &self.weight.data[o * in_features .. (o + 1) * in_features];
-                    out_row[o] = dot_product_f32(in_row, w_row);
-                }
-            });
+            out_data
+                .par_chunks_mut(out_features)
+                .enumerate()
+                .for_each(|(b, out_row)| {
+                    let in_row = &xs.data[b * in_features..(b + 1) * in_features];
+                    for o in 0..out_features {
+                        let w_row = &self.weight.data[o * in_features..(o + 1) * in_features];
+                        out_row[o] = dot_product_f32(in_row, w_row);
+                    }
+                });
         }
-        
+
         Ok(FastTensor::new(out_data, out_shape))
     }
 }
@@ -632,13 +684,20 @@ impl DynamicLinear {
         }
     }
 
-    pub fn forward_with_quantized(&self, xs: &FastTensor, quantized_in: &[i8], inv_scale: f32) -> anyhow::Result<FastTensor> {
+    pub fn forward_with_quantized(
+        &self,
+        xs: &FastTensor,
+        quantized_in: &[i8],
+        inv_scale: f32,
+    ) -> anyhow::Result<FastTensor> {
         match &self.inner {
             LinearKind::Standard(l) => l.forward(xs),
             LinearKind::Int8(l) => l.forward_with_quantized(xs, quantized_in, inv_scale),
             LinearKind::Int4(l) => l.forward_with_quantized(xs, quantized_in, inv_scale),
             LinearKind::Ternary(l) => l.forward_with_quantized(xs, quantized_in, inv_scale),
-            LinearKind::Bit(_) => anyhow::bail!("forward_with_quantized not supported for BitLinear"),
+            LinearKind::Bit(_) => {
+                anyhow::bail!("forward_with_quantized not supported for BitLinear")
+            }
         }
     }
 
@@ -660,14 +719,26 @@ impl DynamicLinear {
         }
     }
 
-    pub fn new_ternary(in_dim: usize, out_dim: usize, weights_f32: &[f32], pack_type: TernaryPackType, provided_scale: Option<f32>) -> anyhow::Result<Self> {
+    pub fn new_ternary(
+        in_dim: usize,
+        out_dim: usize,
+        weights_f32: &[f32],
+        pack_type: TernaryPackType,
+        provided_scale: Option<f32>,
+    ) -> anyhow::Result<Self> {
         let l = TernaryLinear::new(in_dim, out_dim, weights_f32, pack_type, provided_scale)?;
         Ok(Self {
             inner: LinearKind::Ternary(l),
         })
     }
 
-    pub fn new_ternary_direct(packed_weights: Vec<u8>, in_dim: usize, out_dim: usize, pack_type: TernaryPackType, w_scales: Vec<f32>) -> Self {
+    pub fn new_ternary_direct(
+        packed_weights: Vec<u8>,
+        in_dim: usize,
+        out_dim: usize,
+        pack_type: TernaryPackType,
+        w_scales: Vec<f32>,
+    ) -> Self {
         Self {
             inner: LinearKind::Ternary(TernaryLinear {
                 rep: TernaryRep::Dense(packed_weights),
@@ -675,7 +746,7 @@ impl DynamicLinear {
                 out_dim,
                 pack_type,
                 w_scales,
-            })
+            }),
         }
     }
 
@@ -727,17 +798,30 @@ impl DynamicLinear {
                 Self::new_bit(in_dim, out_dim, &weight.data)
             }
             QuantizationConfig::Bit1_58(pack_type, lm_head_cfg, is_inverted_scale) => {
-                if let Ok((packed_weights, w_scales, p_in, p_out)) =
-                    loader.get_prepacked_ternary(&[out_dim, in_dim], name, pack_type, is_inverted_scale)
-                {
+                if let Ok((packed_weights, w_scales, p_in, p_out)) = loader.get_prepacked_ternary(
+                    &[out_dim, in_dim],
+                    name,
+                    pack_type,
+                    is_inverted_scale,
+                ) {
                     if sparse_requested() {
                         let l = TernaryLinear::new_sparse_from_packed(
-                            packed_weights, p_in, p_out, pack_type, w_scales,
+                            packed_weights,
+                            p_in,
+                            p_out,
+                            pack_type,
+                            w_scales,
                         )?;
-                        return Ok(Self { inner: LinearKind::Ternary(l) });
+                        return Ok(Self {
+                            inner: LinearKind::Ternary(l),
+                        });
                     }
                     return Ok(Self::new_ternary_direct(
-                        packed_weights, p_in, p_out, pack_type, w_scales,
+                        packed_weights,
+                        p_in,
+                        p_out,
+                        pack_type,
+                        w_scales,
                     ));
                 }
 
@@ -755,7 +839,13 @@ impl DynamicLinear {
                             let scale_name = format!("{}_scale", name);
                             let provided_scale =
                                 loader.get(&[1], &scale_name).map(|s| s.data[0]).ok();
-                            Self::new_ternary(in_dim, out_dim, &weight.data, pack_type, provided_scale)
+                            Self::new_ternary(
+                                in_dim,
+                                out_dim,
+                                &weight.data,
+                                pack_type,
+                                provided_scale,
+                            )
                         }
                     }
                 } else {
@@ -769,7 +859,9 @@ impl DynamicLinear {
                             pack_type,
                             provided_scale,
                         )?;
-                        return Ok(Self { inner: LinearKind::Ternary(l) });
+                        return Ok(Self {
+                            inner: LinearKind::Ternary(l),
+                        });
                     }
                     return Self::new_ternary(
                         in_dim,
@@ -792,4 +884,3 @@ pub fn sparse_requested() -> bool {
         .map(|s| s.eq_ignore_ascii_case("sparse"))
         .unwrap_or(false)
 }
-

@@ -1,4 +1,4 @@
-use xor_net::util::{uninit_vec, get_num_threads, PARALLEL_THRESHOLD, CHUNK_SIZE};
+use xor_net::util::{CHUNK_SIZE, PARALLEL_THRESHOLD, get_num_threads, uninit_vec};
 
 #[test]
 fn test_uninit_vec_creates_correct_length() {

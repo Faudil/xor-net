@@ -1,9 +1,8 @@
-
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::Api};
 use std::time::Instant;
 use tokenizers::Tokenizer;
-use xor_net::{AutoModelForCausalLM, QuantizationConfig};
 use xor_net::bit1_58::quantization::TernaryPackType;
+use xor_net::{AutoModelForCausalLM, QuantizationConfig};
 
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
@@ -22,7 +21,11 @@ fn main() -> anyhow::Result<()> {
     let model_id = "HF1BitLLM/Llama3-8B-1.58-100B-tokens";
     println!("Loading 1.58-bit model {}...", model_id);
 
-    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, xor_net::nn::LmHeadConfig::Int4, true);
+    let quantization = QuantizationConfig::Bit1_58(
+        TernaryPackType::Pack4,
+        xor_net::nn::LmHeadConfig::Int4,
+        true,
+    );
 
     let load_start = Instant::now();
     let (model, config) = AutoModelForCausalLM::from_pretrained(model_id, quantization)?;
@@ -38,8 +41,8 @@ fn main() -> anyhow::Result<()> {
     ));
 
     let tokenizer_filename = repo.get("tokenizer.json")?;
-    let tokenizer = Tokenizer::from_file(tokenizer_filename)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let tokenizer =
+        Tokenizer::from_file(tokenizer_filename).map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     let prompt = "The capital of France is";
     let mut tokens = tokenizer
@@ -85,14 +88,29 @@ fn main() -> anyhow::Result<()> {
 
     let elapsed = start_gen.elapsed();
     let tps = generated_tokens as f64 / elapsed.as_secs_f64();
-    println!("Generated {} tokens in {:.2?} ({:.2} tokens/sec)", generated_tokens, elapsed, tps);
+    println!(
+        "Generated {} tokens in {:.2?} ({:.2} tokens/sec)",
+        generated_tokens, elapsed, tps
+    );
     println!("  - Model Forward Time: {:.2?}", total_forward_time);
     println!("  - Native Sampling Time: {:.2?}", total_sample_time);
 
     let (blocks_us, lm_head_us, other_us) = xor_net::models::llama::get_profiling_stats();
-    println!("    * [Profile] Transformer Blocks Total: {:.2}ms ({:.2}ms/token)", blocks_us as f64 / 1000.0, (blocks_us as f64 / 1000.0) / generated_tokens as f64);
-    println!("    * [Profile] LM Head Total: {:.2}ms ({:.2}ms/token)", lm_head_us as f64 / 1000.0, (lm_head_us as f64 / 1000.0) / generated_tokens as f64);
-    println!("    * [Profile] Other Ops Total: {:.2}ms ({:.2}ms/token)", other_us as f64 / 1000.0, (other_us as f64 / 1000.0) / generated_tokens as f64);
+    println!(
+        "    * [Profile] Transformer Blocks Total: {:.2}ms ({:.2}ms/token)",
+        blocks_us as f64 / 1000.0,
+        (blocks_us as f64 / 1000.0) / generated_tokens as f64
+    );
+    println!(
+        "    * [Profile] LM Head Total: {:.2}ms ({:.2}ms/token)",
+        lm_head_us as f64 / 1000.0,
+        (lm_head_us as f64 / 1000.0) / generated_tokens as f64
+    );
+    println!(
+        "    * [Profile] Other Ops Total: {:.2}ms ({:.2}ms/token)",
+        other_us as f64 / 1000.0,
+        (other_us as f64 / 1000.0) / generated_tokens as f64
+    );
 
     Ok(())
 }

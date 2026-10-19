@@ -1,11 +1,11 @@
 //! Multi-head causal self-attention with fused ternary QKV projection and a
 //! ring KV-cache (`fast_attention`).
 
-use crate::tensor::FastTensor;
-use crate::nn::{DynamicLinear, FastRmsNorm};
-use crate::nn::dynamic_linear::LinearKind;
 use crate::loader::{SafeTensorLoader, sparse_loader::SparseFile};
 use crate::models::llama::{Cache, Config};
+use crate::nn::dynamic_linear::LinearKind;
+use crate::nn::{DynamicLinear, FastRmsNorm};
+use crate::tensor::FastTensor;
 use anyhow::Result;
 
 /// Issue a non-temporal prefetch for the leading cache line of a projection's
@@ -13,7 +13,9 @@ use anyhow::Result;
 fn prefetch_proj(lin: &DynamicLinear) {
     if let LinearKind::Ternary(t) = &lin.inner {
         if let Some(ptr) = t.prefetch_ptr() {
-            unsafe { crate::models::llama::prefetch_weight(ptr); }
+            unsafe {
+                crate::models::llama::prefetch_weight(ptr);
+            }
         }
     }
 }
@@ -56,12 +58,15 @@ impl CausalSelfAttention {
         // quantize the input once and compute all three projections in a single
         // fused call (no per-projection DynamicLinear dispatch / re-quant).
         let (q, k, v) = match (&self.q_proj.inner, &self.k_proj.inner, &self.v_proj.inner) {
-            (LinearKind::Ternary(q_lin), LinearKind::Ternary(k_lin), LinearKind::Ternary(v_lin))
-                if b_size == 1 =>
-            {
+            (
+                LinearKind::Ternary(q_lin),
+                LinearKind::Ternary(k_lin),
+                LinearKind::Ternary(v_lin),
+            ) if b_size == 1 => {
                 let in_row = &x.data[0..q_lin.in_dim];
                 let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(q_lin.in_dim);
-                let inv_scale = crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
+                let inv_scale =
+                    crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
                 let res = crate::bit1_58::layers::TernaryLinear::fused_forward_qkv(
                     x,
                     &quantized_in,
@@ -130,24 +135,60 @@ impl CausalSelfAttention {
             + proj_bytes(&self.o_proj)
     }
 
-    pub(crate) fn load(loader: SafeTensorLoader, cfg: &Config, sparse: Option<&SparseFile>) -> Result<Self> {
+    pub(crate) fn load(
+        loader: SafeTensorLoader,
+        cfg: &Config,
+        sparse: Option<&SparseFile>,
+    ) -> Result<Self> {
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
         let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
 
-        let q_proj =
-            DynamicLinear::load(size_in, size_q, &loader.pp("q_proj"), "weight", cfg.quantization_config, sparse)?;
-        let k_proj =
-            DynamicLinear::load(size_in, size_kv, &loader.pp("k_proj"), "weight", cfg.quantization_config, sparse)?;
-        let v_proj =
-            DynamicLinear::load(size_in, size_kv, &loader.pp("v_proj"), "weight", cfg.quantization_config, sparse)?;
-        let o_proj =
-            DynamicLinear::load(size_q, size_in, &loader.pp("o_proj"), "weight", cfg.quantization_config, sparse)?;
+        let q_proj = DynamicLinear::load(
+            size_in,
+            size_q,
+            &loader.pp("q_proj"),
+            "weight",
+            cfg.quantization_config,
+            sparse,
+        )?;
+        let k_proj = DynamicLinear::load(
+            size_in,
+            size_kv,
+            &loader.pp("k_proj"),
+            "weight",
+            cfg.quantization_config,
+            sparse,
+        )?;
+        let v_proj = DynamicLinear::load(
+            size_in,
+            size_kv,
+            &loader.pp("v_proj"),
+            "weight",
+            cfg.quantization_config,
+            sparse,
+        )?;
+        let o_proj = DynamicLinear::load(
+            size_q,
+            size_in,
+            &loader.pp("o_proj"),
+            "weight",
+            cfg.quantization_config,
+            sparse,
+        )?;
 
         let inner_attn_ln = if loader.pp("inner_attn_ln").has_tensor("weight") {
-            Some(FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("inner_attn_ln"))?)
+            Some(FastRmsNorm::load(
+                cfg.hidden_size,
+                cfg.rms_norm_eps as f32,
+                &loader.pp("inner_attn_ln"),
+            )?)
         } else if loader.pp("attn_sub_norm").has_tensor("weight") {
-            Some(FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("attn_sub_norm"))?)
+            Some(FastRmsNorm::load(
+                cfg.hidden_size,
+                cfg.rms_norm_eps as f32,
+                &loader.pp("attn_sub_norm"),
+            )?)
         } else {
             None
         };

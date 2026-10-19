@@ -21,7 +21,9 @@ fn main() -> anyhow::Result<()> {
     let bytes = bits / 128.0 * 18.0;
     println!(
         "ffn_gate [{out_dim},{in_dim}]: {:.1} ms  ({:.1} Gelem/s, {:.1} GB/s packed)",
-        dt * 1000.0, bits / dt / 1e9, bytes / dt / 1e9
+        dt * 1000.0,
+        bits / dt / 1e9,
+        bytes / dt / 1e9
     );
     Ok(())
 }

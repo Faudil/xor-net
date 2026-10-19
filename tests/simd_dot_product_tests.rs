@@ -4,10 +4,10 @@
 //! ternary_dot_product_pack5_scalar, xnor_dot_product, and known
 //! hand-computed reference values for small inputs.
 
-use xor_net::bit1_58::quantization::{pack_1_58bit_4pack, pack_1_58bit_5pack};
-use xor_net::bit1_58::simd::{ternary_dot_product_pack4, ternary_dot_product_pack5_scalar};
 use xor_net::bit1::quantization::pack_1bit;
 use xor_net::bit1::simd::xnor_dot_product;
+use xor_net::bit1_58::quantization::{pack_1_58bit_4pack, pack_1_58bit_5pack};
+use xor_net::bit1_58::simd::{ternary_dot_product_pack4, ternary_dot_product_pack5_scalar};
 
 #[test]
 fn ternary_pack4_dot_product_hand_computed() {
@@ -18,7 +18,10 @@ fn ternary_pack4_dot_product_hand_computed() {
     let w_f32 = vec![-1.0, 0.0, 1.0, -1.0];
     let w_packed = pack_1_58bit_4pack(&w_f32, 1.0);
     let result = ternary_dot_product_pack4(&acts, &w_packed, 4);
-    assert_eq!(result, -5, "Hand-computed ternary pack4 dot product mismatch");
+    assert_eq!(
+        result, -5,
+        "Hand-computed ternary pack4 dot product mismatch"
+    );
 }
 
 #[test]
@@ -29,7 +32,10 @@ fn ternary_pack5_dot_product_hand_computed() {
     let w_packed = pack_1_58bit_5pack(&w_f32, 1.0);
     // dot = 2*(-1) + (-3)*0 + 1*1 + 4*(-1) + 5*1 = -2 + 0 + 1 - 4 + 5 = 0
     let result = ternary_dot_product_pack5_scalar(&acts, &w_packed, 5);
-    assert_eq!(result, 0, "Hand-computed ternary pack5 dot product mismatch");
+    assert_eq!(
+        result, 0,
+        "Hand-computed ternary pack5 dot product mismatch"
+    );
 }
 
 #[test]
@@ -50,7 +56,10 @@ fn ternary_pack4_identity_weights() {
     let w_packed = pack_1_58bit_4pack(&w_f32, 1.0);
     let result = ternary_dot_product_pack4(&acts, &w_packed, 4);
     let expected: i32 = acts.iter().map(|&x| x as i32).sum();
-    assert_eq!(result, expected, "All +1 weights: dot product must equal sum of activations");
+    assert_eq!(
+        result, expected,
+        "All +1 weights: dot product must equal sum of activations"
+    );
 }
 
 #[test]
@@ -69,7 +78,13 @@ fn ternary_pack4_vs_pack5_parity_large() {
     // For lengths that are multiples of both 4 and 5 (i.e. 20, 40, 60), verify parity
     for len in [20, 40, 60, 100, 200] {
         let acts: Vec<i8> = (0..len).map(|i| ((i * 7 + 13) % 255) as i8).collect();
-        let w_f32: Vec<f32> = (0..len).map(|i| match i % 3 { 0 => -1.0, 1 => 0.0, _ => 1.0 }).collect();
+        let w_f32: Vec<f32> = (0..len)
+            .map(|i| match i % 3 {
+                0 => -1.0,
+                1 => 0.0,
+                _ => 1.0,
+            })
+            .collect();
 
         let w4 = pack_1_58bit_4pack(&w_f32, 1.0);
         let w5 = pack_1_58bit_5pack(&w_f32, 1.0);
@@ -100,10 +115,16 @@ fn xnor_dot_product_identical_vectors() {
     // Identical vectors → all bits match → matches = total_bits
     // result = 2*total - total = total
     for len in [8, 16, 32, 64, 128, 256] {
-        let f: Vec<f32> = (0..len).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let f: Vec<f32> = (0..len)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
         let packed = pack_1bit(&f);
         let result = xnor_dot_product(&packed, &packed, len);
-        assert_eq!(result, len as f32, "Identical vectors must produce dot product = len ({})", len);
+        assert_eq!(
+            result, len as f32,
+            "Identical vectors must produce dot product = len ({})",
+            len
+        );
     }
 }
 
@@ -111,11 +132,20 @@ fn xnor_dot_product_identical_vectors() {
 fn xnor_dot_product_opposite_vectors() {
     // Flipped vectors → 0 matches → result = 2*0 - total = -total
     for len in [8, 16, 32, 64] {
-        let a_f32: Vec<f32> = (0..len).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
-        let b_f32: Vec<f32> = (0..len).map(|i| if i % 2 == 0 { -1.0 } else { 1.0 }).collect();
+        let a_f32: Vec<f32> = (0..len)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let b_f32: Vec<f32> = (0..len)
+            .map(|i| if i % 2 == 0 { -1.0 } else { 1.0 })
+            .collect();
         let a = pack_1bit(&a_f32);
         let b = pack_1bit(&b_f32);
         let result = xnor_dot_product(&a, &b, len);
-        assert_eq!(result, -(len as f32), "Opposite vectors must produce dot product = -len ({})", len);
+        assert_eq!(
+            result,
+            -(len as f32),
+            "Opposite vectors must produce dot product = -len ({})",
+            len
+        );
     }
 }

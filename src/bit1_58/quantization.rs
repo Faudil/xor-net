@@ -11,7 +11,7 @@ pub fn pack_1_58bit_4pack(weights: &[f32], w_scale: f32) -> Vec<u8> {
         for (i, &w) in chunk.iter().enumerate() {
             let scaled = if w_scale > 0.0 { w / w_scale } else { 0.0 };
             let q = scaled.round().max(-1.0).min(1.0);
-            
+
             let val = if q < -0.5 {
                 0b00
             } else if q > 0.5 {
@@ -53,7 +53,7 @@ pub fn pack_1_58bit_5pack(weights: &[f32], w_scale: f32) -> Vec<u8> {
         for &w in chunk {
             let scaled = if w_scale > 0.0 { w / w_scale } else { 0.0 };
             let q = scaled.round().max(-1.0).min(1.0);
-            
+
             let val = if q < -0.5 {
                 0
             } else if q > 0.5 {
@@ -97,7 +97,7 @@ pub unsafe fn quantize_f32_to_i8_avx512(activations: &[f32], quantized: &mut [i8
     let mut max_vec = _mm512_setzero_ps();
     let chunks = activations.len() / 16;
     let ptr = activations.as_ptr();
-    
+
     let sign_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFFFFFF));
 
     for i in 0..chunks {
@@ -105,42 +105,52 @@ pub unsafe fn quantize_f32_to_i8_avx512(activations: &[f32], quantized: &mut [i8
         let abs_v = _mm512_and_ps(sign_mask, v);
         max_vec = _mm512_max_ps(max_vec, abs_v);
     }
-    
+
     let mut max_arr = [0f32; 16];
     _mm512_storeu_ps(max_arr.as_mut_ptr(), max_vec);
     let mut max_abs = 0f32;
     for &m in &max_arr {
-        if m > max_abs { max_abs = m; }
+        if m > max_abs {
+            max_abs = m;
+        }
     }
     for i in chunks * 16..activations.len() {
         let abs = activations[i].abs();
-        if abs > max_abs { max_abs = abs; }
+        if abs > max_abs {
+            max_abs = abs;
+        }
     }
-    
+
     let scale = if max_abs > 0.0 { 127.0 / max_abs } else { 1.0 };
     let inv_scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
-    
+
     let v_scale = _mm512_set1_ps(scale);
     let v_max = _mm512_set1_ps(127.0);
     let v_min = _mm512_set1_ps(-127.0);
     let out_ptr = quantized.as_mut_ptr();
-    
+
     for i in 0..chunks {
         let v = _mm512_loadu_ps(ptr.add(i * 16));
         let scaled = _mm512_mul_ps(v, v_scale);
         let clamped = _mm512_max_ps(v_min, _mm512_min_ps(v_max, scaled));
-        
+
         let q_i32 = _mm512_cvtps_epi32(clamped);
         let q_i8 = _mm512_cvtepi32_epi8(q_i32);
         _mm_storeu_si128(out_ptr.add(i * 16) as *mut __m128i, q_i8);
     }
-    
+
     for i in chunks * 16..activations.len() {
         let q = (activations[i] * scale).round();
-        let q_clamped = if q > 127.0 { 127.0 } else if q < -127.0 { -127.0 } else { q };
+        let q_clamped = if q > 127.0 {
+            127.0
+        } else if q < -127.0 {
+            -127.0
+        } else {
+            q
+        };
         quantized[i] = q_clamped as i8;
     }
-    
+
     inv_scale
 }
 
@@ -182,15 +192,15 @@ pub fn quantize_f32_to_i8(activations: &[f32], quantized: &mut [i8]) -> f32 {
             max_abs = x.abs();
         }
     }
-    
+
     let scale = if max_abs > 0.0 { 127.0 / max_abs } else { 1.0 };
     let inv_scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
-    
+
     for (q_out, &x) in quantized.iter_mut().zip(activations.iter()) {
         let q = (x * scale).round();
         *q_out = q.max(-127.0).min(127.0) as i8;
     }
-    
+
     inv_scale
 }
 

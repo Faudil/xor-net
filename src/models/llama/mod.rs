@@ -11,10 +11,10 @@ pub mod attention;
 pub mod block;
 pub mod mlp;
 
-use crate::tensor::FastTensor;
-use crate::nn::{DynamicLinear, QuantizationConfig, LmHeadConfig, FastRmsNorm, CpuRingCache};
 use crate::bit1_58::quantization::TernaryPackType;
 use crate::loader::{SafeTensorLoader, sparse_loader::SparseFile};
+use crate::nn::{CpuRingCache, DynamicLinear, FastRmsNorm, LmHeadConfig, QuantizationConfig};
+use crate::tensor::FastTensor;
 use std::f32::consts::PI;
 
 use crate::nn::dynamic_linear::LinearKind;
@@ -62,7 +62,9 @@ pub enum Activation {
 }
 
 impl Default for Activation {
-    fn default() -> Self { Self::Silu }
+    fn default() -> Self {
+        Self::Silu
+    }
 }
 
 impl Activation {
@@ -126,7 +128,11 @@ impl LlamaConfig {
             max_position_embeddings: self.max_position_embeddings,
             tie_word_embeddings: self.tie_word_embeddings.unwrap_or(false),
             quantization_config: QuantizationConfig::None,
-            hidden_act: self.hidden_act.as_deref().map(Activation::from_str).unwrap_or_default(),
+            hidden_act: self
+                .hidden_act
+                .as_deref()
+                .map(Activation::from_str)
+                .unwrap_or_default(),
         }
     }
 }
@@ -436,7 +442,12 @@ impl Llama {
         Ok(logits)
     }
 
-    pub fn forward(&self, x: &[u32], index_pos: usize, cache: &mut Cache) -> anyhow::Result<FastTensor> {
+    pub fn forward(
+        &self,
+        x: &[u32],
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> anyhow::Result<FastTensor> {
         let start_other = std::time::Instant::now();
         let mut x = self.wte.forward(x)?;
         let other_elapsed1 = start_other.elapsed().as_micros() as u64;
@@ -509,8 +520,15 @@ impl Llama {
         Ok(logits)
     }
 
-    pub fn load(loader: &SafeTensorLoader, cfg: &Config, sparse: Option<&SparseFile>) -> anyhow::Result<Self> {
-        let wte_weight = loader.get(&[cfg.vocab_size, cfg.hidden_size], "model.embed_tokens.weight")?;
+    pub fn load(
+        loader: &SafeTensorLoader,
+        cfg: &Config,
+        sparse: Option<&SparseFile>,
+    ) -> anyhow::Result<Self> {
+        let wte_weight = loader.get(
+            &[cfg.vocab_size, cfg.hidden_size],
+            "model.embed_tokens.weight",
+        )?;
         let wte = FastEmbedding::new(wte_weight);
         // When the LM head is tied to the word embedding we control its
         // precision directly from `LmHeadConfig`. Ternary/int4 shrink the
@@ -554,7 +572,11 @@ impl Llama {
                 sparse,
             )?
         };
-        let ln_f = FastRmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps as f32, &loader.pp("model.norm"))?;
+        let ln_f = FastRmsNorm::load(
+            cfg.hidden_size,
+            cfg.rms_norm_eps as f32,
+            &loader.pp("model.norm"),
+        )?;
         let blocks: Result<Vec<_>, _> = (0..cfg.num_hidden_layers)
             .into_par_iter()
             .map(|i| Block::load(loader.pp(format!("model.layers.{i}")), cfg, sparse))

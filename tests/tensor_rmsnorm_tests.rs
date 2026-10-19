@@ -27,7 +27,13 @@ fn rmsnorm_unit_weight() {
     let rms = (12.5f32).sqrt();
     let expected = [3.0 / rms, 4.0 / rms];
     for (i, (&a, &e)) in out.data.iter().zip(expected.iter()).enumerate() {
-        assert!((a - e).abs() < EPS, "rmsnorm unit weight idx {}: {} vs {}", i, a, e);
+        assert!(
+            (a - e).abs() < EPS,
+            "rmsnorm unit weight idx {}: {} vs {}",
+            i,
+            a,
+            e
+        );
     }
 }
 
@@ -67,7 +73,10 @@ fn rmsnorm_large_values_no_nan() {
     let w = FastTensor::new(vec![1.0; 4], vec![4]);
     let out = x.rmsnorm(&w, 1e-6).unwrap();
     for &v in &out.data {
-        assert!(v.is_finite(), "rmsnorm must not produce NaN/Inf for large values");
+        assert!(
+            v.is_finite(),
+            "rmsnorm must not produce NaN/Inf for large values"
+        );
     }
 }
 
@@ -80,6 +89,12 @@ fn rmsnorm_weight_scaling() {
     let out1 = x.rmsnorm(&w1, 1e-6).unwrap();
     let out2 = x.rmsnorm(&w2, 1e-6).unwrap();
     for (i, (&a, &b)) in out2.data.iter().zip(out1.data.iter()).enumerate() {
-        assert!((a - 2.0 * b).abs() < EPS, "2× weight idx {}: {} vs 2*{}", i, a, b);
+        assert!(
+            (a - 2.0 * b).abs() < EPS,
+            "2× weight idx {}: {} vs 2*{}",
+            i,
+            a,
+            b
+        );
     }
 }

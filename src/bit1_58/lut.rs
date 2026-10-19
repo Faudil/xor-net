@@ -5,7 +5,11 @@ use std::arch::x86_64::*;
 /// Fewer instructions overall but shuffle-port heavy.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-pub unsafe fn ternary_dot_product_pack4_avx2_lut(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
+pub unsafe fn ternary_dot_product_pack4_avx2_lut(
+    a_i8: &[i8],
+    b_pack4: &[u8],
+    total_elems: usize,
+) -> i32 {
     unsafe {
         let a_ptr = a_i8.as_ptr() as *const __m256i;
         let b_ptr = b_pack4.as_ptr();
@@ -16,13 +20,13 @@ pub unsafe fn ternary_dot_product_pack4_avx2_lut(a_i8: &[i8], b_pack4: &[u8], to
         let ones_i16 = _mm256_set1_epi16(1);
 
         let dup_mask = _mm256_setr_epi8(
-            0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
-            4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7
+            0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7,
+            7, 7, 7,
         );
         let mask_0c03 = _mm256_set1_epi32(0x0C030C03u32 as i32);
         let decode_lut = _mm256_setr_epi8(
-            -1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-            -1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+            -1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, -1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+            0, 0, 0, 0,
         );
 
         let chunks32 = total_elems / 32;
@@ -39,7 +43,10 @@ pub unsafe fn ternary_dot_product_pack4_avx2_lut(a_i8: &[i8], b_pack4: &[u8], to
             let vb0 = _mm256_blend_epi16(v0, vs0, 0xAA);
             let idx0 = _mm256_and_si256(vb0, mask_0c03);
             let w0 = _mm256_shuffle_epi8(decode_lut, idx0);
-            let s0 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_u8, _mm256_sign_epi8(acts0, w0)), ones_i16);
+            let s0 = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(ones_u8, _mm256_sign_epi8(acts0, w0)),
+                ones_i16,
+            );
             acc0 = _mm256_add_epi32(acc0, s0);
 
             let acts1 = _mm256_loadu_si256(a_ptr.add(i + 1));
@@ -50,7 +57,10 @@ pub unsafe fn ternary_dot_product_pack4_avx2_lut(a_i8: &[i8], b_pack4: &[u8], to
             let vb1 = _mm256_blend_epi16(v1, vs1, 0xAA);
             let idx1 = _mm256_and_si256(vb1, mask_0c03);
             let w1 = _mm256_shuffle_epi8(decode_lut, idx1);
-            let s1 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_u8, _mm256_sign_epi8(acts1, w1)), ones_i16);
+            let s1 = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(ones_u8, _mm256_sign_epi8(acts1, w1)),
+                ones_i16,
+            );
             acc1 = _mm256_add_epi32(acc1, s1);
 
             i += 2;
@@ -66,7 +76,10 @@ pub unsafe fn ternary_dot_product_pack4_avx2_lut(a_i8: &[i8], b_pack4: &[u8], to
             let vb = _mm256_blend_epi16(v, vs, 0xAA);
             let idx = _mm256_and_si256(vb, mask_0c03);
             let w = _mm256_shuffle_epi8(decode_lut, idx);
-            let s = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_u8, _mm256_sign_epi8(acts, w)), ones_i16);
+            let s = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(ones_u8, _mm256_sign_epi8(acts, w)),
+                ones_i16,
+            );
             acc32 = _mm256_add_epi32(acc32, s);
         }
 
@@ -82,10 +95,18 @@ pub unsafe fn ternary_dot_product_pack4_avx2_lut(a_i8: &[i8], b_pack4: &[u8], to
             let w1 = ((w_byte >> 2) & 0x03) as i8 - 1;
             let w2 = ((w_byte >> 4) & 0x03) as i8 - 1;
             let w3 = ((w_byte >> 6) & 0x03) as i8 - 1;
-            if rem_idx < total_elems { sum += a_i8[rem_idx] as i32 * w0 as i32; }
-            if rem_idx + 1 < total_elems { sum += a_i8[rem_idx + 1] as i32 * w1 as i32; }
-            if rem_idx + 2 < total_elems { sum += a_i8[rem_idx + 2] as i32 * w2 as i32; }
-            if rem_idx + 3 < total_elems { sum += a_i8[rem_idx + 3] as i32 * w3 as i32; }
+            if rem_idx < total_elems {
+                sum += a_i8[rem_idx] as i32 * w0 as i32;
+            }
+            if rem_idx + 1 < total_elems {
+                sum += a_i8[rem_idx + 1] as i32 * w1 as i32;
+            }
+            if rem_idx + 2 < total_elems {
+                sum += a_i8[rem_idx + 2] as i32 * w2 as i32;
+            }
+            if rem_idx + 3 < total_elems {
+                sum += a_i8[rem_idx + 3] as i32 * w3 as i32;
+            }
             rem_idx += 4;
             w_idx += 1;
         }
@@ -102,7 +123,11 @@ pub unsafe fn ternary_dot_product_pack4_avx2_lut(a_i8: &[i8], b_pack4: &[u8], to
 /// Interleaving them lets the OoO engine overlap both pipelines.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-pub unsafe fn ternary_dot_product_pack4_avx2_hybrid(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
+pub unsafe fn ternary_dot_product_pack4_avx2_hybrid(
+    a_i8: &[i8],
+    b_pack4: &[u8],
+    total_elems: usize,
+) -> i32 {
     unsafe {
         let a_ptr = a_i8.as_ptr() as *const __m256i;
         let b_ptr = b_pack4.as_ptr();
@@ -116,20 +141,20 @@ pub unsafe fn ternary_dot_product_pack4_avx2_hybrid(a_i8: &[i8], b_pack4: &[u8],
 
         // ---- LUT decode constants ----
         let dup_mask = _mm256_setr_epi8(
-            0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
-            4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7
+            0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7,
+            7, 7, 7,
         );
         let mask_0c03 = _mm256_set1_epi32(0x0C030C03u32 as i32);
         let decode_lut = _mm256_setr_epi8(
-            -1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-            -1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+            -1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, -1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+            0, 0, 0, 0,
         );
 
         // ---- Original decode constants ----
         let mask3 = _mm256_set1_epi32(0x03);
         let orig_lut = _mm256_setr_epi8(
-            -1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            -1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            -1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
         );
 
         let chunks32 = total_elems / 32;
@@ -217,10 +242,8 @@ pub unsafe fn ternary_dot_product_pack4_avx2_hybrid(a_i8: &[i8], b_pack4: &[u8],
         }
 
         // Merge the 4 accumulators
-        let mut acc32 = _mm256_add_epi32(
-            _mm256_add_epi32(acc0, acc1),
-            _mm256_add_epi32(acc2, acc3),
-        );
+        let mut acc32 =
+            _mm256_add_epi32(_mm256_add_epi32(acc0, acc1), _mm256_add_epi32(acc2, acc3));
 
         // Handle remainder chunks (< 4) with LUT decode
         for i in i..chunks32 {
@@ -253,10 +276,18 @@ pub unsafe fn ternary_dot_product_pack4_avx2_hybrid(a_i8: &[i8], b_pack4: &[u8],
             let w1 = ((w_byte >> 2) & 0x03) as i8 - 1;
             let w2 = ((w_byte >> 4) & 0x03) as i8 - 1;
             let w3 = ((w_byte >> 6) & 0x03) as i8 - 1;
-            if rem_idx < total_elems { sum += a_i8[rem_idx] as i32 * w0 as i32; }
-            if rem_idx + 1 < total_elems { sum += a_i8[rem_idx + 1] as i32 * w1 as i32; }
-            if rem_idx + 2 < total_elems { sum += a_i8[rem_idx + 2] as i32 * w2 as i32; }
-            if rem_idx + 3 < total_elems { sum += a_i8[rem_idx + 3] as i32 * w3 as i32; }
+            if rem_idx < total_elems {
+                sum += a_i8[rem_idx] as i32 * w0 as i32;
+            }
+            if rem_idx + 1 < total_elems {
+                sum += a_i8[rem_idx + 1] as i32 * w1 as i32;
+            }
+            if rem_idx + 2 < total_elems {
+                sum += a_i8[rem_idx + 2] as i32 * w2 as i32;
+            }
+            if rem_idx + 3 < total_elems {
+                sum += a_i8[rem_idx + 3] as i32 * w3 as i32;
+            }
             rem_idx += 4;
             w_idx += 1;
         }

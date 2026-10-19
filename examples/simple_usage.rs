@@ -1,17 +1,17 @@
 use std::path::Path;
 use tokenizers::Tokenizer;
-use xor_net::{AutoModelForCausalLM, Cache, QuantizationConfig};
+use xor_net::Sampler;
 use xor_net::bit1_58::quantization::TernaryPackType;
 use xor_net::nn::LmHeadConfig;
-use xor_net::Sampler;
+use xor_net::{AutoModelForCausalLM, Cache, QuantizationConfig};
 
 fn main() -> anyhow::Result<()> {
     let model_path = "/home/faudil/RustroverProjects/XorNet/models/bitnet-2b";
     let (model, config) = AutoModelForCausalLM::from_local(
-        Path::new(model_path), 
-        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, true)
+        Path::new(model_path),
+        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, true),
     )?;
-    
+
     let tokenizer_path = Path::new(model_path).join("tokenizer.json");
     let tokenizer = if tokenizer_path.exists() {
         Tokenizer::from_file(tokenizer_path).unwrap()
@@ -34,12 +34,12 @@ fn main() -> anyhow::Result<()> {
 
     println!("=== Testing Prompt ===");
     println!("Tokens: {:?}", tokens);
-    
+
     let mut cache = Cache::new(true, &config)?;
     let mut response_tokens = Vec::new();
-    
+
     for i in 0..tokens.len() {
-        let logits = model.forward(&tokens[i..i+1], i, &mut cache)?;
+        let logits = model.forward(&tokens[i..i + 1], i, &mut cache)?;
         if i == tokens.len() - 1 {
             let mut logits_data = logits.into_data();
             let next_token = sampler.sample(&mut logits_data, &response_tokens)?;
@@ -47,10 +47,14 @@ fn main() -> anyhow::Result<()> {
             response_tokens.push(next_token);
         }
     }
-    
+
     let mut current_pos = tokens.len() - 1;
     for _ in 0..100 {
-        let logits = model.forward(&tokens[current_pos..current_pos+1], current_pos, &mut cache)?;
+        let logits = model.forward(
+            &tokens[current_pos..current_pos + 1],
+            current_pos,
+            &mut cache,
+        )?;
         let mut logits_data = logits.into_data();
         let next_token = sampler.sample(&mut logits_data, &response_tokens)?;
         tokens.push(next_token);
@@ -60,7 +64,10 @@ fn main() -> anyhow::Result<()> {
             break;
         }
     }
-    println!("Response: {}", tokenizer.decode(&response_tokens, true).unwrap());
+    println!(
+        "Response: {}",
+        tokenizer.decode(&response_tokens, true).unwrap()
+    );
 
     Ok(())
 }

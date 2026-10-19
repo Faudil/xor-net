@@ -23,17 +23,15 @@
 //!   XORNET_POOL_THREADS  if >0, per-stream pool size  (default 0 = shared)
 //!   XORNET_MODEL          model dir / hub id            (default models/bitnet-2b)
 
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::Api};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 use xor_net::models::llama::Config;
-use xor_net::sampler::Sampler;
-use xor_net::{
-    AutoModelForCausalLM, Cache, Llama, QuantizationConfig, TernaryPackType,
-};
 use xor_net::nn::LmHeadConfig;
+use xor_net::sampler::Sampler;
+use xor_net::{AutoModelForCausalLM, Cache, Llama, QuantizationConfig, TernaryPackType};
 
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
@@ -53,9 +51,8 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
-    let prompt = std::env::var("XORNET_PROMPT").unwrap_or_else(|_| {
-        "The history of the Roman Empire is".to_string()
-    });
+    let prompt = std::env::var("XORNET_PROMPT")
+        .unwrap_or_else(|_| "The history of the Roman Empire is".to_string());
     let gthreads: usize = std::env::var("XORNET_GLOBAL_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -70,7 +67,8 @@ fn main() -> anyhow::Result<()> {
 
     let _ = xor_net::init_threads(gthreads);
 
-    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, true);
+    let quantization =
+        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, true);
 
     let load_start = Instant::now();
     let (model, config): (Llama, Config) = if Path::new(&model_path).is_dir() {
@@ -157,7 +155,12 @@ fn main() -> anyhow::Result<()> {
         let (ng, per, text) = res;
         total_gen += ng as u64;
         per_streams.push(per);
-        println!("  stream ng={} ({:.2} tok/s): {}", ng, per, text.replace('\n', " "));
+        println!(
+            "  stream ng={} ({:.2} tok/s): {}",
+            ng,
+            per,
+            text.replace('\n', " ")
+        );
     }
     let wall = wall_start.elapsed();
 
@@ -207,6 +210,8 @@ fn run_stream(
     }
     let ng = tokens_vec.len() - init_len;
     let per = ng as f64 / gen_start.elapsed().as_secs_f64();
-    let text = tok.decode(&tokens_vec[init_len..], true).unwrap_or_default();
+    let text = tok
+        .decode(&tokens_vec[init_len..], true)
+        .unwrap_or_default();
     (ng, per, text)
 }

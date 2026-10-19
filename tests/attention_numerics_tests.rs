@@ -1,7 +1,7 @@
 //! Non-regression tests for attention numerics: softmax row sums,
 //! causal mask correctness, and cache write behavior.
 
-use xor_net::nn::{fast_attention, CpuRingCache};
+use xor_net::nn::{CpuRingCache, fast_attention};
 use xor_net::tensor::FastTensor;
 
 const EPS: f32 = 1e-4;
@@ -15,17 +15,40 @@ fn attention_single_token_is_identity() {
     let head_dim = 4;
     let mut cache = CpuRingCache::new(1, num_kv_heads, 32, head_dim, false);
 
-    let q = FastTensor::new(vec![1.0; num_heads * head_dim], vec![1, num_heads, 1, head_dim]);
-    let k = FastTensor::new(vec![1.0; num_kv_heads * head_dim], vec![1, num_kv_heads, 1, head_dim]);
+    let q = FastTensor::new(
+        vec![1.0; num_heads * head_dim],
+        vec![1, num_heads, 1, head_dim],
+    );
+    let k = FastTensor::new(
+        vec![1.0; num_kv_heads * head_dim],
+        vec![1, num_kv_heads, 1, head_dim],
+    );
     let v_data: Vec<f32> = (0..num_kv_heads * head_dim).map(|i| i as f32).collect();
     let v = FastTensor::new(v_data.clone(), vec![1, num_kv_heads, 1, head_dim]);
 
-    let out = fast_attention(&q, &k, &v, 0, 0, &mut cache, num_heads, num_kv_heads, head_dim).unwrap();
+    let out = fast_attention(
+        &q,
+        &k,
+        &v,
+        0,
+        0,
+        &mut cache,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+    )
+    .unwrap();
     // With GQA ratio 1:1, head h uses kv head h
     // Output should equal V for each head
     assert_eq!(out.shape, vec![1, num_heads, 1, head_dim]);
     for (i, (&a, &e)) in out.data.iter().zip(v_data.iter()).enumerate() {
-        assert!((a - e).abs() < EPS, "Single-token attention idx {}: {} vs {}", i, a, e);
+        assert!(
+            (a - e).abs() < EPS,
+            "Single-token attention idx {}: {} vs {}",
+            i,
+            a,
+            e
+        );
     }
 }
 
@@ -42,13 +65,35 @@ fn attention_causal_mask_second_token_no_future() {
     let q0 = FastTensor::new(vec![1.0, 0.0], vec![1, 1, 1, 2]);
     let k0 = FastTensor::new(vec![1.0, 0.0], vec![1, 1, 1, 2]);
     let v0 = FastTensor::new(vec![10.0, 0.0], vec![1, 1, 1, 2]);
-    let _ = fast_attention(&q0, &k0, &v0, 0, 0, &mut cache, num_heads, num_kv_heads, head_dim).unwrap();
+    let _ = fast_attention(
+        &q0,
+        &k0,
+        &v0,
+        0,
+        0,
+        &mut cache,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+    )
+    .unwrap();
 
     // Step 1: insert K=[0,1], V=[0,20], query=[1,1]
     let q1 = FastTensor::new(vec![1.0, 1.0], vec![1, 1, 1, 2]);
     let k1 = FastTensor::new(vec![0.0, 1.0], vec![1, 1, 1, 2]);
     let v1 = FastTensor::new(vec![0.0, 20.0], vec![1, 1, 1, 2]);
-    let out = fast_attention(&q1, &k1, &v1, 0, 1, &mut cache, num_heads, num_kv_heads, head_dim).unwrap();
+    let out = fast_attention(
+        &q1,
+        &k1,
+        &v1,
+        0,
+        1,
+        &mut cache,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+    )
+    .unwrap();
 
     // Q=[1,1] · K0=[1,0] = 1, Q=[1,1] · K1=[0,1] = 1 (equal scores)
     // After softmax with equal scores → [0.5, 0.5]
@@ -92,7 +137,18 @@ fn attention_output_finite() {
     let k = FastTensor::new(k_data, vec![1, num_kv_heads, seq_len, head_dim]);
     let v = FastTensor::new(v_data, vec![1, num_kv_heads, seq_len, head_dim]);
 
-    let out = fast_attention(&q, &k, &v, 0, 0, &mut cache, num_heads, num_kv_heads, head_dim).unwrap();
+    let out = fast_attention(
+        &q,
+        &k,
+        &v,
+        0,
+        0,
+        &mut cache,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+    )
+    .unwrap();
     for (i, &v) in out.data.iter().enumerate() {
         assert!(v.is_finite(), "Attention output NaN/Inf at idx {}", i);
     }

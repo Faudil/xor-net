@@ -1,5 +1,5 @@
-use crate::tensor::FastTensor;
 use crate::loader::SafeTensorLoader;
+use crate::tensor::FastTensor;
 
 #[derive(Debug, Clone)]
 pub struct FastRmsNorm {
@@ -11,7 +11,7 @@ impl FastRmsNorm {
     pub fn new(weight: FastTensor, eps: f32) -> Self {
         Self { eps, weight }
     }
-    
+
     pub fn forward(&self, t: &FastTensor) -> anyhow::Result<FastTensor> {
         t.rmsnorm(&self.weight, self.eps)
     }

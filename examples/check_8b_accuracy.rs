@@ -1,7 +1,7 @@
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::Api};
 use std::time::Instant;
-use xor_net::{AutoModelForCausalLM, QuantizationConfig};
 use xor_net::bit1_58::quantization::TernaryPackType;
+use xor_net::{AutoModelForCausalLM, QuantizationConfig};
 
 fn main() -> anyhow::Result<()> {
     xor_net::init_threads(1).map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -9,7 +9,8 @@ fn main() -> anyhow::Result<()> {
     let model_id = "HF1BitLLM/Llama3-8B-1.58-100B-tokens";
     println!("Loading {}...", model_id);
 
-    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, xor_net::nn::LmHeadConfig::F32, true);
+    let quantization =
+        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, xor_net::nn::LmHeadConfig::F32, true);
 
     let load_start = Instant::now();
     let (model, config) = AutoModelForCausalLM::from_pretrained(model_id, quantization)?;
@@ -45,12 +46,19 @@ fn main() -> anyhow::Result<()> {
             let logit_max = logits.data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
             println!("Logits range: [{:.4}, {:.4}]", logit_min, logit_max);
             let mut indices: Vec<usize> = (0..logits.data.len()).collect();
-            indices.sort_unstable_by(|&a, &b| logits.data[b].partial_cmp(&logits.data[a]).unwrap_or(std::cmp::Ordering::Equal));
+            indices.sort_unstable_by(|&a, &b| {
+                logits.data[b]
+                    .partial_cmp(&logits.data[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             println!("Top 5 tokens:");
             for i in 0..5.min(indices.len()) {
                 let idx = indices[i];
                 let tok_str = tokenizer.id_to_token(idx as u32).unwrap_or_default();
-                println!("  [{}] token_id={}, logit={:.4}, tok={:?}", i, idx, logits.data[idx], tok_str);
+                println!(
+                    "  [{}] token_id={}, logit={:.4}, tok={:?}",
+                    i, idx, logits.data[idx], tok_str
+                );
             }
         }
         Ok(Err(e)) => eprintln!("Forward error: {:?}", e),

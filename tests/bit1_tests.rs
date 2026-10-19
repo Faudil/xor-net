@@ -1,6 +1,6 @@
+use xor_net::bit1::layers::BitLinear;
 use xor_net::bit1::quantization::pack_1bit;
 use xor_net::bit1::simd::{xnor_dot_product, xnor_dot_product_avx2};
-use xor_net::bit1::layers::BitLinear;
 use xor_net::tensor::FastTensor;
 
 #[test]
@@ -15,14 +15,18 @@ fn test_bit1_packing() {
 fn test_bit1_simd_parity() {
     let lengths = [8, 16, 32, 40, 64, 96, 100, 128, 256, 260];
     for &len in &lengths {
-        let a_floats: Vec<f32> = (0..len).map(|i| if i % 3 == 0 { -1.0 } else { 1.0 }).collect();
-        let b_floats: Vec<f32> = (0..len).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
-        
+        let a_floats: Vec<f32> = (0..len)
+            .map(|i| if i % 3 == 0 { -1.0 } else { 1.0 })
+            .collect();
+        let b_floats: Vec<f32> = (0..len)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+
         let a_packed = pack_1bit(&a_floats);
         let b_packed = pack_1bit(&b_floats);
-        
+
         let scalar_res = xnor_dot_product(&a_packed, &b_packed, len);
-        
+
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             if is_x86_feature_detected!("avx2") {
@@ -37,15 +41,12 @@ fn test_bit1_simd_parity() {
 fn test_bit1_linear_layer() {
     let in_dim = 4;
     let out_dim = 2;
-    let weights = vec![
-         1.0, -1.0,  1.0,  1.0,
-        -1.0, -1.0,  1.0, -1.0,
-    ];
+    let weights = vec![1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0];
     let layer = BitLinear::new(in_dim, out_dim, &weights).unwrap();
-    
+
     let input = FastTensor::new(vec![0.5f32, 1.0, -0.5, 2.0], vec![1, in_dim]);
     let out = layer.forward(&input).unwrap();
     let out_vec = &out.data;
-    
+
     assert_eq!(*out_vec, vec![0.0, -4.0]);
 }

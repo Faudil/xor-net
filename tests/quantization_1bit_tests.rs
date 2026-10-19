@@ -44,13 +44,18 @@ fn pack_1bit_non_aligned_length() {
     let packed = pack_1bit(&weights);
     assert_eq!(packed.len(), 1);
     // Bits: 1, 0, 1, 0, 0, 0, 0, 0 = 0b00000101 = 5
-    assert_eq!(packed[0], 0b00000101, "Non-aligned packing must zero-pad high bits");
+    assert_eq!(
+        packed[0], 0b00000101,
+        "Non-aligned packing must zero-pad high bits"
+    );
 }
 
 #[test]
 fn pack_1bit_multi_byte() {
     // 16 elements → 2 bytes
-    let weights: Vec<f32> = (0..16).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+    let weights: Vec<f32> = (0..16)
+        .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+        .collect();
     let packed = pack_1bit(&weights);
     assert_eq!(packed.len(), 2);
     // Alternating pattern: bits 1,0,1,0,1,0,1,0 = 0x55
@@ -61,7 +66,16 @@ fn pack_1bit_multi_byte() {
 #[test]
 fn pack_1bit_large_values() {
     // Very large magnitudes should still follow the sign convention
-    let weights = vec![1e30, -1e30, f32::MAX, f32::MIN, 1e-38, -1e-38, 0.0, f32::EPSILON];
+    let weights = vec![
+        1e30,
+        -1e30,
+        f32::MAX,
+        f32::MIN,
+        1e-38,
+        -1e-38,
+        0.0,
+        f32::EPSILON,
+    ];
     let packed = pack_1bit(&weights);
     // Expected bits (LSB first): 1,0,1,0,1,0,1,1 = 0b11010101 = 213
     assert_eq!(packed[0], 0b11010101);

@@ -1,13 +1,13 @@
-use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::bit1_58::quantization::TernaryPackType;
+use crate::init_threads;
 use crate::models::auto::AutoModelForCausalLM;
 use crate::models::llama::{Cache, Config, Llama, LlamaConfig};
-use crate::bit1_58::quantization::TernaryPackType;
-use crate::nn::{QuantizationConfig, LmHeadConfig};
-use crate::init_threads;
+use crate::nn::{LmHeadConfig, QuantizationConfig};
 
 #[pyclass]
 #[derive(Clone)]
@@ -23,13 +23,21 @@ impl QuantizationConfigPy {
         let pack = match pack_type.to_lowercase().as_str() {
             "pack4" => TernaryPackType::Pack4,
             "pack5" => TernaryPackType::Pack5,
-            _ => return Err(PyRuntimeError::new_err(format!("Unknown pack type: {pack_type}"))),
+            _ => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "Unknown pack type: {pack_type}"
+                )));
+            }
         };
         let lm_head_config = match lm_head.to_lowercase().as_str() {
             "int4" => LmHeadConfig::Int4,
             "int8" => LmHeadConfig::Int8,
             "fp32" => LmHeadConfig::F32,
-            _ => return Err(PyRuntimeError::new_err(format!("Unknown lm_head config: {lm_head}"))),
+            _ => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "Unknown lm_head config: {lm_head}"
+                )));
+            }
         };
         Ok(Self {
             inner: QuantizationConfig::Bit1_58(pack, lm_head_config, true),
@@ -46,8 +54,8 @@ pub struct ModelConfig {
 impl ModelConfig {
     #[staticmethod]
     fn from_json(json_str: &str) -> PyResult<Self> {
-        let llama_config: LlamaConfig = serde_json::from_str(json_str)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let llama_config: LlamaConfig =
+            serde_json::from_str(json_str).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self {
             inner: llama_config.into_config(false),
         })
@@ -92,21 +100,30 @@ impl XorNetModel {
             init_threads(n).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
 
-        let quant_config = quantization.map(|q| q.inner).unwrap_or(QuantizationConfig::None);
+        let quant_config = quantization
+            .map(|q| q.inner)
+            .unwrap_or(QuantizationConfig::None);
 
         let (model, config) = AutoModelForCausalLM::from_pretrained(model_id, quant_config)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        let api = hf_hub::api::sync::Api::new().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let repo = api.repo(hf_hub::Repo::new(model_id.to_string(), hf_hub::RepoType::Model));
+        let api =
+            hf_hub::api::sync::Api::new().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let repo = api.repo(hf_hub::Repo::new(
+            model_id.to_string(),
+            hf_hub::RepoType::Model,
+        ));
 
-        let tokenizer_file = repo.get("tokenizer.json").map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let tokenizer_file = repo
+            .get("tokenizer.json")
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let tokenizer = Arc::new(
             tokenizers::Tokenizer::from_file(&tokenizer_file)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
         );
 
-        let cache = Cache::new(true, &config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let cache =
+            Cache::new(true, &config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let sampler = crate::Sampler::new(299792458, Some(0.7), None, 1.0);
 
@@ -130,7 +147,9 @@ impl XorNetModel {
             init_threads(n).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
 
-        let quant_config = quantization.map(|q| q.inner).unwrap_or(QuantizationConfig::None);
+        let quant_config = quantization
+            .map(|q| q.inner)
+            .unwrap_or(QuantizationConfig::None);
 
         let model_dir = Path::new(model_dir);
         let (model, config) = AutoModelForCausalLM::from_local(model_dir, quant_config)
@@ -139,10 +158,11 @@ impl XorNetModel {
         let tokenizer_file = model_dir.join("tokenizer.json");
         let tokenizer = Arc::new(
             tokenizers::Tokenizer::from_file(&tokenizer_file)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
         );
 
-        let cache = Cache::new(true, &config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let cache =
+            Cache::new(true, &config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let sampler = crate::Sampler::new(299792458, Some(0.7), None, 1.0);
 
@@ -153,9 +173,9 @@ impl XorNetModel {
             tokenizer,
             sampler,
         })
-}
- 
-#[pyo3(signature = (prompt, max_tokens=None, temperature=None, top_p=None, top_k=None, seed=None))]
+    }
+
+    #[pyo3(signature = (prompt, max_tokens=None, temperature=None, top_p=None, top_k=None, seed=None))]
     fn generate(
         &mut self,
         prompt: &str,
@@ -172,9 +192,12 @@ impl XorNetModel {
         let seed = seed.unwrap_or(299792458);
 
         self.sampler = crate::Sampler::new(seed, Some(temperature), Some(top_p), 1.0);
-        self.cache = Cache::new(true, &self.config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        self.cache =
+            Cache::new(true, &self.config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        let encoding = self.tokenizer.encode(prompt, true)
+        let encoding = self
+            .tokenizer
+            .encode(prompt, true)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mut tokens = encoding.get_ids().to_vec();
 
@@ -187,19 +210,23 @@ impl XorNetModel {
 
         let mut index_pos = 0;
         let mut _generated = 0;
- 
+
         for _ in 0..max_tokens {
             let context_size = if index_pos == 0 { tokens.len() } else { 1 };
             let start_pos = tokens.len().saturating_sub(context_size);
- 
-            let logits = self.model.forward(&tokens[start_pos..], index_pos, &mut self.cache)
+
+            let logits = self
+                .model
+                .forward(&tokens[start_pos..], index_pos, &mut self.cache)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
- 
+
             let mut logits = logits.into_data();
-            let next_token = self.sampler.sample(&mut logits, &tokens)
+            let next_token = self
+                .sampler
+                .sample(&mut logits, &tokens)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
- 
-tokens.push(next_token);
+
+            tokens.push(next_token);
             index_pos += context_size;
             _generated += 1;
 
@@ -208,13 +235,15 @@ tokens.push(next_token);
             }
         }
 
-        let output = self.tokenizer.decode(&tokens, true)
+        let output = self
+            .tokenizer
+            .decode(&tokens, true)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         Ok(output)
     }
- 
-#[pyo3(signature = (prompt, max_tokens=None, temperature=None, top_p=None, top_k=None, seed=None))]
+
+    #[pyo3(signature = (prompt, max_tokens=None, temperature=None, top_p=None, top_k=None, seed=None))]
     fn generate_stream(
         &mut self,
         prompt: &str,
@@ -231,9 +260,12 @@ tokens.push(next_token);
         let seed = seed.unwrap_or(299792458);
 
         self.sampler = crate::Sampler::new(seed, Some(temperature), Some(top_p), 1.0);
-        self.cache = Cache::new(true, &self.config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        self.cache =
+            Cache::new(true, &self.config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        let encoding = self.tokenizer.encode(prompt, true)
+        let encoding = self
+            .tokenizer
+            .encode(prompt, true)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mut tokens = encoding.get_ids().to_vec();
 
@@ -252,18 +284,24 @@ tokens.push(next_token);
             let context_size = if index_pos == 0 { tokens.len() } else { 1 };
             let start_pos = tokens.len().saturating_sub(context_size);
 
-            let logits = self.model.forward(&tokens[start_pos..], index_pos, &mut self.cache)
+            let logits = self
+                .model
+                .forward(&tokens[start_pos..], index_pos, &mut self.cache)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             let mut logits = logits.into_data();
-            let next_token = self.sampler.sample(&mut logits, &tokens)
+            let next_token = self
+                .sampler
+                .sample(&mut logits, &tokens)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             tokens.push(next_token);
             index_pos += context_size;
             _generated += 1;
 
-            let current_text = self.tokenizer.decode(&tokens, true)
+            let current_text = self
+                .tokenizer
+                .decode(&tokens, true)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             outputs.push(current_text);
 
@@ -276,18 +314,23 @@ tokens.push(next_token);
     }
 
     fn tokenize(&self, text: &str) -> PyResult<Vec<u32>> {
-        let encoding = self.tokenizer.encode(text, true)
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(encoding.get_ids().to_vec())
     }
 
     fn decode(&self, tokens: Vec<u32>) -> PyResult<String> {
-        self.tokenizer.decode(&tokens, true)
+        self.tokenizer
+            .decode(&tokens, true)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     fn config(&self) -> ModelConfig {
-        ModelConfig { inner: self.config.clone() }
+        ModelConfig {
+            inner: self.config.clone(),
+        }
     }
 }
 

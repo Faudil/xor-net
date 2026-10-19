@@ -1,10 +1,10 @@
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::Api};
 use std::path::Path;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 use xor_net::Sampler;
-use xor_net::{AutoModelForCausalLM, QuantizationConfig, TernaryPackType};
 use xor_net::nn::LmHeadConfig;
+use xor_net::{AutoModelForCausalLM, QuantizationConfig, TernaryPackType};
 
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
@@ -16,10 +16,11 @@ static GLOBAL: Jemalloc = Jemalloc;
 fn main() -> anyhow::Result<()> {
     xor_net::init_threads(0).map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    let model_path = std::env::args().nth(1).unwrap_or_else(|| {
-        "/home/faudil/RustroverProjects/XorNet/models/bitnet-2b".to_string()
-    });
-    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, true);
+    let model_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/home/faudil/RustroverProjects/XorNet/models/bitnet-2b".to_string());
+    let quantization =
+        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, true);
 
     let load_start = Instant::now();
     let (model, config) = if Path::new(&model_path).is_dir() {
@@ -39,8 +40,8 @@ fn main() -> anyhow::Result<()> {
         RepoType::Model,
     ));
     let tokenizer_filename = repo.get("tokenizer.json")?;
-    let tokenizer = Tokenizer::from_file(tokenizer_filename)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let tokenizer =
+        Tokenizer::from_file(tokenizer_filename).map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     let prompt = "The capital of France is";
     let mut tokens = tokenizer
@@ -85,9 +86,7 @@ fn main() -> anyhow::Result<()> {
     let tps = max_len as f64 / elapsed.as_secs_f64();
     println!(
         "Generated {} tokens in {:.2?} ({:.2} tokens/sec)",
-        max_len,
-        elapsed,
-        tps
+        max_len, elapsed, tps
     );
 
     // ── Detailed stage profiling (accumulated across the whole run) ──────────

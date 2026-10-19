@@ -13,7 +13,9 @@ pub fn get_pooled_buffer(size: usize) -> Vec<f32> {
             if buf.capacity() < size {
                 buf.reserve(size - buf.len());
             }
-            unsafe { buf.set_len(size); }
+            unsafe {
+                buf.set_len(size);
+            }
             buf
         } else {
             crate::util::uninit_vec(size)
@@ -41,7 +43,9 @@ pub fn get_pooled_buffer_i8(size: usize) -> Vec<i8> {
             if buf.capacity() < size {
                 buf.reserve(size - buf.len());
             }
-            unsafe { buf.set_len(size); }
+            unsafe {
+                buf.set_len(size);
+            }
             buf
         } else {
             crate::util::uninit_vec(size)

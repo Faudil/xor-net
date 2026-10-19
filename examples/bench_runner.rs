@@ -14,14 +14,14 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use hf_hub::api::sync::Api;
 use hf_hub::{Repo, RepoType};
 use rayon::ThreadPoolBuilder;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokenizers::Tokenizer;
 
 use xor_net::bit1_58::quantization::TernaryPackType;
@@ -414,10 +414,11 @@ fn main() -> anyhow::Result<()> {
     let streams = env_usize("XORNET_STREAMS", 4);
     let pool_threads = env_usize("XORNET_POOL_THREADS", 0);
     let tokens = env_usize("XORNET_TOKENS", 128);
-    let prompt = env_str("XORNET_PROMPT").unwrap_or_else(|| "The history of the Roman Empire is".into());
+    let prompt =
+        env_str("XORNET_PROMPT").unwrap_or_else(|| "The history of the Roman Empire is".into());
     let model_path = env_str("XORNET_MODEL").unwrap_or_else(|| "models/bitnet-2b".into());
-    let tok_repo = env_str("XORNET_TOKENIZER_REPO")
-        .unwrap_or_else(|| "microsoft/bitnet-b1.58-2B-4T".into());
+    let tok_repo =
+        env_str("XORNET_TOKENIZER_REPO").unwrap_or_else(|| "microsoft/bitnet-b1.58-2B-4T".into());
     let seed_base = env_usize("XORNET_SEED", 299792458) as u64;
 
     let _ = xor_net::init_threads(threads);
@@ -542,7 +543,9 @@ fn main() -> anyhow::Result<()> {
         obj.insert("silu_ms".into(), json!(r.prof.silu as f64 / 1e6));
         eprintln!(
             "[bench_runner] aggregate={:.2} tok/s | streams={} total_gen={} wall={:.1?} avg/stream={:.2}",
-            agg, streams, r.total_gen,
+            agg,
+            streams,
+            r.total_gen,
             std::time::Duration::from_secs_f64(r.wall_ms / 1000.0),
             avg
         );

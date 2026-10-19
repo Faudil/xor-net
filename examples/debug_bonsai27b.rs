@@ -1,11 +1,12 @@
 //! Debug: dump layer outputs for correctness comparison with Python reference.
 //! Usage: cargo run --example debug_bonsai27b --release -- <gguf>
 use std::sync::Arc;
-use xor_net::*;
 use xor_net::models::bonsai_qwen35::*;
+use xor_net::*;
 
 fn main() -> anyhow::Result<()> {
-    let path = std::env::args().nth(1)
+    let path = std::env::args()
+        .nth(1)
         .unwrap_or_else(|| "/tmp/bonsai-27b-q1_0.gguf".to_string());
     let device = candle_core::Device::Cpu;
     let gguf = Arc::new(GgufFile::open(&path)?);
@@ -22,10 +23,12 @@ fn main() -> anyhow::Result<()> {
     let out0 = model.debug_block(0, &x, 0, &mut cache)?;
     let o0: Vec<f32> = out0.flatten_all()?.to_vec1()?;
     println!("blk0(SSM) out: first10={:?}", &o0[..10]);
-    println!("blk0(SSM) out: min={} max={} mean={}",
+    println!(
+        "blk0(SSM) out: min={} max={} mean={}",
         o0.iter().cloned().fold(f32::INFINITY, f32::min),
         o0.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-        o0.iter().sum::<f32>() / o0.len() as f32);
+        o0.iter().sum::<f32>() / o0.len() as f32
+    );
 
     // Block 3 = full attention
     let mut cache2 = BonsaiQwen35Cache::new(&cfg, &device)?;
@@ -33,10 +36,12 @@ fn main() -> anyhow::Result<()> {
     let out3 = model.debug_block(3, &x2, 0, &mut cache2)?;
     let o3: Vec<f32> = out3.flatten_all()?.to_vec1()?;
     println!("blk3(ATTN) out: first10={:?}", &o3[..10]);
-    println!("blk3(ATTN) out: min={} max={} mean={}",
+    println!(
+        "blk3(ATTN) out: min={} max={} mean={}",
         o3.iter().cloned().fold(f32::INFINITY, f32::min),
         o3.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-        o3.iter().sum::<f32>() / o3.len() as f32);
+        o3.iter().sum::<f32>() / o3.len() as f32
+    );
 
     Ok(())
 }

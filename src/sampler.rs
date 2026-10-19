@@ -11,7 +11,12 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    pub fn new(seed: u64, temperature: Option<f32>, top_p: Option<f32>, repetition_penalty: f32) -> Self {
+    pub fn new(
+        seed: u64,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+        repetition_penalty: f32,
+    ) -> Self {
         let actual_seed = if seed == 0 {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -55,7 +60,7 @@ impl Sampler {
                 }
             }
         }
-        
+
         let temp = self.temperature.unwrap_or(0.0);
         if temp == 0.0 {
             // Greedy argmax

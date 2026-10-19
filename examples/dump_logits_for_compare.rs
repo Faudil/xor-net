@@ -1,12 +1,14 @@
-use xor_net::{AutoModelForCausalLM, QuantizationConfig};
+use std::time::Instant;
 use xor_net::bit1_58::quantization::TernaryPackType;
 use xor_net::nn::LmHeadConfig;
-use std::time::Instant;
+use xor_net::{AutoModelForCausalLM, QuantizationConfig};
 
 fn main() -> anyhow::Result<()> {
     xor_net::init_threads(0).map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    let model_id = std::env::args().nth(1).unwrap_or_else(|| "1bitLLM/bitnet_b1_58-3B".to_string());
+    let model_id = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "1bitLLM/bitnet_b1_58-3B".to_string());
 
     let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::F32, true);
 
@@ -30,12 +32,15 @@ fn main() -> anyhow::Result<()> {
     let last_pos = (b_size - 1) * seq_len * vocab_size + (seq_len - 1) * vocab_size;
 
     println!("  Vocab size: {}", vocab_size);
-    println!("  Last token logits (first 20): {:?}",
-        &logits.data[last_pos..last_pos + 20.min(vocab_size)]);
+    println!(
+        "  Last token logits (first 20): {:?}",
+        &logits.data[last_pos..last_pos + 20.min(vocab_size)]
+    );
 
     // Save logits for comparison
     let logits_data = &logits.data[last_pos..last_pos + vocab_size];
-    println!("  Logits min: {:.4}, max: {:.4}, mean: {:.4}",
+    println!(
+        "  Logits min: {:.4}, max: {:.4}, mean: {:.4}",
         logits_data.iter().fold(f32::INFINITY, |a, &b| a.min(b)),
         logits_data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)),
         logits_data.iter().sum::<f32>() / logits_data.len() as f32

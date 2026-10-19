@@ -1,6 +1,6 @@
-use candle_core::{CustomOp1, Error, Layout, Result, Shape, CpuStorage};
 use super::quantization::pack_1bit;
 use super::simd::xnor_dot_product;
+use candle_core::{CpuStorage, CustomOp1, Error, Layout, Result, Shape};
 
 #[derive(Debug, Clone)]
 pub struct BitMatMulOp {
@@ -31,36 +31,49 @@ impl CustomOp1 for BitMatMulOp {
             let mut dims = layout.shape().dims().to_vec();
             if let Some(last) = dims.last_mut() {
                 if *last != self.in_dim {
-                    return Err(Error::Msg(format!("Input dimension mismatch: expected {}, got {}", self.in_dim, last)));
+                    return Err(Error::Msg(format!(
+                        "Input dimension mismatch: expected {}, got {}",
+                        self.in_dim, last
+                    )));
                 }
                 *last = self.out_dim;
             } else {
-                return Err(Error::Msg("Input must have at least 1 dimension".to_string()));
+                return Err(Error::Msg(
+                    "Input must have at least 1 dimension".to_string(),
+                ));
             }
             Shape::from(dims)
         };
-        
-        let b_size: usize = layout.shape().dims()[..layout.shape().rank() - 1].iter().product();
+
+        let b_size: usize = layout.shape().dims()[..layout.shape().rank() - 1]
+            .iter()
+            .product();
         let mut out_data = vec![0.0; b_size * self.out_dim];
         let bytes_per_row = (self.in_dim + 7) / 8;
-        
+
         use rayon::prelude::*;
-        
-        out_data.par_chunks_mut(self.out_dim).enumerate().for_each(|(b, out_row)| {
-            let in_row = &input_slice[b * self.in_dim .. (b + 1) * self.in_dim];
-            let packed_in = pack_1bit(in_row);
-            
-            let chunk_size = 64;
-            out_row.par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, out_chunk)| {
-                let start_o = chunk_idx * chunk_size;
-                for (i, out_val) in out_chunk.iter_mut().enumerate() {
-                    let o = start_o + i;
-                    let w_row = &self.packed_weights[o * bytes_per_row .. (o + 1) * bytes_per_row];
-                    *out_val = xnor_dot_product(&packed_in, w_row, self.in_dim);
-                }
+
+        out_data
+            .par_chunks_mut(self.out_dim)
+            .enumerate()
+            .for_each(|(b, out_row)| {
+                let in_row = &input_slice[b * self.in_dim..(b + 1) * self.in_dim];
+                let packed_in = pack_1bit(in_row);
+
+                let chunk_size = 64;
+                out_row.par_chunks_mut(chunk_size).enumerate().for_each(
+                    |(chunk_idx, out_chunk)| {
+                        let start_o = chunk_idx * chunk_size;
+                        for (i, out_val) in out_chunk.iter_mut().enumerate() {
+                            let o = start_o + i;
+                            let w_row =
+                                &self.packed_weights[o * bytes_per_row..(o + 1) * bytes_per_row];
+                            *out_val = xnor_dot_product(&packed_in, w_row, self.in_dim);
+                        }
+                    },
+                );
             });
-        });
-        
+
         Ok((CpuStorage::F32(out_data), out_shape))
     }
 }

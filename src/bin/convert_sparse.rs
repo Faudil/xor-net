@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use xor_net::bit1_58::quantization::unpack_1_58bit_4pack;
 use xor_net::bit1_58::sparse::encode_sparse_tensor;
-use xor_net::loader::{SafeTensorRepo, SafeTensorLoader, sparse_loader::SparseFile};
+use xor_net::loader::{SafeTensorLoader, SafeTensorRepo, sparse_loader::SparseFile};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -36,7 +36,9 @@ fn main() -> anyhow::Result<()> {
         i += 1;
     }
     if positional.len() < 2 {
-        eprintln!("usage: convert_sparse <model_dir> <output.sparse> [--no-invert] [--model <dir>]");
+        eprintln!(
+            "usage: convert_sparse <model_dir> <output.sparse> [--no-invert] [--model <dir>]"
+        );
         std::process::exit(2);
     }
     let model_dir = PathBuf::from(&positional[0]);

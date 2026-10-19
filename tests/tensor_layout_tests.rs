@@ -3,8 +3,6 @@
 
 use xor_net::tensor::FastTensor;
 
-
-
 #[test]
 fn reshape_preserves_data() {
     let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
@@ -71,10 +69,7 @@ fn slice_last_token_single_batch() {
 
 #[test]
 fn slice_last_token_batched() {
-    let t = FastTensor::new(vec![
-        1.0, 2.0, 3.0, 4.0,
-        5.0, 6.0, 7.0, 8.0,
-    ], vec![2, 2, 2]);
+    let t = FastTensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![2, 2, 2]);
     let sliced = t.slice_last_token().unwrap();
     assert_eq!(sliced.shape(), &[2, 1, 2]);
     assert_eq!(sliced.data, vec![3.0, 4.0, 7.0, 8.0]);

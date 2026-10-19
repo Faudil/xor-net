@@ -2,11 +2,11 @@
 //! Each test verifies forward-pass correctness against a hand-computed
 //! reference matmul or known mathematical properties.
 
-use xor_net::tensor::FastTensor;
-use xor_net::nn::dynamic_linear::F32Linear;
+use xor_net::bit1::layers::BitLinear;
 use xor_net::bit1_58::layers::TernaryLinear;
 use xor_net::bit1_58::quantization::TernaryPackType;
-use xor_net::bit1::layers::BitLinear;
+use xor_net::nn::dynamic_linear::F32Linear;
+use xor_net::tensor::FastTensor;
 
 const TOL: f32 = 1e-4;
 
@@ -27,7 +27,9 @@ fn ref_matmul(input: &[f32], weight: &[f32], in_dim: usize, out_dim: usize) -> V
 fn f32_linear_identity_weight() {
     // 4×4 identity matrix → output == input
     let mut w_data = vec![0.0f32; 16];
-    for i in 0..4 { w_data[i * 4 + i] = 1.0; }
+    for i in 0..4 {
+        w_data[i * 4 + i] = 1.0;
+    }
     let w = FastTensor::new(w_data, vec![4, 4]);
     let layer = F32Linear::new(w);
     let input = FastTensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 4]);
@@ -68,7 +70,11 @@ fn ternary_linear_pack4_vs_pack5_parity() {
     let in_dim = 20;
     let out_dim = 4;
     let weights: Vec<f32> = (0..in_dim * out_dim)
-        .map(|i| match i % 3 { 0 => -1.0, 1 => 0.0, _ => 1.0 })
+        .map(|i| match i % 3 {
+            0 => -1.0,
+            1 => 0.0,
+            _ => 1.0,
+        })
         .collect();
     let input_data: Vec<f32> = (0..in_dim).map(|i| (i as f32 - 10.0) * 0.1).collect();
     let input = FastTensor::new(input_data, vec![1, in_dim]);
@@ -79,7 +85,13 @@ fn ternary_linear_pack4_vs_pack5_parity() {
     let o5 = l5.forward(&input).unwrap();
 
     for (i, (&a, &b)) in o4.data.iter().zip(o5.data.iter()).enumerate() {
-        assert!((a - b).abs() < TOL, "Pack4 vs Pack5 mismatch idx {}: {} vs {}", i, a, b);
+        assert!(
+            (a - b).abs() < TOL,
+            "Pack4 vs Pack5 mismatch idx {}: {} vs {}",
+            i,
+            a,
+            b
+        );
     }
 }
 
@@ -90,7 +102,11 @@ fn ternary_linear_zero_input() {
     let input = FastTensor::new(vec![0.0, 0.0], vec![1, 2]);
     let out = layer.forward(&input).unwrap();
     for &v in &out.data {
-        assert!(v.abs() < TOL, "Zero input should produce ~zero output, got {}", v);
+        assert!(
+            v.abs() < TOL,
+            "Zero input should produce ~zero output, got {}",
+            v
+        );
     }
 }
 

@@ -1,5 +1,5 @@
-use rayon::prelude::*;
 use crate::nn::fast_attention_simd::{rms_norm, rope_inplace as rope_simd_inplace};
+use rayon::prelude::*;
 pub mod workspace;
 use std::fmt::{self, Debug};
 
@@ -89,7 +89,8 @@ impl FastTensor {
         }
         let mut out_data = crate::util::uninit_vec(self.data.len());
         if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
-            out_data.par_chunks_mut(crate::util::CHUNK_SIZE)
+            out_data
+                .par_chunks_mut(crate::util::CHUNK_SIZE)
                 .zip(self.data.par_chunks(crate::util::CHUNK_SIZE))
                 .zip(other.data.par_chunks(crate::util::CHUNK_SIZE))
                 .for_each(|((out_chunk, self_chunk), other_chunk)| {
@@ -115,7 +116,8 @@ impl FastTensor {
         }
         let mut out_data = crate::util::uninit_vec(self.data.len());
         if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
-            out_data.par_chunks_mut(crate::util::CHUNK_SIZE)
+            out_data
+                .par_chunks_mut(crate::util::CHUNK_SIZE)
                 .zip(self.data.par_chunks(crate::util::CHUNK_SIZE))
                 .zip(other.data.par_chunks(crate::util::CHUNK_SIZE))
                 .for_each(|((out_chunk, self_chunk), other_chunk)| {
@@ -134,7 +136,7 @@ impl FastTensor {
         }
         Ok(Self::new(out_data, self.shape.clone()))
     }
-    
+
     pub fn add_inplace(mut self, other: &Self) -> anyhow::Result<Self> {
         if self.shape != other.shape {
             anyhow::bail!(
@@ -143,9 +145,10 @@ impl FastTensor {
                 other.shape
             );
         }
-        
+
         if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
-            self.data.par_chunks_mut(1024)
+            self.data
+                .par_chunks_mut(1024)
                 .zip(other.data.par_chunks(1024))
                 .for_each(|(out_chunk, other_chunk)| {
                     for i in 0..out_chunk.len() {
@@ -163,7 +166,7 @@ impl FastTensor {
                 }
             }
         }
-            
+
         Ok(self)
     }
 
@@ -175,9 +178,10 @@ impl FastTensor {
                 other.shape
             );
         }
-        
+
         if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
-            self.data.par_chunks_mut(1024)
+            self.data
+                .par_chunks_mut(1024)
                 .zip(other.data.par_chunks(1024))
                 .for_each(|(s1_chunk, s2_chunk)| {
                     for i in 0..s1_chunk.len() {
@@ -199,7 +203,7 @@ impl FastTensor {
                 }
             }
         }
-            
+
         Ok(self)
     }
 
@@ -213,7 +217,8 @@ impl FastTensor {
         }
 
         if self.data.len() >= crate::util::PARALLEL_THRESHOLD {
-            self.data.par_chunks_mut(1024)
+            self.data
+                .par_chunks_mut(1024)
                 .zip(other.data.par_chunks(1024))
                 .for_each(|(s1_chunk, s2_chunk)| {
                     for i in 0..s1_chunk.len() {
@@ -221,7 +226,8 @@ impl FastTensor {
                         unsafe {
                             let x = *s1_chunk.get_unchecked(i);
                             let relu = if x > 0.0 { x } else { 0.0 };
-                            *s1_chunk.get_unchecked_mut(i) = relu * relu * *s2_chunk.get_unchecked(i);
+                            *s1_chunk.get_unchecked_mut(i) =
+                                relu * relu * *s2_chunk.get_unchecked(i);
                         }
                     }
                 });
@@ -240,9 +246,10 @@ impl FastTensor {
     }
 
     pub fn rmsnorm(&self, weight: &Self, eps: f32) -> anyhow::Result<Self> {
-        let hidden_size = *self.shape.last().ok_or_else(|| {
-            anyhow::anyhow!("FastTensor::rmsnorm: empty shape")
-        })?;
+        let hidden_size = *self
+            .shape
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("FastTensor::rmsnorm: empty shape"))?;
         if weight.data.len() != hidden_size {
             anyhow::bail!(
                 "FastTensor::rmsnorm weight size mismatch: expected {}, got {}",
@@ -250,17 +257,18 @@ impl FastTensor {
                 weight.data.len()
             );
         }
-        
+
         let mut out_data = crate::util::uninit_vec(self.data.len());
-        
-        out_data.par_chunks_mut(hidden_size)
+
+        out_data
+            .par_chunks_mut(hidden_size)
             .zip(self.data.par_chunks(hidden_size))
             .for_each(|(out_row, in_row)| {
                 let mut row_copy: Vec<f32> = in_row.to_vec();
                 rms_norm(&mut row_copy, &weight.data, eps);
                 out_row.copy_from_slice(&row_copy);
             });
-        
+
         Ok(Self::new(out_data, self.shape.clone()))
     }
 
@@ -273,7 +281,7 @@ impl FastTensor {
         }
         let vocab_size = weight.shape[0];
         let hidden_size = weight.shape[1];
-        
+
         let mut out_data = crate::tensor::workspace::get_pooled_buffer(ids.len() * hidden_size);
         for (i, &id) in ids.iter().enumerate() {
             let id = id as usize;
@@ -284,104 +292,140 @@ impl FastTensor {
                     vocab_size
                 );
             }
-            let src = &weight.data[id * hidden_size .. (id + 1) * hidden_size];
-            let dest = &mut out_data[i * hidden_size .. (i + 1) * hidden_size];
+            let src = &weight.data[id * hidden_size..(id + 1) * hidden_size];
+            let dest = &mut out_data[i * hidden_size..(i + 1) * hidden_size];
             dest.copy_from_slice(src);
         }
-        
+
         Ok(Self::new(out_data, vec![1, ids.len(), hidden_size]))
     }
 
-    pub fn rope_inplace(mut self, cos: &Self, sin: &Self, index_pos: usize) -> anyhow::Result<Self> {
+    pub fn rope_inplace(
+        mut self,
+        cos: &Self,
+        sin: &Self,
+        index_pos: usize,
+    ) -> anyhow::Result<Self> {
         let (_b_sz, num_heads, seq_len, head_dim) = match self.shape.as_slice() {
             &[b_sz, num_heads, seq_len, head_dim] => (b_sz, num_heads, seq_len, head_dim),
-            _ => anyhow::bail!("rope_inplace: input must be 4D shape [b_sz, num_heads, seq_len, head_dim], got {:?}", self.shape),
+            _ => anyhow::bail!(
+                "rope_inplace: input must be 4D shape [b_sz, num_heads, seq_len, head_dim], got {:?}",
+                self.shape
+            ),
         };
-        
-        self.data.par_chunks_mut(seq_len * head_dim)
+
+        self.data
+            .par_chunks_mut(seq_len * head_dim)
             .enumerate()
             .for_each(|(bh, head_out)| {
                 let _b = bh / num_heads;
                 for t in 0..seq_len {
                     let pos = index_pos + t;
-                    let cos_pos = &cos.data[pos * (head_dim / 2) .. (pos + 1) * (head_dim / 2)];
-                    let sin_pos = &sin.data[pos * (head_dim / 2) .. (pos + 1) * (head_dim / 2)];
-                    
-                    let token_vec = &mut head_out[t * head_dim .. (t + 1) * head_dim];
+                    let cos_pos = &cos.data[pos * (head_dim / 2)..(pos + 1) * (head_dim / 2)];
+                    let sin_pos = &sin.data[pos * (head_dim / 2)..(pos + 1) * (head_dim / 2)];
+
+                    let token_vec = &mut head_out[t * head_dim..(t + 1) * head_dim];
                     rope_simd_inplace(token_vec, cos_pos, sin_pos, pos, head_dim);
                 }
             });
-            
+
         Ok(self)
     }
 
     pub fn slice_last_token(&self) -> anyhow::Result<Self> {
         let (b_sz, seq_len, hidden_size) = match self.shape.as_slice() {
             &[b_sz, seq_len, hidden_size] => (b_sz, seq_len, hidden_size),
-            _ => anyhow::bail!("slice_last_token: input must be 3D [b_sz, seq_len, hidden_size], got {:?}", self.shape),
+            _ => anyhow::bail!(
+                "slice_last_token: input must be 3D [b_sz, seq_len, hidden_size], got {:?}",
+                self.shape
+            ),
         };
         let mut out_data = crate::tensor::workspace::get_pooled_buffer(b_sz * hidden_size);
         for b in 0..b_sz {
-            let src = &self.data[b * seq_len * hidden_size + (seq_len - 1) * hidden_size .. b * seq_len * hidden_size + seq_len * hidden_size];
-            let dest = &mut out_data[b * hidden_size .. (b + 1) * hidden_size];
+            let src = &self.data[b * seq_len * hidden_size + (seq_len - 1) * hidden_size
+                ..b * seq_len * hidden_size + seq_len * hidden_size];
+            let dest = &mut out_data[b * hidden_size..(b + 1) * hidden_size];
             dest.copy_from_slice(src);
         }
         Ok(Self::new(out_data, vec![b_sz, 1, hidden_size]))
     }
 
-    pub fn transpose_seq_to_heads(&self, num_heads: usize, head_dim: usize) -> anyhow::Result<Self> {
+    pub fn transpose_seq_to_heads(
+        &self,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> anyhow::Result<Self> {
         let (b_sz, seq_len, hidden_size) = match self.shape.as_slice() {
             &[b_sz, seq_len, hidden_size] => (b_sz, seq_len, hidden_size),
-            _ => anyhow::bail!("transpose_seq_to_heads: input must be 3D, got {:?}", self.shape),
+            _ => anyhow::bail!(
+                "transpose_seq_to_heads: input must be 3D, got {:?}",
+                self.shape
+            ),
         };
         if hidden_size != num_heads * head_dim {
-            anyhow::bail!("transpose_seq_to_heads: hidden_size {} must equal num_heads {} * head_dim {}", hidden_size, num_heads, head_dim);
+            anyhow::bail!(
+                "transpose_seq_to_heads: hidden_size {} must equal num_heads {} * head_dim {}",
+                hidden_size,
+                num_heads,
+                head_dim
+            );
         }
         let mut out_data = crate::util::uninit_vec(self.data.len());
-        
-        out_data.par_chunks_mut(seq_len * head_dim)
+
+        out_data
+            .par_chunks_mut(seq_len * head_dim)
             .enumerate()
             .for_each(|(h, head_out)| {
                 for t in 0..seq_len {
                     let in_offset = t * num_heads * head_dim + h * head_dim;
                     let out_offset = t * head_dim;
-                    head_out[out_offset .. out_offset + head_dim]
-                        .copy_from_slice(&self.data[in_offset .. in_offset + head_dim]);
+                    head_out[out_offset..out_offset + head_dim]
+                        .copy_from_slice(&self.data[in_offset..in_offset + head_dim]);
                 }
             });
-        
-        Ok(Self::new(out_data, vec![b_sz, num_heads, seq_len, head_dim]))
+
+        Ok(Self::new(
+            out_data,
+            vec![b_sz, num_heads, seq_len, head_dim],
+        ))
     }
 
     pub fn transpose_heads_to_seq(&self) -> anyhow::Result<Self> {
         let (b_sz, num_heads, seq_len, head_dim) = match self.shape.as_slice() {
             &[b_sz, num_heads, seq_len, head_dim] => (b_sz, num_heads, seq_len, head_dim),
-            _ => anyhow::bail!("transpose_heads_to_seq: input must be 4D, got {:?}", self.shape),
+            _ => anyhow::bail!(
+                "transpose_heads_to_seq: input must be 4D, got {:?}",
+                self.shape
+            ),
         };
         let hidden_size = num_heads * head_dim;
         let mut out_data = crate::util::uninit_vec(self.data.len());
-        
-        out_data.par_chunks_mut(hidden_size)
+
+        out_data
+            .par_chunks_mut(hidden_size)
             .enumerate()
             .for_each(|(t, seq_out)| {
                 for h in 0..num_heads {
                     let in_offset = h * seq_len * head_dim + t * head_dim;
                     let out_offset = h * head_dim;
-                    seq_out[out_offset .. out_offset + head_dim]
-                        .copy_from_slice(&self.data[in_offset .. in_offset + head_dim]);
+                    seq_out[out_offset..out_offset + head_dim]
+                        .copy_from_slice(&self.data[in_offset..in_offset + head_dim]);
                 }
             });
-        
+
         Ok(Self::new(out_data, vec![b_sz, seq_len, hidden_size]))
     }
 
     pub fn gelu(&self) -> anyhow::Result<Self> {
         let mut out_data = crate::util::uninit_vec(self.data.len());
-        out_data.par_iter_mut().zip(self.data.par_iter()).for_each(|(out, &x)| {
-            let x_cube = x * x * x;
-            let inner = 0.79788456f32 * (x + 0.044715f32 * x_cube);
-            *out = 0.5f32 * x * (1.0f32 + inner.tanh());
-        });
+        out_data
+            .par_iter_mut()
+            .zip(self.data.par_iter())
+            .for_each(|(out, &x)| {
+                let x_cube = x * x * x;
+                let inner = 0.79788456f32 * (x + 0.044715f32 * x_cube);
+                *out = 0.5f32 * x * (1.0f32 + inner.tanh());
+            });
         Ok(Self::new(out_data, self.shape.clone()))
     }
 }

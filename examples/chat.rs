@@ -3,10 +3,10 @@ use std::path::Path;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 use xor_net::Sampler;
-use xor_net::{AutoModelForCausalLM, Cache, Config, Llama, QuantizationConfig};
 use xor_net::bit1_58::quantization::TernaryPackType;
 use xor_net::models::llama::LlamaEosToks;
 use xor_net::nn::LmHeadConfig;
+use xor_net::{AutoModelForCausalLM, Cache, Config, Llama, QuantizationConfig};
 
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
@@ -58,7 +58,11 @@ fn load_local_model(model_dir: &Path) -> anyhow::Result<(Llama, Config, Tokenize
     let load_start = Instant::now();
     let (model, config) = AutoModelForCausalLM::from_local(
         model_dir,
-        QuantizationConfig::Bit1_58(TernaryPackType::Pack4, lmhead_cfg(LmHeadConfig::Int4), false),
+        QuantizationConfig::Bit1_58(
+            TernaryPackType::Pack4,
+            lmhead_cfg(LmHeadConfig::Int4),
+            false,
+        ),
     )?;
     eprintln!("Model loaded in {:.2?}", load_start.elapsed());
 
@@ -233,7 +237,10 @@ fn main() -> anyhow::Result<()> {
             context_tokens.extend(&user_ids);
         } else if is_llama3_base {
             let user_prompt = if context_tokens.is_empty() {
-                format!("System: {}\nUser: {}<|eot_id|>\nAssistant: ", SYSTEM_PROMPT, input)
+                format!(
+                    "System: {}\nUser: {}<|eot_id|>\nAssistant: ",
+                    SYSTEM_PROMPT, input
+                )
             } else {
                 format!("User: {}<|eot_id|>\nAssistant: ", input)
             };
@@ -284,7 +291,7 @@ fn main() -> anyhow::Result<()> {
         let mut generated = 0usize;
         let mut total_forward = std::time::Duration::ZERO;
         let mut total_sample = std::time::Duration::ZERO;
-        
+
         let mut response_tokens: Vec<u32> = Vec::new();
         let mut prev_text = String::new();
 
@@ -378,7 +385,11 @@ fn main() -> anyhow::Result<()> {
             }
 
             let t0 = Instant::now();
-            let logits = model.forward(&tokens[start_pos..start_pos + context_size], index_pos, &mut cache)?;
+            let logits = model.forward(
+                &tokens[start_pos..start_pos + context_size],
+                index_pos,
+                &mut cache,
+            )?;
             total_forward += t0.elapsed();
 
             let t0 = Instant::now();
@@ -421,17 +432,13 @@ fn main() -> anyhow::Result<()> {
         let elapsed = start_gen.elapsed();
         let tps = generated as f64 / elapsed.as_secs_f64();
 
-        let (blocks_end, lm_head_end, other_end) =
-            xor_net::models::llama::get_profiling_stats();
+        let (blocks_end, lm_head_end, other_end) = xor_net::models::llama::get_profiling_stats();
         let blocks_ms = (blocks_end.saturating_sub(blocks_start)) as f64 / 1000.0;
         let lm_head_ms = (lm_head_end.saturating_sub(lm_head_start)) as f64 / 1000.0;
         let other_ms = (other_end.saturating_sub(other_start)) as f64 / 1000.0;
 
         println!("{}", "─".repeat(46));
-        println!(
-            " {generated} tokens in {:.2?} ({:.2} tok/s)",
-            elapsed, tps
-        );
+        println!(" {generated} tokens in {:.2?} ({:.2} tok/s)", elapsed, tps);
         println!(" Forward: {total_forward:.2?} | Sample: {total_sample:.2?}");
         if generated > 0 {
             let g = generated as f64;
@@ -466,7 +473,9 @@ fn main() -> anyhow::Result<()> {
                 let rate = spec_accepted as f64 / spec_drafted as f64;
                 println!(
                     " └ Speculative: drafted={} accepted={} acceptance={:.1}% (~{:.2} tok/step)",
-                    spec_drafted, spec_accepted, rate * 100.0,
+                    spec_drafted,
+                    spec_accepted,
+                    rate * 100.0,
                     (spec_accepted as f64 / generated.max(1) as f64) * spec_n as f64,
                 );
             }

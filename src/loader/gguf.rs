@@ -1,8 +1,8 @@
+use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use memmap2::Mmap;
 
 const GGUF_MAGIC: u32 = 0x46554747;
 const GGUF_MAGIC_SWAPPED: u32 = 0x47475546;
@@ -184,7 +184,11 @@ fn read_value<R: Read>(reader: &mut R, version: VersionedMagic) -> anyhow::Resul
     read_value_body(reader, type_id, version)
 }
 
-fn read_value_body<R: Read>(reader: &mut R, type_id: u32, version: VersionedMagic) -> anyhow::Result<Value> {
+fn read_value_body<R: Read>(
+    reader: &mut R,
+    type_id: u32,
+    version: VersionedMagic,
+) -> anyhow::Result<Value> {
     match type_id {
         0 => Ok(Value::U8(reader.read_u8_le()?)),
         1 => Ok(Value::I8(reader.read_u8_le()? as i8)),
@@ -293,10 +297,10 @@ impl GgufTensorInfo {
 
     pub fn compute_byte_size(shape: &[usize], dtype: u32) -> anyhow::Result<u64> {
         let elem_count: usize = shape.iter().product();
-        let bs = Self::block_size(dtype)
-            .ok_or_else(|| anyhow::anyhow!("unknown GGUF dtype {dtype}"))?;
-        let ts = Self::type_size(dtype)
-            .ok_or_else(|| anyhow::anyhow!("unknown GGUF dtype {dtype}"))?;
+        let bs =
+            Self::block_size(dtype).ok_or_else(|| anyhow::anyhow!("unknown GGUF dtype {dtype}"))?;
+        let ts =
+            Self::type_size(dtype).ok_or_else(|| anyhow::anyhow!("unknown GGUF dtype {dtype}"))?;
         if elem_count % bs != 0 {
             anyhow::bail!("dtype {dtype} block size {bs} does not divide elem_count {elem_count}");
         }
@@ -498,7 +502,9 @@ impl GgufFile {
             let name = read_gguf_string(&mut file, version)?;
             let n_dim = file.read_u32_le()?;
             if n_dim > GGUF_MAX_TENSOR_DIMS {
-                anyhow::bail!("tensor '{name}' has {n_dim} dimensions, max is {GGUF_MAX_TENSOR_DIMS}");
+                anyhow::bail!(
+                    "tensor '{name}' has {n_dim} dimensions, max is {GGUF_MAX_TENSOR_DIMS}"
+                );
             }
 
             let mut shape = match version {
@@ -568,7 +574,10 @@ impl GgufFile {
 
     /// Get raw bytes of a tensor (the packed quantized data).
     pub fn tensor_bytes(&self, name: &str) -> anyhow::Result<&[u8]> {
-        let info = self.metadata.tensor_infos.get(name)
+        let info = self
+            .metadata
+            .tensor_infos
+            .get(name)
             .ok_or_else(|| anyhow::anyhow!("tensor '{name}' not found"))?;
         let start = self.metadata.tensor_data_offset + info.offset;
         let end = start + info.byte_size;
@@ -578,7 +587,10 @@ impl GgufFile {
     /// Dequantize a tensor to f32. Handles standard dtypes (F32, F16, BF16)
     /// and PRISM 1-bit types (42, 43).
     pub fn dequantize_tensor(&self, name: &str) -> anyhow::Result<Vec<f32>> {
-        let info = self.metadata.tensor_infos.get(name)
+        let info = self
+            .metadata
+            .tensor_infos
+            .get(name)
             .ok_or_else(|| anyhow::anyhow!("tensor '{name}' not found"))?;
         let bytes = self.tensor_bytes(name)?;
         dequantize_data(bytes, info.dtype_u32, info.elem_count)
@@ -586,7 +598,9 @@ impl GgufFile {
 
     /// Get tensor metadata (shape + dtype)
     pub fn tensor_info(&self, name: &str) -> anyhow::Result<&GgufTensorInfo> {
-        self.metadata.tensor_infos.get(name)
+        self.metadata
+            .tensor_infos
+            .get(name)
             .ok_or_else(|| anyhow::anyhow!("tensor '{name}' not found"))
     }
 
@@ -602,7 +616,8 @@ impl GgufFile {
 
     /// Extract the general.architecture name from metadata
     pub fn architecture(&self) -> anyhow::Result<String> {
-        self.metadata.metadata
+        self.metadata
+            .metadata
             .get("general.architecture")
             .and_then(|v| v.to_string())
             .map(|s| s.to_string())
@@ -682,7 +697,8 @@ pub fn build_tokenizer(gguf: &GgufFile) -> anyhow::Result<tokenizers::Tokenizer>
 
     let meta = &gguf.metadata.metadata;
 
-    let tokens = meta.get("tokenizer.ggml.tokens")
+    let tokens = meta
+        .get("tokenizer.ggml.tokens")
         .and_then(|v| v.to_string_vec())
         .ok_or_else(|| anyhow::anyhow!("missing tokenizer.ggml.tokens"))?;
 
@@ -692,7 +708,10 @@ pub fn build_tokenizer(gguf: &GgufFile) -> anyhow::Result<tokenizers::Tokenizer>
     }
 
     let mut merges: Vec<(String, String)> = Vec::new();
-    if let Some(merge_strs) = meta.get("tokenizer.ggml.merges").and_then(|v| v.to_string_vec()) {
+    if let Some(merge_strs) = meta
+        .get("tokenizer.ggml.merges")
+        .and_then(|v| v.to_string_vec())
+    {
         for m in merge_strs {
             // merges are stored as "a b"
             if let Some((a, b)) = m.split_once(' ') {
@@ -773,7 +792,10 @@ impl BonsaiConfig {
         let hidden_size = get_u32("embedding_length")?;
         let num_attention_heads = get_u32("attention.head_count")?;
         let num_kv_heads = get_u32("attention.head_count_kv")?;
-        let head_dim = match metadata.get(&prefix("attention.key_length")).and_then(|v| v.to_u32()) {
+        let head_dim = match metadata
+            .get(&prefix("attention.key_length"))
+            .and_then(|v| v.to_u32())
+        {
             Some(v) => v as usize,
             None => hidden_size / num_attention_heads,
         };
@@ -885,7 +907,10 @@ mod tests {
         assert_eq!(out.len(), 32);
         for (i, &val) in out.iter().enumerate() {
             let expected = if (i % 2) == 0 { 1.0 } else { -1.0 };
-            assert!((val - expected).abs() < 1e-6, "mismatch at {i}: {val} vs {expected}");
+            assert!(
+                (val - expected).abs() < 1e-6,
+                "mismatch at {i}: {val} vs {expected}"
+            );
         }
     }
 
@@ -927,7 +952,12 @@ mod tests {
             let bit_idx = i & 7;
             let bit = (data[byte_idx] >> bit_idx) & 1;
             let expected = if bit == 0 { -1.0 } else { 1.0 };
-            assert!((out[i] - expected).abs() < 1e-6, "mismatch at {i}: {} vs {}", out[i], expected);
+            assert!(
+                (out[i] - expected).abs() < 1e-6,
+                "mismatch at {i}: {} vs {}",
+                out[i],
+                expected
+            );
         }
     }
 

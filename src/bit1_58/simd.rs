@@ -26,7 +26,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
+pub unsafe fn ternary_dot_product_pack4_avx512(
+    a_i8: &[i8],
+    b_pack4: &[u8],
+    total_elems: usize,
+) -> i32 {
     let a_ptr = a_i8.as_ptr() as *const __m512i;
     let b_ptr = b_pack4.as_ptr();
 
@@ -40,10 +44,9 @@ pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], tota
     let ones_i16 = _mm512_set1_epi16(1);
     let mask3 = _mm512_set1_epi32(0x03);
     let lut = _mm512_set_epi8(
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 1, 0, -1,
     );
 
     let chunks64 = total_elems / 64;
@@ -57,7 +60,9 @@ pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], tota
         macro_rules! block {
             ($acc:expr, $i:expr) => {{
                 let acts = _mm512_loadu_si512(a_ptr.add(idx + $i));
-                let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(b_ptr.add((idx + $i) * 16) as *const __m128i));
+                let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(
+                    b_ptr.add((idx + $i) * 16) as *const __m128i
+                ));
                 let p0 = _mm512_and_si512(w32, mask3);
                 let p1 = _mm512_and_si512(_mm512_srli_epi32(w32, 2), mask3);
                 let p2 = _mm512_and_si512(_mm512_srli_epi32(w32, 4), mask3);
@@ -72,7 +77,10 @@ pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], tota
                 let neg_a = _mm512_sub_epi8(zero, acts);
                 let blend = _mm512_mask_blend_epi8(pos_mask, neg_a, acts);
                 let sa = _mm512_mask_mov_epi8(blend, zero_mask, zero);
-                $acc = _mm512_add_epi32($acc, _mm512_madd_epi16(_mm512_maddubs_epi16(ones_u8, sa), ones_i16));
+                $acc = _mm512_add_epi32(
+                    $acc,
+                    _mm512_madd_epi16(_mm512_maddubs_epi16(ones_u8, sa), ones_i16),
+                );
             }};
         }
 
@@ -85,10 +93,7 @@ pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], tota
     }
 
     // Merge 4 accumulators
-    let mut acc = _mm512_add_epi32(
-        _mm512_add_epi32(acc0, acc1),
-        _mm512_add_epi32(acc2, acc3),
-    );
+    let mut acc = _mm512_add_epi32(_mm512_add_epi32(acc0, acc1), _mm512_add_epi32(acc2, acc3));
 
     // Cleanup: remaining chunks (< 4)
     while idx < chunks64 {
@@ -110,7 +115,10 @@ pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], tota
         let neg_a = _mm512_sub_epi8(zero, acts);
         let blend = _mm512_mask_blend_epi8(pos_mask, neg_a, acts);
         let signed_acts = _mm512_mask_mov_epi8(blend, zero_mask, zero);
-        acc = _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(ones_u8, signed_acts), ones_i16));
+        acc = _mm512_add_epi32(
+            acc,
+            _mm512_madd_epi16(_mm512_maddubs_epi16(ones_u8, signed_acts), ones_i16),
+        );
         idx += 1;
     }
 
@@ -123,17 +131,26 @@ pub unsafe fn ternary_dot_product_pack4_avx512(a_i8: &[i8], b_pack4: &[u8], tota
         let byte_idx = j / 4;
         let bit_shift = (j % 4) * 2;
         let val = (b_pack4[byte_idx] >> bit_shift) & 0b11;
-        let w = if val == 0b00 { -1 } else if val == 0b10 { 1 } else { 0 };
+        let w = if val == 0b00 {
+            -1
+        } else if val == 0b10 {
+            1
+        } else {
+            0
+        };
         total += a_i8[j] as i32 * w as i32;
     }
 
     total
 }
 
-
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-pub unsafe fn ternary_dot_product_pack4_avx2(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
+pub unsafe fn ternary_dot_product_pack4_avx2(
+    a_i8: &[i8],
+    b_pack4: &[u8],
+    total_elems: usize,
+) -> i32 {
     unsafe {
         let a_ptr = a_i8.as_ptr() as *const __m256i;
         let b_ptr = b_pack4.as_ptr();
@@ -144,8 +161,8 @@ pub unsafe fn ternary_dot_product_pack4_avx2(a_i8: &[i8], b_pack4: &[u8], total_
         let ones_i16 = _mm256_set1_epi16(1);
         let mask3 = _mm256_set1_epi32(0x03);
         let lut = _mm256_setr_epi8(
-            -1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            -1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            -1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
         );
 
         let chunks32 = total_elems / 32;
@@ -163,11 +180,17 @@ pub unsafe fn ternary_dot_product_pack4_avx2(a_i8: &[i8], b_pack4: &[u8], total_
             let p02 = _mm256_and_si256(_mm256_srli_epi32(x0, 4), mask3);
             let p03 = _mm256_and_si256(_mm256_srli_epi32(x0, 6), mask3);
 
-            let w_i8_0 = _mm256_shuffle_epi8(lut, _mm256_or_si256(
-                _mm256_or_si256(p00, _mm256_slli_epi32(p01, 8)),
-                _mm256_or_si256(_mm256_slli_epi32(p02, 16), _mm256_slli_epi32(p03, 24))
-            ));
-            let sums0 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_u8, _mm256_sign_epi8(acts0, w_i8_0)), ones_i16);
+            let w_i8_0 = _mm256_shuffle_epi8(
+                lut,
+                _mm256_or_si256(
+                    _mm256_or_si256(p00, _mm256_slli_epi32(p01, 8)),
+                    _mm256_or_si256(_mm256_slli_epi32(p02, 16), _mm256_slli_epi32(p03, 24)),
+                ),
+            );
+            let sums0 = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(ones_u8, _mm256_sign_epi8(acts0, w_i8_0)),
+                ones_i16,
+            );
             acc0 = _mm256_add_epi32(acc0, sums0);
 
             let acts1 = _mm256_loadu_si256(a_ptr.add(i + 1));
@@ -179,11 +202,17 @@ pub unsafe fn ternary_dot_product_pack4_avx2(a_i8: &[i8], b_pack4: &[u8], total_
             let p12 = _mm256_and_si256(_mm256_srli_epi32(x1, 4), mask3);
             let p13 = _mm256_and_si256(_mm256_srli_epi32(x1, 6), mask3);
 
-            let w_i8_1 = _mm256_shuffle_epi8(lut, _mm256_or_si256(
-                _mm256_or_si256(p10, _mm256_slli_epi32(p11, 8)),
-                _mm256_or_si256(_mm256_slli_epi32(p12, 16), _mm256_slli_epi32(p13, 24))
-            ));
-            let sums1 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_u8, _mm256_sign_epi8(acts1, w_i8_1)), ones_i16);
+            let w_i8_1 = _mm256_shuffle_epi8(
+                lut,
+                _mm256_or_si256(
+                    _mm256_or_si256(p10, _mm256_slli_epi32(p11, 8)),
+                    _mm256_or_si256(_mm256_slli_epi32(p12, 16), _mm256_slli_epi32(p13, 24)),
+                ),
+            );
+            let sums1 = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(ones_u8, _mm256_sign_epi8(acts1, w_i8_1)),
+                ones_i16,
+            );
             acc1 = _mm256_add_epi32(acc1, sums1);
 
             i += 2;
@@ -201,11 +230,17 @@ pub unsafe fn ternary_dot_product_pack4_avx2(a_i8: &[i8], b_pack4: &[u8], total_
             let p2 = _mm256_and_si256(_mm256_srli_epi32(x, 4), mask3);
             let p3 = _mm256_and_si256(_mm256_srli_epi32(x, 6), mask3);
 
-            let w_i8 = _mm256_shuffle_epi8(lut, _mm256_or_si256(
-                _mm256_or_si256(p0, _mm256_slli_epi32(p1, 8)),
-                _mm256_or_si256(_mm256_slli_epi32(p2, 16), _mm256_slli_epi32(p3, 24))
-            ));
-            let sums = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_u8, _mm256_sign_epi8(acts, w_i8)), ones_i16);
+            let w_i8 = _mm256_shuffle_epi8(
+                lut,
+                _mm256_or_si256(
+                    _mm256_or_si256(p0, _mm256_slli_epi32(p1, 8)),
+                    _mm256_or_si256(_mm256_slli_epi32(p2, 16), _mm256_slli_epi32(p3, 24)),
+                ),
+            );
+            let sums = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(ones_u8, _mm256_sign_epi8(acts, w_i8)),
+                ones_i16,
+            );
             acc32 = _mm256_add_epi32(acc32, sums);
         }
 
@@ -218,7 +253,13 @@ pub unsafe fn ternary_dot_product_pack4_avx2(a_i8: &[i8], b_pack4: &[u8], total_
             let byte_idx = i / 4;
             let bit_shift = (i % 4) * 2;
             let val = (b_pack4[byte_idx] >> bit_shift) & 0b11;
-            let w = if val == 0b00 { -1 } else if val == 0b10 { 1 } else { 0 };
+            let w = if val == 0b00 {
+                -1
+            } else if val == 0b10 {
+                1
+            } else {
+                0
+            };
             total_sum += a_i8[i] as i32 * w as i32;
         }
 
@@ -255,7 +296,11 @@ fn vnni_prefetch_bytes() -> usize {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-pub unsafe fn ternary_dot_product_pack4_avx512_vnni(a_i8: &[i8], b_pack4: &[u8], total_elems: usize) -> i32 {
+pub unsafe fn ternary_dot_product_pack4_avx512_vnni(
+    a_i8: &[i8],
+    b_pack4: &[u8],
+    total_elems: usize,
+) -> i32 {
     let a_ptr = a_i8.as_ptr() as *const __m512i;
     let b_ptr = b_pack4.as_ptr();
     let pf = vnni_prefetch_bytes();
@@ -266,10 +311,9 @@ pub unsafe fn ternary_dot_product_pack4_avx512_vnni(a_i8: &[i8], b_pack4: &[u8],
     let ones_u8 = _mm512_set1_epi8(1);
     let mask3 = _mm512_set1_epi32(0x03);
     let lut = _mm512_set_epi8(
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 1, 0, -1,
     );
 
     let chunks64 = total_elems / 64;
@@ -282,7 +326,9 @@ pub unsafe fn ternary_dot_product_pack4_avx512_vnni(a_i8: &[i8], b_pack4: &[u8],
         macro_rules! block {
             ($k:expr) => {{
                 let acts = _mm512_loadu_si512(a_ptr.add(idx + $k));
-                let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(b_ptr.add((idx + $k) * 16) as *const __m128i));
+                let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(
+                    b_ptr.add((idx + $k) * 16) as *const __m128i
+                ));
                 let p0 = _mm512_and_si512(w32, mask3);
                 let p1 = _mm512_and_si512(_mm512_srli_epi32(w32, 2), mask3);
                 let p2 = _mm512_and_si512(_mm512_srli_epi32(w32, 4), mask3);
@@ -302,10 +348,22 @@ pub unsafe fn ternary_dot_product_pack4_avx512_vnni(a_i8: &[i8], b_pack4: &[u8],
             }};
         }
 
-        block!(0); block!(1); block!(2); block!(3);
-        block!(4); block!(5); block!(6); block!(7);
-        block!(8); block!(9); block!(10); block!(11);
-        block!(12); block!(13); block!(14); block!(15);
+        block!(0);
+        block!(1);
+        block!(2);
+        block!(3);
+        block!(4);
+        block!(5);
+        block!(6);
+        block!(7);
+        block!(8);
+        block!(9);
+        block!(10);
+        block!(11);
+        block!(12);
+        block!(13);
+        block!(14);
+        block!(15);
 
         idx += 16;
     }
@@ -348,7 +406,13 @@ pub unsafe fn ternary_dot_product_pack4_avx512_vnni(a_i8: &[i8], b_pack4: &[u8],
         let byte_idx = j / 4;
         let bit_shift = (j % 4) * 2;
         let val = (b_pack4[byte_idx] >> bit_shift) & 0b11;
-        let w = if val == 0b00 { -1 } else if val == 0b10 { 1 } else { 0 };
+        let w = if val == 0b00 {
+            -1
+        } else if val == 0b10 {
+            1
+        } else {
+            0
+        };
         total += a_i8[j] as i32 * w as i32;
     }
 
@@ -365,19 +429,31 @@ pub fn ternary_dot_product_pack4(a_i8: &[i8], b_pack4: &[u8], total_elems: usize
             return unsafe { ternary_dot_product_pack4_avx512(a_i8, b_pack4, total_elems) };
         }
         if is_x86_feature_detected!("avx2") {
-            return unsafe { crate::bit1_58::lut::ternary_dot_product_pack4_avx2_hybrid(a_i8, b_pack4, total_elems) };
+            return unsafe {
+                crate::bit1_58::lut::ternary_dot_product_pack4_avx2_hybrid(
+                    a_i8,
+                    b_pack4,
+                    total_elems,
+                )
+            };
         }
     }
-    
+
     let mut total_sum = 0i32;
     for i in 0..total_elems {
         let byte_idx = i / 4;
         let bit_shift = (i % 4) * 2;
         let val = (b_pack4[byte_idx] >> bit_shift) & 0b11;
-        let w = if val == 0b00 { -1 } else if val == 0b10 { 1 } else { 0 };
+        let w = if val == 0b00 {
+            -1
+        } else if val == 0b10 {
+            1
+        } else {
+            0
+        };
         total_sum += a_i8[i] as i32 * w as i32;
     }
-    
+
     total_sum
 }
 
@@ -387,29 +463,41 @@ pub fn ternary_dot_product_pack5(a_i8: &[i8], b_pack5: &[u8], total_elems: usize
 
 pub fn ternary_dot_product_pack5_scalar(a_i8: &[i8], b_pack5: &[u8], total_elems: usize) -> i32 {
     let mut total_sum = 0i32;
-    
+
     let chunks = total_elems / 5;
     for i in 0..chunks {
         let mut b = b_pack5[i];
         for j in 0..5 {
             let val = b % 3;
             b /= 3;
-            let w = if val == 0 { -1 } else if val == 2 { 1 } else { 0 };
+            let w = if val == 0 {
+                -1
+            } else if val == 2 {
+                1
+            } else {
+                0
+            };
             total_sum += a_i8[i * 5 + j] as i32 * w as i32;
         }
     }
-    
+
     let remainder_start = chunks * 5;
     if remainder_start < total_elems {
         let mut b = b_pack5[chunks];
         for j in 0..(total_elems - remainder_start) {
             let val = b % 3;
             b /= 3;
-            let w = if val == 0 { -1 } else if val == 2 { 1 } else { 0 };
+            let w = if val == 0 {
+                -1
+            } else if val == 2 {
+                1
+            } else {
+                0
+            };
             total_sum += a_i8[remainder_start + j] as i32 * w as i32;
         }
     }
-    
+
     total_sum
 }
 
@@ -550,13 +638,16 @@ pub fn ternary_dot_product_sparse(
 #[cfg(test)]
 mod sparse_correctness_tests {
     use crate::bit1_58::quantization::pack_1_58bit_4pack;
-    use crate::bit1_58::sparse::{encode_sparse_tensor, SparseTernary};
+    use crate::bit1_58::sparse::{SparseTernary, encode_sparse_tensor};
 
     // Simple deterministic LCG so the test needs no external deps.
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             self.0 >> 33
         }
         fn below(&mut self, n: u64) -> u64 {
@@ -661,7 +752,11 @@ mod sparse_correctness_tests {
         let mut tmp = [0i32; 16];
         unsafe { _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, avx) };
         let avx_sum = tmp.iter().sum::<i32>();
-        assert_eq!(avx_sum, scalar, "avx block {} != scalar {}", avx_sum, scalar);
+        assert_eq!(
+            avx_sum, scalar,
+            "avx block {} != scalar {}",
+            avx_sum, scalar
+        );
     }
 
     #[test]
@@ -676,7 +771,13 @@ mod sparse_correctness_tests {
         for r in 0..out_dim {
             let decoded = st.decode_row(r, in_dim);
             for i in 0..in_dim {
-                assert_eq!(decoded[i], w_i8[r * in_dim + i], "decode mismatch r={} i={}", r, i);
+                assert_eq!(
+                    decoded[i],
+                    w_i8[r * in_dim + i],
+                    "decode mismatch r={} i={}",
+                    r,
+                    i
+                );
             }
         }
     }

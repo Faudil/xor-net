@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use candle_core::{Device, Tensor};
-use candle_core::shape::D;
 use candle_core::Result as CandleResult;
+use candle_core::shape::D;
+use candle_core::{Device, Tensor};
 
-use crate::loader::gguf::{BonsaiConfig, GgufFile};
 use crate::loader::gguf;
+use crate::loader::gguf::{BonsaiConfig, GgufFile};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -37,8 +37,12 @@ fn apply_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor, seq_pos: usize) -> Candl
     let half = head_dim / 2;
     let x1 = x.narrow(D::Minus1, 0, half)?;
     let x2 = x.narrow(D::Minus1, half, half)?;
-    let cos_slice = cos.narrow(0, seq_pos, seq_len)?.reshape((seq_len, 1, half))?;
-    let sin_slice = sin.narrow(0, seq_pos, seq_len)?.reshape((seq_len, 1, half))?;
+    let cos_slice = cos
+        .narrow(0, seq_pos, seq_len)?
+        .reshape((seq_len, 1, half))?;
+    let sin_slice = sin
+        .narrow(0, seq_pos, seq_len)?
+        .reshape((seq_len, 1, half))?;
     let m1 = x1.broadcast_mul(&cos_slice)?;
     let m2 = x2.broadcast_mul(&sin_slice)?;
     let m3 = x1.broadcast_mul(&sin_slice)?;
@@ -49,7 +53,12 @@ fn apply_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor, seq_pos: usize) -> Candl
     rotated.reshape((b_sz, seq_len, n_head, head_dim))
 }
 
-fn matmul_proj(hidden: &Tensor, weight_f32: Vec<f32>, out_dim: usize, in_dim: usize) -> CandleResult<Tensor> {
+fn matmul_proj(
+    hidden: &Tensor,
+    weight_f32: Vec<f32>,
+    out_dim: usize,
+    in_dim: usize,
+) -> CandleResult<Tensor> {
     let device = hidden.device();
     let w = Tensor::from_vec(weight_f32, (out_dim, in_dim), device)?;
     let wt = w.t()?;
@@ -71,9 +80,13 @@ struct ProjWeights {
 impl ProjWeights {
     fn load_f32(&self) -> CandleResult<Vec<f32>> {
         let name = &self.name;
-        let bytes = self.gguf.tensor_bytes(name)
+        let bytes = self
+            .gguf
+            .tensor_bytes(name)
             .map_err(|e| candle_core::Error::Msg(format!("{e:?}")))?;
-        let info = self.gguf.tensor_info(name)
+        let info = self
+            .gguf
+            .tensor_info(name)
             .map_err(|e| candle_core::Error::Msg(format!("{e:?}")))?;
         gguf::dequantize_data(bytes, info.dtype_u32, self.out_dim * self.in_dim)
             .map_err(|e| candle_core::Error::Msg(format!("{e:?}")))
@@ -134,9 +147,24 @@ impl CausalSelfAttention {
         let seq_len = x.dim(1)?;
 
         // Project
-        let q = matmul_proj(x, self.q_proj.load_f32()?, self.n_head * self.head_dim, in_dim)?;
-        let k = matmul_proj(x, self.k_proj.load_f32()?, self.n_kv_head * self.head_dim, in_dim)?;
-        let v = matmul_proj(x, self.v_proj.load_f32()?, self.n_kv_head * self.head_dim, in_dim)?;
+        let q = matmul_proj(
+            x,
+            self.q_proj.load_f32()?,
+            self.n_head * self.head_dim,
+            in_dim,
+        )?;
+        let k = matmul_proj(
+            x,
+            self.k_proj.load_f32()?,
+            self.n_kv_head * self.head_dim,
+            in_dim,
+        )?;
+        let v = matmul_proj(
+            x,
+            self.v_proj.load_f32()?,
+            self.n_kv_head * self.head_dim,
+            in_dim,
+        )?;
 
         let q = q.reshape((b_sz, seq_len, self.n_head, self.head_dim))?;
         let k = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?;
@@ -178,10 +206,12 @@ impl CausalSelfAttention {
             attn.matmul(&v)?
         } else {
             let n_groups = self.n_head / self.n_kv_head;
-            let k = k.unsqueeze(2)?
+            let k = k
+                .unsqueeze(2)?
                 .expand((b_sz, self.n_kv_head, n_groups, kv_len, self.head_dim))?
                 .reshape((b_sz, self.n_head, kv_len, self.head_dim))?;
-            let v = v.unsqueeze(2)?
+            let v = v
+                .unsqueeze(2)?
                 .expand((b_sz, self.n_kv_head, n_groups, kv_len, self.head_dim))?
                 .reshape((b_sz, self.n_head, kv_len, self.head_dim))?;
             let scores = q.matmul(&k.transpose(2, 3)?)?;
@@ -192,13 +222,26 @@ impl CausalSelfAttention {
             attn.matmul(&v)?
         };
 
-        attn_out = attn_out.transpose(1, 2)?.reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
+        attn_out =
+            attn_out
+                .transpose(1, 2)?
+                .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
 
-        matmul_proj(&attn_out, self.o_proj.load_f32()?, in_dim, self.n_head * self.head_dim)
+        matmul_proj(
+            &attn_out,
+            self.o_proj.load_f32()?,
+            in_dim,
+            self.n_head * self.head_dim,
+        )
     }
 }
 
-fn make_causal_mask(seq_len: usize, kv_len: usize, _seq_pos: usize, device: &Device) -> CandleResult<Tensor> {
+fn make_causal_mask(
+    seq_len: usize,
+    kv_len: usize,
+    _seq_pos: usize,
+    device: &Device,
+) -> CandleResult<Tensor> {
     if seq_len == 1 {
         return Tensor::zeros((1, 1, 1, kv_len), candle_core::DType::F32, device);
     }
@@ -207,7 +250,11 @@ fn make_causal_mask(seq_len: usize, kv_len: usize, _seq_pos: usize, device: &Dev
         .flat_map(|i| {
             let max_visible = prior_count + i;
             (0..kv_len).map(move |j| {
-                if j <= max_visible { 0.0 } else { f32::NEG_INFINITY }
+                if j <= max_visible {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                }
             })
         })
         .collect();
@@ -465,12 +512,21 @@ impl BonsaiModel {
             x = block.forward(&x, index_pos, &self.cos, &self.sin, &mut cache.kv_caches[i])?;
         }
 
-        let norm_w = Tensor::from_vec(self.output_norm.load_f32()?, self.config.hidden_size, &self.device)?;
+        let norm_w = Tensor::from_vec(
+            self.output_norm.load_f32()?,
+            self.config.hidden_size,
+            &self.device,
+        )?;
         x = rms_norm(&x, &norm_w, self.config.rms_norm_eps)?;
 
         let last = x.narrow(1, x.dim(1)? - 1, 1)?.squeeze(1)?;
 
-        matmul_proj(&last, self.lm_head.load_f32()?, self.config.vocab_size, self.config.hidden_size)
+        matmul_proj(
+            &last,
+            self.lm_head.load_f32()?,
+            self.config.vocab_size,
+            self.config.hidden_size,
+        )
     }
 }
 
@@ -520,8 +576,16 @@ impl BonsaiCache {
         let head_dim = config.head_dim;
         let kv_caches = (0..config.num_hidden_layers)
             .map(|_| {
-                let k = Tensor::zeros((1, config.num_key_value_heads, 0, head_dim), candle_core::DType::F32, device)?;
-                let v = Tensor::zeros((1, config.num_key_value_heads, 0, head_dim), candle_core::DType::F32, device)?;
+                let k = Tensor::zeros(
+                    (1, config.num_key_value_heads, 0, head_dim),
+                    candle_core::DType::F32,
+                    device,
+                )?;
+                let v = Tensor::zeros(
+                    (1, config.num_key_value_heads, 0, head_dim),
+                    candle_core::DType::F32,
+                    device,
+                )?;
                 Ok((k, v))
             })
             .collect::<CandleResult<Vec<_>>>()?;
@@ -536,8 +600,8 @@ impl BonsaiCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
     use crate::loader::gguf::PRISM_Q1_0_UPSTREAM;
+    use candle_core::Device;
 
     #[test]
     fn test_make_causal_mask_prefill() {
@@ -552,8 +616,10 @@ mod tests {
                 if j <= i {
                     assert_eq!(val, 0.0, "mask[{i},{j}] should be 0.0 for prefill");
                 } else {
-                    assert!(val.is_infinite() && val < 0.0,
-                        "mask[{i},{j}] should be -inf for prefill, got {val}");
+                    assert!(
+                        val.is_infinite() && val < 0.0,
+                        "mask[{i},{j}] should be -inf for prefill, got {val}"
+                    );
                 }
             }
         }
@@ -583,9 +649,9 @@ mod tests {
         // Position 1 of new tokens (cache pos 3): can see 0..3
         // Position 2 of new tokens (cache pos 4): can see 0..4
         let expectations: [[f32; 5]; 3] = [
-            [0.0, 0.0, 0.0, f32::NEG_INFINITY, f32::NEG_INFINITY],  // i=0 sees 0..2
-            [0.0, 0.0, 0.0, 0.0, f32::NEG_INFINITY],                 // i=1 sees 0..3
-            [0.0, 0.0, 0.0, 0.0, 0.0],                               // i=2 sees all 0..4
+            [0.0, 0.0, 0.0, f32::NEG_INFINITY, f32::NEG_INFINITY], // i=0 sees 0..2
+            [0.0, 0.0, 0.0, 0.0, f32::NEG_INFINITY],               // i=1 sees 0..3
+            [0.0, 0.0, 0.0, 0.0, 0.0],                             // i=2 sees all 0..4
         ];
         for i in 0..3 {
             for j in 0..5 {
@@ -594,8 +660,10 @@ mod tests {
                 if exp == 0.0 {
                     assert_eq!(val, 0.0, "extend mask[{i},{j}] should be 0.0");
                 } else {
-                    assert!(val.is_infinite() && val < 0.0,
-                        "extend mask[{i},{j}] should be -inf, got {val}");
+                    assert!(
+                        val.is_infinite() && val < 0.0,
+                        "extend mask[{i},{j}] should be -inf, got {val}"
+                    );
                 }
             }
         }
@@ -615,7 +683,10 @@ mod tests {
         let rms = (7.5f64 + eps).sqrt();
         for (i, &v) in data.iter().enumerate() {
             let expected = ((i as f64 + 1.0) / rms * 2.0) as f32;
-            assert!((v - expected).abs() < 1e-3, "rms_norm[{i}]: got {v}, expected {expected}");
+            assert!(
+                (v - expected).abs() < 1e-3,
+                "rms_norm[{i}]: got {v}, expected {expected}"
+            );
         }
     }
 
@@ -623,10 +694,7 @@ mod tests {
     fn test_rms_norm_broadcast() {
         let device = &Device::Cpu;
         // 3D case: [1, 2, 3] -> normalize over last dim
-        let x = Tensor::from_vec(
-            vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
-            (1, 2, 3), device,
-        ).unwrap();
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (1, 2, 3), device).unwrap();
         let weight = Tensor::from_vec(vec![1.0f32, 1.0, 1.0], 3, device).unwrap();
         let eps = 1e-6_f64;
         let result = rms_norm(&x, &weight, eps).unwrap();
@@ -634,16 +702,30 @@ mod tests {
         // Position 0: [1,2,3], mean=(1+4+9)/3 = 14/3 ≈ 4.6667, rms ≈ 2.1602
         // normalized ≈ [0.4629, 0.9258, 1.3887]
         let rms0 = ((14.0f64 / 3.0) + eps).sqrt();
-        let expected0: Vec<f32> = [1.0, 2.0, 3.0].iter().map(|&v| (v as f64 / rms0) as f32).collect();
+        let expected0: Vec<f32> = [1.0, 2.0, 3.0]
+            .iter()
+            .map(|&v| (v as f64 / rms0) as f32)
+            .collect();
         // Position 1: [4,5,6], mean=(16+25+36)/3 = 77/3 ≈ 25.6667, rms ≈ 5.0662
         // normalized ≈ [0.7895, 0.9869, 1.1843]
         let rms1 = ((77.0f64 / 3.0) + eps).sqrt();
-        let expected1: Vec<f32> = [4.0, 5.0, 6.0].iter().map(|&v| (v as f64 / rms1) as f32).collect();
+        let expected1: Vec<f32> = [4.0, 5.0, 6.0]
+            .iter()
+            .map(|&v| (v as f64 / rms1) as f32)
+            .collect();
         for j in 0..3 {
-            assert!((data[0][j] - expected0[j]).abs() < 1e-3,
-                "rms_norm bcast pos0[{j}]: got {}, expected {}", data[0][j], expected0[j]);
-            assert!((data[1][j] - expected1[j]).abs() < 1e-3,
-                "rms_norm bcast pos1[{j}]: got {}, expected {}", data[1][j], expected1[j]);
+            assert!(
+                (data[0][j] - expected0[j]).abs() < 1e-3,
+                "rms_norm bcast pos0[{j}]: got {}, expected {}",
+                data[0][j],
+                expected0[j]
+            );
+            assert!(
+                (data[1][j] - expected1[j]).abs() < 1e-3,
+                "rms_norm bcast pos1[{j}]: got {}, expected {}",
+                data[1][j],
+                expected1[j]
+            );
         }
     }
 
@@ -658,8 +740,10 @@ mod tests {
         let exp_sum = 1.0f64.exp() + 2.0f64.exp() + 3.0f64.exp() + 4.0f64.exp();
         for (i, &v) in data.iter().enumerate() {
             let expected = ((i as f64 + 1.0).exp() / exp_sum) as f32;
-            assert!((v - expected).abs() < 1e-5,
-                "softmax[{i}]: got {v}, expected {expected}");
+            assert!(
+                (v - expected).abs() < 1e-5,
+                "softmax[{i}]: got {v}, expected {expected}"
+            );
         }
     }
 
@@ -668,15 +752,30 @@ mod tests {
         let device = &Device::Cpu;
         // 2D case with -inf masking: first position is the only valid one
         let x = Tensor::from_vec(
-            vec![5.0f32, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY],
-            (1, 4), device,
-        ).unwrap();
+            vec![
+                5.0f32,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ],
+            (1, 4),
+            device,
+        )
+        .unwrap();
         let result = softmax(&x, 1).unwrap();
         let data: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
         // Only position 0 is valid → softmax = [1, 0, 0, 0]
-        assert!((data[0] - 1.0).abs() < 1e-5, "softmax masked[0]: got {}", data[0]);
+        assert!(
+            (data[0] - 1.0).abs() < 1e-5,
+            "softmax masked[0]: got {}",
+            data[0]
+        );
         for i in 1..4 {
-            assert_eq!(data[i], 0.0, "softmax masked[{i}]: should be 0, got {}", data[i]);
+            assert_eq!(
+                data[i], 0.0,
+                "softmax masked[{i}]: should be 0, got {}",
+                data[i]
+            );
         }
     }
 
@@ -686,10 +785,12 @@ mod tests {
         let elem_count = 256; // 2 blocks of 128
         let mut data = vec![0u8; (elem_count / 128) * 18];
         // Block 0: scale=1.0 (0x3c00 LE), first 8 bits=0x55 (10101010...)
-        data[0] = 0x00; data[1] = 0x3c; // fp16 1.0
+        data[0] = 0x00;
+        data[1] = 0x3c; // fp16 1.0
         data[2] = 0x55; // bits: 01010101...
         // Block 1: scale=2.0 (0x4000 LE), first 8 bits=0xFF (11111111...)
-        data[18] = 0x00; data[19] = 0x40; // fp16 2.0
+        data[18] = 0x00;
+        data[19] = 0x40; // fp16 2.0
         data[20] = 0xFF; // bits: 11111111...
 
         let out = crate::loader::gguf::dequantize_q1_0_upstream(&data, elem_count);
@@ -700,13 +801,22 @@ mod tests {
         // → -1, +1, -1, +1, -1, +1, -1, +1
         for i in 0..8 {
             let expected = if (i % 2) == 0 { -1.0 } else { 1.0 };
-            assert!((out[i] - expected).abs() < 1e-6, "block0[{i}]: got {}, expected {}", out[i], expected);
+            assert!(
+                (out[i] - expected).abs() < 1e-6,
+                "block0[{i}]: got {}, expected {}",
+                out[i],
+                expected
+            );
         }
 
         // Block 1: scale=2.0, bit=0 → +2.0, bit=1 → -2.0
         // 0xFF on first byte → all bits=1 → all -2.0
         for i in 128..136 {
-            assert!((out[i] - (-2.0)).abs() < 1e-6, "block1[{i}]: got {}, expected -2.0", out[i]);
+            assert!(
+                (out[i] - (-2.0)).abs() < 1e-6,
+                "block1[{i}]: got {}, expected -2.0",
+                out[i]
+            );
         }
     }
 
@@ -719,26 +829,66 @@ mod tests {
         assert_eq!(sin.dims(), &[10, 64]);
 
         // Position 0: cos=1, sin=0 for all pairs
-        let cos0: Vec<f32> = cos.narrow(0, 0, 1).unwrap().flatten_all().unwrap().to_vec1().unwrap();
-        let sin0: Vec<f32> = sin.narrow(0, 0, 1).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let cos0: Vec<f32> = cos
+            .narrow(0, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let sin0: Vec<f32> = sin
+            .narrow(0, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         for k in 0..64 {
-            assert!((cos0[k] - 1.0).abs() < 1e-5, "cos[0,{k}] should be ~1.0, got {}", cos0[k]);
-            assert!((sin0[k] - 0.0).abs() < 1e-5, "sin[0,{k}] should be ~0.0, got {}", sin0[k]);
+            assert!(
+                (cos0[k] - 1.0).abs() < 1e-5,
+                "cos[0,{k}] should be ~1.0, got {}",
+                cos0[k]
+            );
+            assert!(
+                (sin0[k] - 0.0).abs() < 1e-5,
+                "sin[0,{k}] should be ~0.0, got {}",
+                sin0[k]
+            );
         }
 
         // Position 1: verify theta computation: theta^(-2k/d) for k=0..63
         let theta = 1_000_000.0f64;
         let head_dim = 128.0;
-        let cos1: Vec<f32> = cos.narrow(0, 1, 1).unwrap().flatten_all().unwrap().to_vec1().unwrap();
-        let sin1: Vec<f32> = sin.narrow(0, 1, 1).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let cos1: Vec<f32> = cos
+            .narrow(0, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let sin1: Vec<f32> = sin
+            .narrow(0, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         for k in 0..64 {
             let inv_freq = 1.0 / theta.powf((2 * k) as f64 / head_dim);
             let expected_cos = (1.0f64 * inv_freq).cos() as f32;
             let expected_sin = (1.0f64 * inv_freq).sin() as f32;
-            assert!((cos1[k] - expected_cos).abs() < 1e-5,
-                "cos[1,{k}]: got {}, expected {}", cos1[k], expected_cos);
-            assert!((sin1[k] - expected_sin).abs() < 1e-5,
-                "sin[1,{k}]: got {}, expected {}", sin1[k], expected_sin);
+            assert!(
+                (cos1[k] - expected_cos).abs() < 1e-5,
+                "cos[1,{k}]: got {}, expected {}",
+                cos1[k],
+                expected_cos
+            );
+            assert!(
+                (sin1[k] - expected_sin).abs() < 1e-5,
+                "sin[1,{k}]: got {}, expected {}",
+                sin1[k],
+                expected_sin
+            );
         }
     }
 }

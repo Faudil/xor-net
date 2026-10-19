@@ -62,10 +62,12 @@ fn test_temperature_scaling_changes_distribution() {
     let mut cold = Sampler::new(42, Some(0.1), None, 1.0);
     let mut cold_logits = logits_base.clone();
     assert_eq!(cold.sample(&mut cold_logits, &[]).unwrap(), 9);
-    let hot_tokens: Vec<u32> = (0..20).map(|_| {
-        let mut s = Sampler::new(42, Some(10.0), None, 1.0);
-        s.sample(&mut logits_base.clone(), &[]).unwrap()
-    }).collect();
+    let hot_tokens: Vec<u32> = (0..20)
+        .map(|_| {
+            let mut s = Sampler::new(42, Some(10.0), None, 1.0);
+            s.sample(&mut logits_base.clone(), &[]).unwrap()
+        })
+        .collect();
     assert!(hot_tokens.iter().any(|&t| t != 9));
 }
 

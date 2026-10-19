@@ -1,17 +1,20 @@
-use std::path::Path;
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use crate::loader::{SafeTensorLoader, SafeTensorRepo, sparse_loader::SparseFile};
 use crate::models::llama::{Config, Llama, LlamaConfig};
 use crate::nn::QuantizationConfig;
-use crate::loader::{SafeTensorRepo, SafeTensorLoader, sparse_loader::SparseFile};
+use hf_hub::{Repo, RepoType, api::sync::Api};
+use std::path::Path;
 
 pub struct AutoModelForCausalLM;
 
 impl AutoModelForCausalLM {
-    pub fn from_local(model_dir: &Path, quantization_config: QuantizationConfig) -> anyhow::Result<(Llama, Config)> {
+    pub fn from_local(
+        model_dir: &Path,
+        quantization_config: QuantizationConfig,
+    ) -> anyhow::Result<(Llama, Config)> {
         let config_path = model_dir.join("config.json");
         let config_str = std::fs::read_to_string(&config_path)?;
-        let mut config: Config = serde_json::from_str::<LlamaConfig>(&config_str)?
-            .into_config(false);
+        let mut config: Config =
+            serde_json::from_str::<LlamaConfig>(&config_str)?.into_config(false);
         config.quantization_config = quantization_config;
 
         let index_path = model_dir.join("model.safetensors.index.json");
@@ -38,7 +41,11 @@ impl AutoModelForCausalLM {
                 // Fallback: glob any *.safetensors files
                 let mut entries: Vec<_> = std::fs::read_dir(model_dir)?
                     .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().map_or(false, |ext| ext == "safetensors"))
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .map_or(false, |ext| ext == "safetensors")
+                    })
                     .map(|e| e.path())
                     .collect();
                 entries.sort();
@@ -86,8 +93,8 @@ impl AutoModelForCausalLM {
         let mut filenames = vec![];
         if let Ok(index_file) = repo.get("model.safetensors.index.json") {
             let index_str = std::fs::read_to_string(index_file)?;
-            let index: serde_json::Value = serde_json::from_str(&index_str)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let index: serde_json::Value =
+                serde_json::from_str(&index_str).map_err(|e| anyhow::anyhow!(e.to_string()))?;
             if let Some(weight_map) = index.get("weight_map").and_then(|w| w.as_object()) {
                 let mut unique_files: Vec<String> = weight_map
                     .values()

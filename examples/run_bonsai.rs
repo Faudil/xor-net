@@ -3,9 +3,9 @@ use std::time::Instant;
 
 use candle_core::Device;
 use candle_transformers::generation::LogitsProcessor;
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::Api};
 use tokenizers::Tokenizer;
-use xor_net::{BonsaiModel, BonsaiCache, BonsaiConfig, GgufFile};
+use xor_net::{BonsaiCache, BonsaiConfig, BonsaiModel, GgufFile};
 
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
@@ -28,7 +28,10 @@ fn main() -> anyhow::Result<()> {
         println!("Architecture: {}", cfg.architecture);
         println!("Hidden size: {}", cfg.hidden_size);
         println!("Layers: {}", cfg.num_hidden_layers);
-        println!("Heads: {} / {} KV", cfg.num_attention_heads, cfg.num_key_value_heads);
+        println!(
+            "Heads: {} / {} KV",
+            cfg.num_attention_heads, cfg.num_key_value_heads
+        );
         println!("Vocab: {}", cfg.vocab_size);
         println!("Context: {}", cfg.max_position_embeddings);
         println!("File: {path}");
@@ -47,7 +50,10 @@ fn main() -> anyhow::Result<()> {
         println!("Architecture: {}", cfg.architecture);
         println!("Hidden size: {}", cfg.hidden_size);
         println!("Layers: {}", cfg.num_hidden_layers);
-        println!("Heads: {} / {} KV", cfg.num_attention_heads, cfg.num_key_value_heads);
+        println!(
+            "Heads: {} / {} KV",
+            cfg.num_attention_heads, cfg.num_key_value_heads
+        );
         println!("Vocab: {}", cfg.vocab_size);
         println!("Context: {}", cfg.max_position_embeddings);
         println!("File: {}", path.display());
@@ -74,10 +80,11 @@ fn main() -> anyhow::Result<()> {
             .to_string()
     });
 
-    let tokenizer = Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let tokenizer =
+        Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    let prompt = std::env::var("BONSAI_PROMPT").unwrap_or_else(|_| "Q: What is 2+2?\nA:".to_string());
+    let prompt =
+        std::env::var("BONSAI_PROMPT").unwrap_or_else(|_| "Q: What is 2+2?\nA:".to_string());
 
     let tokens = tokenizer
         .encode(prompt.as_str(), true)
@@ -85,7 +92,10 @@ fn main() -> anyhow::Result<()> {
         .get_ids()
         .to_vec();
 
-    println!("Prompt: '{prompt}' ({tokens} tokens)", tokens = tokens.len());
+    println!(
+        "Prompt: '{prompt}' ({tokens} tokens)",
+        tokens = tokens.len()
+    );
 
     let mut cache = BonsaiCache::new(&config, &device)?;
     let mut logits_processor = LogitsProcessor::new(299792458, None, None);

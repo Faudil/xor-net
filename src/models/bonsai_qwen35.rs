@@ -9,12 +9,12 @@
 //! Optimization: all weights are pre-loaded (cached) at model creation.
 //! No per-forward dequant.
 
-use std::sync::OnceLock;
-use std::sync::Arc;
-use rayon::prelude::*;
-use candle_core::{Device, Tensor, D};
+use crate::loader::gguf::{self as gguf, GgufFile};
 use candle_core::Result as CandleResult;
-use crate::loader::gguf::{GgufFile, self as gguf};
+use candle_core::{D, Device, Tensor};
+use rayon::prelude::*;
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Bitwise PRISM Q1_0 GEMV kernels (no dequant: dot product on packed signs)
@@ -110,14 +110,21 @@ pub struct LazyLinear {
 
 impl LazyLinear {
     pub fn new_bench(gguf: &Arc<GgufFile>, name: &str) -> CandleResult<Self> {
-        let info = gguf.tensor_info(name)
+        let info = gguf
+            .tensor_info(name)
             .map_err(|_e| candle_core::Error::Msg("no tensor".into()))?;
         Ok(LazyLinear::new(gguf, name, info.shape[0], info.shape[1]))
     }
-    pub fn in_dim(&self) -> usize { self.in_dim }
-    pub fn out_dim(&self) -> usize { self.out_dim }
+    pub fn in_dim(&self) -> usize {
+        self.in_dim
+    }
+    pub fn out_dim(&self) -> usize {
+        self.out_dim
+    }
     pub fn bench_forward(&self, x: &[f32]) -> CandleResult<Vec<f32>> {
-        let bytes = self.gguf.tensor_bytes(&self.name)
+        let bytes = self
+            .gguf
+            .tensor_bytes(&self.name)
             .map_err(|_e| candle_core::Error::Msg("no bytes".into()))?;
         let blocks_per_row = self.in_dim.div_ceil(128);
         let row_bytes = blocks_per_row * 18;
@@ -127,20 +134,31 @@ impl LazyLinear {
             .collect();
         let out_chunks: Vec<Vec<f32>> = chunks
             .par_iter()
-            .map(|&(lo, hi)| self.gemv_rows(x, bytes, lo, hi, self.in_dim, row_bytes, blocks_per_row))
+            .map(|&(lo, hi)| {
+                self.gemv_rows(x, bytes, lo, hi, self.in_dim, row_bytes, blocks_per_row)
+            })
             .collect::<CandleResult<Vec<_>>>()?;
         Ok(out_chunks.into_iter().flatten().collect())
     }
 
     fn new(gguf: &Arc<GgufFile>, name: &str, out_dim: usize, in_dim: usize) -> Self {
-        LazyLinear { gguf: gguf.clone(), name: name.to_string(), out_dim, in_dim }
+        LazyLinear {
+            gguf: gguf.clone(),
+            name: name.to_string(),
+            out_dim,
+            in_dim,
+        }
     }
 
     /// Dequantize the full weight matrix to a row-major f32 Vec.
     fn load_f32(&self) -> CandleResult<Vec<f32>> {
-        let info = self.gguf.tensor_info(&self.name)
+        let info = self
+            .gguf
+            .tensor_info(&self.name)
             .map_err(|_e| candle_core::Error::Msg(format!("tensor {} not found", self.name)))?;
-        let bytes = self.gguf.tensor_bytes(&self.name)
+        let bytes = self
+            .gguf
+            .tensor_bytes(&self.name)
             .map_err(|_e| candle_core::Error::Msg(format!("tensor {} bytes", self.name)))?;
         gguf::dequantize_data(bytes, info.dtype_u32, info.elem_count)
             .map_err(|_e| candle_core::Error::Msg(format!("dequant {}", self.name)))
@@ -149,20 +167,27 @@ impl LazyLinear {
     /// Dequantize rows [row_start, row_end) → f32 Vec of len rows*in_dim.
     /// Only the needed rows are unpacked (embedding + chunked matmul).
     fn load_rows(&self, row_start: usize, row_end: usize) -> CandleResult<Vec<f32>> {
-        let info = self.gguf.tensor_info(&self.name)
+        let info = self
+            .gguf
+            .tensor_info(&self.name)
             .map_err(|_e| candle_core::Error::Msg(format!("tensor {} not found", self.name)))?;
-        let bytes = self.gguf.tensor_bytes(&self.name)
+        let bytes = self
+            .gguf
+            .tensor_bytes(&self.name)
             .map_err(|_e| candle_core::Error::Msg(format!("tensor {} bytes", self.name)))?;
 
         match info.dtype_u32 {
-            0 => { // F32: contiguous rows, in_dim*4 bytes each
+            0 => {
+                // F32: contiguous rows, in_dim*4 bytes each
                 let row_bytes = self.in_dim * 4;
                 let slice = &bytes[row_start * row_bytes..row_end * row_bytes];
-                Ok(slice.chunks_exact(4)
+                Ok(slice
+                    .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect())
             }
-            41 | 43 => { // Upstream Q1_0 (128 elems / 18-byte block)
+            41 | 43 => {
+                // Upstream Q1_0 (128 elems / 18-byte block)
                 let rows_per_block = 128usize;
                 let blocks_per_row = self.in_dim.div_ceil(rows_per_block);
                 let row_bytes = blocks_per_row * 18;
@@ -173,7 +198,8 @@ impl LazyLinear {
                     let num_full_blocks = self.in_dim / rows_per_block;
                     for b in 0..num_full_blocks {
                         let bo = base + b * 18;
-                        let scale = gguf::fp16_to_f32(u16::from_le_bytes([bytes[bo], bytes[bo + 1]]));
+                        let scale =
+                            gguf::fp16_to_f32(u16::from_le_bytes([bytes[bo], bytes[bo + 1]]));
                         let off = b * rows_per_block;
                         for i in 0..rows_per_block {
                             let bit = (bytes[bo + 2 + (i >> 3)] >> (i & 7)) & 1;
@@ -199,7 +225,9 @@ impl LazyLinear {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         // For PRISM-packed weights use the bitwise GEMV (no dequant).
         // For F32 weights use the standard matmul.
-        let info = self.gguf.tensor_info(&self.name)
+        let info = self
+            .gguf
+            .tensor_info(&self.name)
             .map_err(|_e| candle_core::Error::Msg(format!("tensor {} not found", self.name)))?;
         match info.dtype_u32 {
             41 | 43 => self.forward_bitwise(x, 512),
@@ -214,7 +242,9 @@ impl LazyLinear {
     /// Computes out = x @ W^T without ever dequantizing to f32.
     /// Uses rayon to parallelize across output-row chunks.
     fn forward_bitwise(&self, x: &Tensor, chunk_rows: usize) -> CandleResult<Tensor> {
-        let bytes = self.gguf.tensor_bytes(&self.name)
+        let bytes = self
+            .gguf
+            .tensor_bytes(&self.name)
             .map_err(|_e| candle_core::Error::Msg(format!("tensor {} bytes", self.name)))?;
         let in_dim = self.in_dim;
         let out_dim = self.out_dim;
@@ -239,7 +269,9 @@ impl LazyLinear {
             .collect();
         let out_chunks: Vec<Vec<f32>> = chunks
             .par_iter()
-            .map(|&(lo, hi)| self.gemv_rows(&x_f32, bytes, lo, hi, in_dim, row_bytes, blocks_per_row))
+            .map(|&(lo, hi)| {
+                self.gemv_rows(&x_f32, bytes, lo, hi, in_dim, row_bytes, blocks_per_row)
+            })
             .collect::<CandleResult<Vec<_>>>()?;
         let out: Vec<f32> = out_chunks.into_iter().flatten().collect();
 
@@ -250,14 +282,21 @@ impl LazyLinear {
     /// Compute output rows [lo, hi) of y = x @ W^T via bitwise accumulation.
     #[inline(never)]
     fn gemv_rows(
-        &self, x: &[f32], bytes: &[u8],
-        lo: usize, hi: usize, in_dim: usize,
-        row_bytes: usize, blocks_per_row: usize,
+        &self,
+        x: &[f32],
+        bytes: &[u8],
+        lo: usize,
+        hi: usize,
+        in_dim: usize,
+        row_bytes: usize,
+        blocks_per_row: usize,
     ) -> CandleResult<Vec<f32>> {
         #[cfg(target_arch = "x86_64")]
         {
             if std::is_x86_feature_detected!("avx512f") {
-                return Ok(unsafe { gemv_rows_avx512(x, bytes, lo, hi, in_dim, row_bytes, blocks_per_row) });
+                return Ok(unsafe {
+                    gemv_rows_avx512(x, bytes, lo, hi, in_dim, row_bytes, blocks_per_row)
+                });
             }
         }
         let mut out = vec![0.0f32; hi - lo];
@@ -279,7 +318,9 @@ impl LazyLinear {
     /// Chunked matmul: x @ W^T computed in row-chunks to bound peak RAM.
     /// Uses the bitwise GEMV for PRISM-packed weights.
     fn forward_chunked(&self, x: &Tensor, chunk_rows: usize) -> CandleResult<Tensor> {
-        let info = self.gguf.tensor_info(&self.name)
+        let info = self
+            .gguf
+            .tensor_info(&self.name)
             .map_err(|_e| candle_core::Error::Msg(format!("tensor {} not found", self.name)))?;
         if matches!(info.dtype_u32, 41 | 43) {
             return self.forward_bitwise(x, chunk_rows);
@@ -310,10 +351,12 @@ struct RmsNorm {
 
 impl RmsNorm {
     fn from_gguf(gguf: &Arc<GgufFile>, name: &str, eps: f64) -> CandleResult<Self> {
-        let info = gguf.tensor_info(name)
+        let info = gguf
+            .tensor_info(name)
             .map_err(|_e| candle_core::Error::Msg("error".to_string()))?;
         let dim = info.shape.iter().product();
-        let data = gguf.tensor_bytes(name)
+        let data = gguf
+            .tensor_bytes(name)
             .map_err(|_e| candle_core::Error::Msg("error".to_string()))?;
         let f32_vec = gguf::dequantize_data(data, info.dtype_u32, info.elem_count)
             .map_err(|_e| candle_core::Error::Msg("error".to_string()))?;
@@ -335,7 +378,9 @@ impl RmsNorm {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn silu(x: &Tensor) -> CandleResult<Tensor> { x.silu() }
+fn silu(x: &Tensor) -> CandleResult<Tensor> {
+    x.silu()
+}
 
 fn sigmoid(x: &Tensor) -> CandleResult<Tensor> {
     let neg_x = x.affine(-1.0, 0.0)?;
@@ -379,15 +424,25 @@ fn precompute_rope(
 
 /// Apply RoPE to the first `rotary_dim` dims of the last axis; pass the rest through.
 /// cos/sin: [seq_len, rotary_dim/2], x: [b, seq, n_head, head_dim]
-fn apply_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor, seq_pos: usize, rotary_dim: usize) -> CandleResult<Tensor> {
+fn apply_rotary(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    seq_pos: usize,
+    rotary_dim: usize,
+) -> CandleResult<Tensor> {
     let (b_sz, seq_len, n_head, head_dim) = x.dims4()?;
     let half = rotary_dim / 2;
-    let rot = x.narrow(D::Minus1, 0, rotary_dim)?;         // [b, s, h, rot]
+    let rot = x.narrow(D::Minus1, 0, rotary_dim)?; // [b, s, h, rot]
     let passthrough = x.narrow(D::Minus1, rotary_dim, head_dim - rotary_dim)?; // [b, s, h, rest]
     let x1 = rot.narrow(D::Minus1, 0, half)?;
     let x2 = rot.narrow(D::Minus1, half, half)?;
-    let cos_slice = cos.narrow(0, seq_pos, seq_len)?.reshape((seq_len, 1, half))?;
-    let sin_slice = sin.narrow(0, seq_pos, seq_len)?.reshape((seq_len, 1, half))?;
+    let cos_slice = cos
+        .narrow(0, seq_pos, seq_len)?
+        .reshape((seq_len, 1, half))?;
+    let sin_slice = sin
+        .narrow(0, seq_pos, seq_len)?
+        .reshape((seq_len, 1, half))?;
     let m1 = x1.broadcast_mul(&cos_slice)?;
     let m2 = x2.broadcast_mul(&sin_slice)?;
     let m3 = x1.broadcast_mul(&sin_slice)?;
@@ -399,7 +454,12 @@ fn apply_rotary(x: &Tensor, cos: &Tensor, sin: &Tensor, seq_pos: usize, rotary_d
     out.reshape((b_sz, seq_len, n_head, head_dim))
 }
 
-fn make_causal_mask(seq_len: usize, kv_len: usize, _seq_pos: usize, device: &Device) -> CandleResult<Tensor> {
+fn make_causal_mask(
+    seq_len: usize,
+    kv_len: usize,
+    _seq_pos: usize,
+    device: &Device,
+) -> CandleResult<Tensor> {
     if seq_len == 1 {
         return Tensor::zeros((1, 1, 1, kv_len), candle_core::DType::F32, device);
     }
@@ -408,7 +468,11 @@ fn make_causal_mask(seq_len: usize, kv_len: usize, _seq_pos: usize, device: &Dev
         .flat_map(|i| {
             let max_visible = prior_count + i;
             (0..kv_len).map(move |j| {
-                if j <= max_visible { 0.0 } else { f32::NEG_INFINITY }
+                if j <= max_visible {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                }
             })
         })
         .collect();
@@ -422,35 +486,73 @@ fn make_causal_mask(seq_len: usize, kv_len: usize, _seq_pos: usize, device: &Dev
 
 #[derive(Clone)]
 struct FullAttention {
-    q_proj: LazyLinear,     // [12288, 5120] = 2*n_heads*head_dim (Q+gate)
-    k_proj: LazyLinear,     // [1024,  5120] = n_kv_heads*head_dim
-    v_proj: LazyLinear,     // [1024,  5120] = n_kv_heads*head_dim
-    o_proj: LazyLinear,     // [5120,  6144]
-    q_norm: RmsNorm,       // [256]
-    k_norm: RmsNorm,       // [256]
-    n_head: usize,         // 24
-    n_kv_head: usize,    // 4
-    head_dim: usize,     // 256
-    rotary_dim: usize,   // 128 (partial RoPE)
+    q_proj: LazyLinear, // [12288, 5120] = 2*n_heads*head_dim (Q+gate)
+    k_proj: LazyLinear, // [1024,  5120] = n_kv_heads*head_dim
+    v_proj: LazyLinear, // [1024,  5120] = n_kv_heads*head_dim
+    o_proj: LazyLinear, // [5120,  6144]
+    q_norm: RmsNorm,    // [256]
+    k_norm: RmsNorm,    // [256]
+    n_head: usize,      // 24
+    n_kv_head: usize,   // 4
+    head_dim: usize,    // 256
+    rotary_dim: usize,  // 128 (partial RoPE)
 }
 
 impl FullAttention {
-    fn load(gguf: &Arc<GgufFile>, pfx: &str, head_dim: usize, n_head: usize, n_kv: usize, eps: f64, rotary_dim: usize) -> CandleResult<Self> {
+    fn load(
+        gguf: &Arc<GgufFile>,
+        pfx: &str,
+        head_dim: usize,
+        n_head: usize,
+        n_kv: usize,
+        eps: f64,
+        rotary_dim: usize,
+    ) -> CandleResult<Self> {
         let q_out = 2 * n_head * head_dim;
         let kv_out = n_kv * head_dim;
         let o_in = n_head * head_dim;
         Ok(FullAttention {
-            q_proj: LazyLinear::new(gguf, &format!("{pfx}.attn_q.weight"), q_out, tensor_in_dim(gguf, &format!("{pfx}.attn_q.weight"))?),
-            k_proj: LazyLinear::new(gguf, &format!("{pfx}.attn_k.weight"), kv_out, tensor_in_dim(gguf, &format!("{pfx}.attn_k.weight"))?),
-            v_proj: LazyLinear::new(gguf, &format!("{pfx}.attn_v.weight"), kv_out, tensor_in_dim(gguf, &format!("{pfx}.attn_v.weight"))?),
-            o_proj: LazyLinear::new(gguf, &format!("{pfx}.attn_output.weight"), tensor_out_dim(gguf, &format!("{pfx}.attn_output.weight"))?, o_in),
+            q_proj: LazyLinear::new(
+                gguf,
+                &format!("{pfx}.attn_q.weight"),
+                q_out,
+                tensor_in_dim(gguf, &format!("{pfx}.attn_q.weight"))?,
+            ),
+            k_proj: LazyLinear::new(
+                gguf,
+                &format!("{pfx}.attn_k.weight"),
+                kv_out,
+                tensor_in_dim(gguf, &format!("{pfx}.attn_k.weight"))?,
+            ),
+            v_proj: LazyLinear::new(
+                gguf,
+                &format!("{pfx}.attn_v.weight"),
+                kv_out,
+                tensor_in_dim(gguf, &format!("{pfx}.attn_v.weight"))?,
+            ),
+            o_proj: LazyLinear::new(
+                gguf,
+                &format!("{pfx}.attn_output.weight"),
+                tensor_out_dim(gguf, &format!("{pfx}.attn_output.weight"))?,
+                o_in,
+            ),
             q_norm: RmsNorm::from_gguf(gguf, &format!("{pfx}.attn_q_norm.weight"), eps)?,
             k_norm: RmsNorm::from_gguf(gguf, &format!("{pfx}.attn_k_norm.weight"), eps)?,
-            n_head, n_kv_head: n_kv, head_dim, rotary_dim,
+            n_head,
+            n_kv_head: n_kv,
+            head_dim,
+            rotary_dim,
         })
     }
 
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, seq_pos: usize, cache: &mut (Tensor, Tensor)) -> CandleResult<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        seq_pos: usize,
+        cache: &mut (Tensor, Tensor),
+    ) -> CandleResult<Tensor> {
         let b_sz = 1usize;
         let seq_len = x.dim(1)?;
 
@@ -462,8 +564,14 @@ impl FullAttention {
         let q = qg.narrow(D::Minus1, 0, self.head_dim)?;
         let gate = qg.narrow(D::Minus1, self.head_dim, self.head_dim)?;
 
-        let k = self.k_proj.forward(x)?.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?;
-        let v = self.v_proj.forward(x)?.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?;
 
         // Q/K norms (applied BEFORE RoPE, matching the reference)
         let q = self.q_norm.forward(&q)?;
@@ -474,9 +582,9 @@ impl FullAttention {
         let k = apply_rotary(&k, cos, sin, seq_pos, self.rotary_dim)?;
 
         // Transpose → [b, n_heads, seq, head_dim]
-        let q = q.transpose(1,2)?;
-        let k = k.transpose(1,2)?;
-        let v = v.transpose(1,2)?;
+        let q = q.transpose(1, 2)?;
+        let k = k.transpose(1, 2)?;
+        let v = v.transpose(1, 2)?;
 
         // KV cache
         let k = Tensor::cat(&[&cache.0, &k], 2)?;
@@ -487,18 +595,24 @@ impl FullAttention {
 
         // GQA
         let n_groups = self.n_head / self.n_kv_head;
-        let k = k.unsqueeze(2)?.expand((b_sz, self.n_kv_head, n_groups, kv_len, self.head_dim))?.reshape((b_sz, self.n_head, kv_len, self.head_dim))?;
-        let v = v.unsqueeze(2)?.expand((b_sz, self.n_kv_head, n_groups, kv_len, self.head_dim))?.reshape((b_sz, self.n_head, kv_len, self.head_dim))?;
+        let k = k
+            .unsqueeze(2)?
+            .expand((b_sz, self.n_kv_head, n_groups, kv_len, self.head_dim))?
+            .reshape((b_sz, self.n_head, kv_len, self.head_dim))?;
+        let v = v
+            .unsqueeze(2)?
+            .expand((b_sz, self.n_kv_head, n_groups, kv_len, self.head_dim))?
+            .reshape((b_sz, self.n_head, kv_len, self.head_dim))?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let scores = q.matmul(&k.transpose(2,3)?)?.affine(scale, 0.0)?;
+        let scores = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?;
         let mask = make_causal_mask(seq_len, kv_len, seq_pos, x.device())?;
         let scores = scores.broadcast_add(&mask)?;
         let attn = softmax(&scores, 3)?;
         let attn_out = attn.matmul(&v)?;
 
         // Gate: sigmoid(gate) * attn_out
-        let gate = gate.transpose(1,2)?;
+        let gate = gate.transpose(1, 2)?;
         let gate = sigmoid(&gate)?;
 
         if std::env::var("BONSAI_DBG").is_ok() && seq_len == 1 {
@@ -515,7 +629,10 @@ impl FullAttention {
             eprintln!("  [attn] gated_attn[:4]={:?}", &attn_flat[..4]);
         }
 
-        let attn_out = attn_out.transpose(1,2)?.reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
+        let attn_out =
+            attn_out
+                .transpose(1, 2)?
+                .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
         self.o_proj.forward(&attn_out)
     }
 }
@@ -536,21 +653,21 @@ impl FullAttention {
 #[derive(Clone)]
 #[allow(dead_code)]
 struct GatedDeltaNet {
-    in_proj_qkv: LazyLinear,  // [10240, 5120] → 2*key_dim + value_dim
-    in_proj_z: LazyLinear,    // [6144,  5120] → gate
-    in_proj_a: LazyLinear,    // [48,   5120] → alpha
-    in_proj_b: LazyLinear,    // [48,   5120] → beta
+    in_proj_qkv: LazyLinear, // [10240, 5120] → 2*key_dim + value_dim
+    in_proj_z: LazyLinear,   // [6144,  5120] → gate
+    in_proj_a: LazyLinear,   // [48,   5120] → alpha
+    in_proj_b: LazyLinear,   // [48,   5120] → beta
     conv1d_w: Tensor,        // [10240, 4]   → depthwise conv weights
     dt_bias_f32: Vec<f32>,   // [48]         → time step bias
     a_log_f32: Vec<f32>,     // [48]         → A_log (diagonal state decay)
-    norm: RmsNorm,        // [128]        → per-v-head norm
-    out_proj: LazyLinear,  // [5120, 6144] → output projection
-    key_dim: usize,     // 2048
-    value_dim: usize,   // 6144
-    num_v_heads: usize, // 48
-    num_k_heads: usize, // 16
-    head_dim: usize,   // 128 (shared by k and v heads)
-    conv_kernel: usize, // 4
+    norm: RmsNorm,           // [128]        → per-v-head norm
+    out_proj: LazyLinear,    // [5120, 6144] → output projection
+    key_dim: usize,          // 2048
+    value_dim: usize,        // 6144
+    num_v_heads: usize,      // 48
+    num_k_heads: usize,      // 16
+    head_dim: usize,         // 128 (shared by k and v heads)
+    conv_kernel: usize,      // 4
 }
 
 impl GatedDeltaNet {
@@ -559,14 +676,38 @@ impl GatedDeltaNet {
         let conv_dim = cfg.ssm_key_dim * 2 + cfg.ssm_value_dim;
         Ok(GatedDeltaNet {
             in_proj_qkv: LazyLinear::new(gguf, &p("attn_qkv.weight"), conv_dim, cfg.hidden_size),
-            in_proj_z: LazyLinear::new(gguf, &p("attn_gate.weight"), cfg.ssm_value_dim, cfg.hidden_size),
-            in_proj_a: LazyLinear::new(gguf, &p("ssm_alpha.weight"), cfg.ssm_num_v_heads, cfg.hidden_size),
-            in_proj_b: LazyLinear::new(gguf, &p("ssm_beta.weight"), cfg.ssm_num_v_heads, cfg.hidden_size),
-            conv1d_w: Tensor::from_vec(load_f32_simple(gguf, &p("ssm_conv1d.weight"))?, (conv_dim, cfg.ssm_conv_kernel), &candle_core::Device::Cpu)?,
+            in_proj_z: LazyLinear::new(
+                gguf,
+                &p("attn_gate.weight"),
+                cfg.ssm_value_dim,
+                cfg.hidden_size,
+            ),
+            in_proj_a: LazyLinear::new(
+                gguf,
+                &p("ssm_alpha.weight"),
+                cfg.ssm_num_v_heads,
+                cfg.hidden_size,
+            ),
+            in_proj_b: LazyLinear::new(
+                gguf,
+                &p("ssm_beta.weight"),
+                cfg.ssm_num_v_heads,
+                cfg.hidden_size,
+            ),
+            conv1d_w: Tensor::from_vec(
+                load_f32_simple(gguf, &p("ssm_conv1d.weight"))?,
+                (conv_dim, cfg.ssm_conv_kernel),
+                &candle_core::Device::Cpu,
+            )?,
             dt_bias_f32: load_f32_simple(gguf, &p("ssm_dt.bias"))?,
             a_log_f32: load_f32_simple(gguf, &p("ssm_a"))?,
             norm: RmsNorm::from_gguf(gguf, &p("ssm_norm.weight"), cfg.rms_norm_eps)?,
-            out_proj: LazyLinear::new(gguf, &p("ssm_out.weight"), cfg.hidden_size, cfg.ssm_value_dim),
+            out_proj: LazyLinear::new(
+                gguf,
+                &p("ssm_out.weight"),
+                cfg.hidden_size,
+                cfg.ssm_value_dim,
+            ),
             key_dim: cfg.ssm_key_dim,
             value_dim: cfg.ssm_value_dim,
             num_v_heads: cfg.ssm_num_v_heads,
@@ -576,14 +717,19 @@ impl GatedDeltaNet {
         })
     }
 
-    fn forward(&self, x: &Tensor, _seq_pos: usize, ssm_state: &mut SsmState) -> CandleResult<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        _seq_pos: usize,
+        ssm_state: &mut SsmState,
+    ) -> CandleResult<Tensor> {
         let seq_len = x.dim(1)?;
 
         // 1. Projections
-        let qkv = self.in_proj_qkv.forward(x)?;   // [1, seq, 10240]
-        let z = self.in_proj_z.forward(x)?;       // [1, seq, 6144]
-        let a_coeff = self.in_proj_a.forward(x)?;   // [1, seq, 48]
-        let b_coeff = self.in_proj_b.forward(x)?;   // [1, seq, 48]
+        let qkv = self.in_proj_qkv.forward(x)?; // [1, seq, 10240]
+        let z = self.in_proj_z.forward(x)?; // [1, seq, 6144]
+        let a_coeff = self.in_proj_a.forward(x)?; // [1, seq, 48]
+        let b_coeff = self.in_proj_b.forward(x)?; // [1, seq, 48]
 
         // 2. Causal conv1d (depthwise, along seq) + SiLU
         let qkv = apply_conv1d(&qkv, &self.conv1d_w, self.conv_kernel, ssm_state)?;
@@ -591,7 +737,7 @@ impl GatedDeltaNet {
         // 3. Split QKV: Q[0:key_dim], K[key_dim:2*key_dim], V[2*key_dim:end]
         let q_raw = qkv.narrow(D::Minus1, 0, self.key_dim)?;
         let k_raw = qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
-        let v_raw = qkv.narrow(D::Minus1, 2*self.key_dim, self.value_dim)?;
+        let v_raw = qkv.narrow(D::Minus1, 2 * self.key_dim, self.value_dim)?;
 
         // 4. Reshape per-head: Q/K→n_k_heads, V→n_v_heads
         let q = q_raw.reshape((1, seq_len, self.num_k_heads, self.head_dim))?;
@@ -600,7 +746,7 @@ impl GatedDeltaNet {
 
         // 5. Delta rule per token (loop for prefill, single-step for decode)
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let heads_per_k = self.num_v_heads / self.num_k_heads;  // 3
+        let heads_per_k = self.num_v_heads / self.num_k_heads; // 3
 
         if seq_len == 1 {
             // Decode: single-step
@@ -610,40 +756,67 @@ impl GatedDeltaNet {
             let z_p = z.squeeze(1)?.squeeze(0)?;
             let a_p = a_coeff.squeeze(1)?.squeeze(0)?;
             let b_p = b_coeff.squeeze(1)?.squeeze(0)?;
-            return self.ssm_step(&q_p, &k_p, &v_p, &z_p, &a_p, &b_p, scale, heads_per_k, ssm_state);
+            return self.ssm_step(
+                &q_p,
+                &k_p,
+                &v_p,
+                &z_p,
+                &a_p,
+                &b_p,
+                scale,
+                heads_per_k,
+                ssm_state,
+            );
         }
 
         // Prefill: per-token loop
         let mut parts: Vec<Tensor> = Vec::with_capacity(seq_len);
         for pos in 0..seq_len {
-            let q_p = q.narrow(1, pos,1)?.squeeze(1)?.squeeze(0)?;
-            let k_p = k.narrow(1, pos,1)?.squeeze(1)?.squeeze(0)?;
-            let v_p = v.narrow(1, pos,1)?.squeeze(1)?.squeeze(0)?;
-            let z_p = z.narrow(1, pos,1)?.squeeze(1)?.squeeze(0)?;
-            let a_p = a_coeff.narrow(1, pos,1)?.squeeze(1)?.squeeze(0)?;
-            let b_p = b_coeff.narrow(1, pos,1)?.squeeze(1)?.squeeze(0)?;
-            let out = self.ssm_step(&q_p, &k_p, &v_p, &z_p, &a_p, &b_p, scale, heads_per_k, ssm_state)?;
-            parts.push(out);  // already [1, 1, hidden]
+            let q_p = q.narrow(1, pos, 1)?.squeeze(1)?.squeeze(0)?;
+            let k_p = k.narrow(1, pos, 1)?.squeeze(1)?.squeeze(0)?;
+            let v_p = v.narrow(1, pos, 1)?.squeeze(1)?.squeeze(0)?;
+            let z_p = z.narrow(1, pos, 1)?.squeeze(1)?.squeeze(0)?;
+            let a_p = a_coeff.narrow(1, pos, 1)?.squeeze(1)?.squeeze(0)?;
+            let b_p = b_coeff.narrow(1, pos, 1)?.squeeze(1)?.squeeze(0)?;
+            let out = self.ssm_step(
+                &q_p,
+                &k_p,
+                &v_p,
+                &z_p,
+                &a_p,
+                &b_p,
+                scale,
+                heads_per_k,
+                ssm_state,
+            )?;
+            parts.push(out); // already [1, 1, hidden]
         }
         Tensor::cat(&parts, 1)
     }
 
     /// Delta rule for a single (q,k,v) step, all in plain f32 (no tiny tensors).
     fn ssm_step(
-        &self, q: &Tensor, k: &Tensor, v: &Tensor, z: &Tensor,
-        a: &Tensor, b: &Tensor, scale: f64,
-        heads_per_k: usize, state: &mut SsmState,
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        z: &Tensor,
+        a: &Tensor,
+        b: &Tensor,
+        scale: f64,
+        heads_per_k: usize,
+        state: &mut SsmState,
     ) -> CandleResult<Tensor> {
         let hd = self.head_dim;
         let n_vh = self.num_v_heads;
         let n_kh = self.num_k_heads;
 
-        let q: Vec<f32> = q.flatten_all()?.to_vec1()?;   // [n_kh*hd]
-        let k: Vec<f32> = k.flatten_all()?.to_vec1()?;   // [n_kh*hd]
-        let v: Vec<f32> = v.flatten_all()?.to_vec1()?;   // [n_vh*hd]
-        let z: Vec<f32> = z.flatten_all()?.to_vec1()?;   // [value_dim]
-        let a: Vec<f32> = a.flatten_all()?.to_vec1()?;   // [n_vh]
-        let b: Vec<f32> = b.flatten_all()?.to_vec1()?;   // [n_vh]
+        let q: Vec<f32> = q.flatten_all()?.to_vec1()?; // [n_kh*hd]
+        let k: Vec<f32> = k.flatten_all()?.to_vec1()?; // [n_kh*hd]
+        let v: Vec<f32> = v.flatten_all()?.to_vec1()?; // [n_vh*hd]
+        let z: Vec<f32> = z.flatten_all()?.to_vec1()?; // [value_dim]
+        let a: Vec<f32> = a.flatten_all()?.to_vec1()?; // [n_vh]
+        let b: Vec<f32> = b.flatten_all()?.to_vec1()?; // [n_vh]
 
         if std::env::var("BONSAI_DBG").is_ok() {
             eprintln!("  [ssm] q[:4]={:?}", &q[..4]);
@@ -708,10 +881,12 @@ impl GatedDeltaNet {
             let decay = g[vh].exp();
             let beta_h = beta[vh];
 
-            let s = &mut state.s[vh];  // [hd*hd] row-major: s[i*hd + j]
+            let s = &mut state.s[vh]; // [hd*hd] row-major: s[i*hd + j]
 
             // S = S * exp(g)
-            for e in s.iter_mut() { *e *= decay; }
+            for e in s.iter_mut() {
+                *e *= decay;
+            }
 
             // kv_mem[j] = sum_i S[i][j] * k_i[i]
             let mut kv_mem = vec![0.0f32; hd];
@@ -774,8 +949,13 @@ impl GatedDeltaNet {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn gemv_rows_avx512(
-    x: &[f32], bytes: &[u8], lo: usize, hi: usize,
-    _in_dim: usize, row_bytes: usize, blocks_per_row: usize,
+    x: &[f32],
+    bytes: &[u8],
+    lo: usize,
+    hi: usize,
+    _in_dim: usize,
+    row_bytes: usize,
+    blocks_per_row: usize,
 ) -> Vec<f32> {
     use std::arch::x86_64::*;
     let table = sign_table();
@@ -821,7 +1001,9 @@ unsafe fn gemv_rows_avx512(
 /// For each pos t: out[c,t] = sum_k(conv_w[c,k] * qkv[c,t-k]) with left-zero-pad.
 /// History from previous tokens is kept in state.conv_hist (pad rows).
 fn apply_conv1d(
-    qkv: &Tensor, conv1d_w: &Tensor, kernel_size: usize,
+    qkv: &Tensor,
+    conv1d_w: &Tensor,
+    kernel_size: usize,
     state: &mut SsmState,
 ) -> CandleResult<Tensor> {
     let seq_len = qkv.dim(1)?;
@@ -840,9 +1022,9 @@ fn apply_conv1d(
     // out[t] = sum_k conv_w[:,k] * padded[:, t+k, :]
     let mut acc: Option<Tensor> = None;
     for k in 0..kernel_size {
-        let slice = padded.narrow(1, k, seq_len)?;       // [1, seq, dim]
+        let slice = padded.narrow(1, k, seq_len)?; // [1, seq, dim]
         let w_k = conv1d_w.narrow(1, k, 1)?.squeeze(1)?; // [dim]
-        let term = slice.broadcast_mul(&w_k)?;           // [1, seq, dim]
+        let term = slice.broadcast_mul(&w_k)?; // [1, seq, dim]
         acc = Some(match acc {
             None => term,
             Some(a) => (a + term)?,
@@ -874,13 +1056,24 @@ pub struct SsmState {
 }
 
 impl SsmState {
-    fn new(num_v_heads: usize, head_dim: usize, conv_dim: usize, kernel_size: usize, _device: &Device) -> CandleResult<Self> {
+    fn new(
+        num_v_heads: usize,
+        head_dim: usize,
+        conv_dim: usize,
+        kernel_size: usize,
+        _device: &Device,
+    ) -> CandleResult<Self> {
         let s = (0..num_v_heads)
             .map(|_| vec![0.0f32; head_dim * head_dim])
             .collect::<Vec<_>>();
         let conv_pad = kernel_size.saturating_sub(1);
         let conv_hist = vec![0.0f32; conv_dim * conv_pad.max(1)];
-        Ok(SsmState { s, conv_hist, conv_dim, conv_pad })
+        Ok(SsmState {
+            s,
+            conv_hist,
+            conv_dim,
+            conv_pad,
+        })
     }
 }
 
@@ -934,8 +1127,12 @@ struct Block {
 #[allow(dead_code)]
 impl Block {
     fn forward(
-        &self, x: &Tensor, cos: &Tensor, sin: &Tensor,
-        seq_pos: usize, attn_cache: &mut (Tensor, Tensor),
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        seq_pos: usize,
+        attn_cache: &mut (Tensor, Tensor),
         ssm_state: &mut SsmState,
     ) -> CandleResult<Tensor> {
         let residual = x.clone();
@@ -987,18 +1184,22 @@ pub struct BonsaiQwen35Config {
 impl BonsaiQwen35Config {
     pub fn from_gguf(gguf: &GgufFile) -> anyhow::Result<Self> {
         let meta = &gguf.metadata.metadata;
-        let arch = meta.get("general.architecture")
+        let arch = meta
+            .get("general.architecture")
             .and_then(|v| v.to_string())
             .ok_or_else(|| anyhow::anyhow!("missing general.architecture"))?;
         anyhow::ensure!(arch == "qwen35", "expected qwen35, got {arch}");
 
         let p = |k: &str| format!("{arch}.{k}");
         let get_u32 = |k: &str| -> anyhow::Result<usize> {
-            meta.get(&p(k)).and_then(|v| v.to_u32()).map(|v| v as usize)
+            meta.get(&p(k))
+                .and_then(|v| v.to_u32())
+                .map(|v| v as usize)
                 .ok_or_else(|| anyhow::anyhow!("missing {}", p(k)))
         };
         let get_f32 = |k: &str| -> anyhow::Result<f32> {
-            meta.get(&p(k)).and_then(|v| v.to_f32())
+            meta.get(&p(k))
+                .and_then(|v| v.to_f32())
                 .ok_or_else(|| anyhow::anyhow!("missing {}", p(k)))
         };
 
@@ -1009,9 +1210,15 @@ impl BonsaiQwen35Config {
         let n_layers = get_u32("block_count")?;
         let ctx = get_u32("context_length")?;
         let rms_eps = get_f32("attention.layer_norm_rms_epsilon")? as f64;
-        let rope_theta = meta.get(&p("rope.freq_base")).and_then(|v| v.to_f32()).unwrap_or(10000000.0);
+        let rope_theta = meta
+            .get(&p("rope.freq_base"))
+            .and_then(|v| v.to_f32())
+            .unwrap_or(10000000.0);
         // rope.dimension_count = number of inv_freq values → rotary dim = 2 × count
-        let rope_dim_count = meta.get(&p("rope.dimension_count")).and_then(|v| v.to_u32()).unwrap_or((head_dim / 2) as u32) as usize;
+        let rope_dim_count = meta
+            .get(&p("rope.dimension_count"))
+            .and_then(|v| v.to_u32())
+            .unwrap_or((head_dim / 2) as u32) as usize;
         let rope_rotary_dim = 2 * rope_dim_count;
         let inter = get_u32("feed_forward_length")?;
         let fa_interval = get_u32("full_attention_interval")?;
@@ -1030,24 +1237,43 @@ impl BonsaiQwen35Config {
         // Verify QKV split: 2*key_dim + value_dim = attn_qkv out_dim
         if let Some(info) = gguf.metadata.tensor_infos.get("blk.0.attn_qkv.weight") {
             let expected = 2 * key_dim + value_dim;
-            anyhow::ensure!(info.shape[0] == expected,
-                "attn_qkv mismatch: {} vs {}", info.shape[0], expected);
+            anyhow::ensure!(
+                info.shape[0] == expected,
+                "attn_qkv mismatch: {} vs {}",
+                info.shape[0],
+                expected
+            );
         }
 
-        let vocab = meta.get("tokenizer.ggml.tokens").and_then(|v| v.array_len())
+        let vocab = meta
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.array_len())
             .ok_or_else(|| anyhow::anyhow!("missing tokenizer.ggml.tokens"))?;
         let has_output = gguf.has_tensor("output.weight");
 
         Ok(BonsaiQwen35Config {
-            hidden_size: hidden, intermediate_size: inter, vocab_size: vocab,
-            num_hidden_layers: n_layers, num_attention_heads: n_heads,
-            num_key_value_heads: n_kv, head_dim, rms_norm_eps: rms_eps,
-            rope_theta, rope_rotary_dim, max_position_embeddings: ctx, full_attention_interval: fa_interval,
-            ssm_conv_kernel: ssm_conv, ssm_state_size: ssm_state,
-            ssm_group_count: ssm_groups, ssm_time_step_rank: ssm_ts_rank,
-            ssm_key_dim: key_dim, ssm_value_dim: value_dim,
-            ssm_head_v_dim: head_v_dim, ssm_num_v_heads: num_v_heads,
-            ssm_num_k_heads: num_k_heads, has_output_weight: has_output,
+            hidden_size: hidden,
+            intermediate_size: inter,
+            vocab_size: vocab,
+            num_hidden_layers: n_layers,
+            num_attention_heads: n_heads,
+            num_key_value_heads: n_kv,
+            head_dim,
+            rms_norm_eps: rms_eps,
+            rope_theta,
+            rope_rotary_dim,
+            max_position_embeddings: ctx,
+            full_attention_interval: fa_interval,
+            ssm_conv_kernel: ssm_conv,
+            ssm_state_size: ssm_state,
+            ssm_group_count: ssm_groups,
+            ssm_time_step_rank: ssm_ts_rank,
+            ssm_key_dim: key_dim,
+            ssm_value_dim: value_dim,
+            ssm_head_v_dim: head_v_dim,
+            ssm_num_v_heads: num_v_heads,
+            ssm_num_k_heads: num_k_heads,
+            has_output_weight: has_output,
         })
     }
 }
@@ -1071,9 +1297,13 @@ pub struct BonsaiQwen35Model {
 impl BonsaiQwen35Model {
     pub fn from_gguf(gguf: Arc<GgufFile>, device: &Device) -> anyhow::Result<Self> {
         let config = BonsaiQwen35Config::from_gguf(&gguf)?;
-        println!("Loading Bonsai-27B (qwen35): {} layers, {} hidden, {} heads/{} KV",
-            config.num_hidden_layers, config.hidden_size,
-            config.num_attention_heads, config.num_key_value_heads);
+        println!(
+            "Loading Bonsai-27B (qwen35): {} layers, {} hidden, {} heads/{} KV",
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.num_attention_heads,
+            config.num_key_value_heads
+        );
 
         let hidden = config.hidden_size;
         let token_embd = LazyLinear::new(&gguf, "token_embd.weight", config.vocab_size, hidden);
@@ -1088,34 +1318,83 @@ impl BonsaiQwen35Model {
         for i in 0..config.num_hidden_layers {
             let pfx = format!("blk.{i}");
             let is_full = i % config.full_attention_interval == 3;
-            let input_norm = RmsNorm::from_gguf(&gguf, &format!("{pfx}.attn_norm.weight"), config.rms_norm_eps)?;
-            let post_norm = RmsNorm::from_gguf(&gguf, &format!("{pfx}.post_attention_norm.weight"), config.rms_norm_eps)?;
+            let input_norm = RmsNorm::from_gguf(
+                &gguf,
+                &format!("{pfx}.attn_norm.weight"),
+                config.rms_norm_eps,
+            )?;
+            let post_norm = RmsNorm::from_gguf(
+                &gguf,
+                &format!("{pfx}.post_attention_norm.weight"),
+                config.rms_norm_eps,
+            )?;
             let mlp = Mlp::load(&gguf, &pfx, hidden, config.intermediate_size)?;
             let kind = if is_full {
-                BlockKind::FullAttention(FullAttention::load(&gguf, &pfx, config.head_dim, config.num_attention_heads, config.num_key_value_heads, config.rms_norm_eps, config.rope_rotary_dim)?)
+                BlockKind::FullAttention(FullAttention::load(
+                    &gguf,
+                    &pfx,
+                    config.head_dim,
+                    config.num_attention_heads,
+                    config.num_key_value_heads,
+                    config.rms_norm_eps,
+                    config.rope_rotary_dim,
+                )?)
             } else {
                 BlockKind::GatedDeltaNet(GatedDeltaNet::load(&gguf, &pfx, &config)?)
             };
-            blocks.push(Block { kind, input_norm, post_norm, mlp, is_full_attn: is_full });
+            blocks.push(Block {
+                kind,
+                input_norm,
+                post_norm,
+                mlp,
+                is_full_attn: is_full,
+            });
         }
 
-        let (cos, sin) = precompute_rope(config.rope_rotary_dim, config.max_position_embeddings, config.rope_theta as f64, device)?;
-        Ok(BonsaiQwen35Model { config, token_embd, output_norm, lm_head, blocks, cos, sin, device: device.clone() })
+        let (cos, sin) = precompute_rope(
+            config.rope_rotary_dim,
+            config.max_position_embeddings,
+            config.rope_theta as f64,
+            device,
+        )?;
+        Ok(BonsaiQwen35Model {
+            config,
+            token_embd,
+            output_norm,
+            lm_head,
+            blocks,
+            cos,
+            sin,
+            device: device.clone(),
+        })
     }
 
-    pub fn forward(&self, tokens: &[u32], seq_pos: usize, cache: &mut BonsaiQwen35Cache) -> CandleResult<Tensor> {
+    pub fn forward(
+        &self,
+        tokens: &[u32],
+        seq_pos: usize,
+        cache: &mut BonsaiQwen35Cache,
+    ) -> CandleResult<Tensor> {
         let x = self.embed(tokens)?;
         self.forward_embed(&x, seq_pos, cache)
     }
 
     /// Debug: run just block `idx` (SSM or attention) on an embedded input.
-    pub fn debug_block(&self, idx: usize, x: &Tensor, seq_pos: usize, cache: &mut BonsaiQwen35Cache) -> CandleResult<Tensor> {
+    pub fn debug_block(
+        &self,
+        idx: usize,
+        x: &Tensor,
+        seq_pos: usize,
+        cache: &mut BonsaiQwen35Cache,
+    ) -> CandleResult<Tensor> {
         let block = &self.blocks[idx];
         let attn_cache = &mut cache.attn_caches[idx];
         let ssm_state = &mut cache.ssm_states[idx];
         let x_norm = block.input_norm.forward(x)?;
         let out = match &block.kind {
-            BlockKind::FullAttention(attn) => attn.forward(&x_norm, &self.cos, &self.sin, seq_pos, attn_cache)?,
+            BlockKind::FullAttention(attn) => {
+                attn.forward(&x_norm, &self.cos, &self.sin, seq_pos, attn_cache)?
+            }
             BlockKind::GatedDeltaNet(ssm) => ssm.forward(&x_norm, seq_pos, ssm_state)?,
         };
         Ok(out)
@@ -1145,7 +1424,12 @@ impl BonsaiQwen35Model {
         t.unsqueeze(0)
     }
 
-    pub fn forward_embed(&self, x: &Tensor, seq_pos: usize, cache: &mut BonsaiQwen35Cache) -> CandleResult<Tensor> {
+    pub fn forward_embed(
+        &self,
+        x: &Tensor,
+        seq_pos: usize,
+        cache: &mut BonsaiQwen35Cache,
+    ) -> CandleResult<Tensor> {
         let profile = std::env::var("BONSAI_PROFILE").is_ok();
         let mut t_ssm = 0.0f64;
         let mut t_attn = 0.0f64;
@@ -1161,10 +1445,13 @@ impl BonsaiQwen35Model {
                 let x_norm = block.input_norm.forward(&x)?;
                 let t0 = std::time::Instant::now();
                 if let BlockKind::FullAttention(ref attn) = block.kind {
-                    let attn_out = attn.forward(&x_norm, &self.cos, &self.sin, seq_pos, attn_cache)?;
+                    let attn_out =
+                        attn.forward(&x_norm, &self.cos, &self.sin, seq_pos, attn_cache)?;
                     x = (residual + attn_out)?;
                 }
-                if profile { t_attn += t0.elapsed().as_secs_f64(); }
+                if profile {
+                    t_attn += t0.elapsed().as_secs_f64();
+                }
             } else {
                 let residual = x.clone();
                 let x_norm = block.input_norm.forward(&x)?;
@@ -1173,7 +1460,9 @@ impl BonsaiQwen35Model {
                     let ssm_out = ssm.forward(&x_norm, seq_pos, ssm_state)?;
                     x = (residual + ssm_out)?;
                 }
-                if profile { t_ssm += t0.elapsed().as_secs_f64(); }
+                if profile {
+                    t_ssm += t0.elapsed().as_secs_f64();
+                }
             }
 
             let residual = x.clone();
@@ -1181,11 +1470,18 @@ impl BonsaiQwen35Model {
             let t0 = std::time::Instant::now();
             let mlp_out = block.mlp.forward(&x_norm)?;
             x = (residual + mlp_out)?;
-            if profile { t_mlp += t0.elapsed().as_secs_f64(); }
+            if profile {
+                t_mlp += t0.elapsed().as_secs_f64();
+            }
         }
 
         if profile {
-            eprintln!("  [profile] ssm={:.0}ms attn={:.0}ms mlp={:.0}ms", t_ssm*1000.0, t_attn*1000.0, t_mlp*1000.0);
+            eprintln!(
+                "  [profile] ssm={:.0}ms attn={:.0}ms mlp={:.0}ms",
+                t_ssm * 1000.0,
+                t_attn * 1000.0,
+                t_mlp * 1000.0
+            );
         }
 
         x = self.output_norm.forward(&x)?;
@@ -1209,21 +1505,36 @@ impl BonsaiQwen35Cache {
     pub fn new(config: &BonsaiQwen35Config, device: &Device) -> CandleResult<Self> {
         let attn_caches = (0..config.num_hidden_layers)
             .map(|_| {
-                let k = Tensor::zeros((1, config.num_key_value_heads, 0, config.head_dim), candle_core::DType::F32, device)?;
-                let v = Tensor::zeros((1, config.num_key_value_heads, 0, config.head_dim), candle_core::DType::F32, device)?;
+                let k = Tensor::zeros(
+                    (1, config.num_key_value_heads, 0, config.head_dim),
+                    candle_core::DType::F32,
+                    device,
+                )?;
+                let v = Tensor::zeros(
+                    (1, config.num_key_value_heads, 0, config.head_dim),
+                    candle_core::DType::F32,
+                    device,
+                )?;
                 Ok((k, v))
             })
             .collect::<CandleResult<Vec<_>>>()?;
 
         let ssm_states = (0..config.num_hidden_layers)
-            .map(|_| SsmState::new(
-                config.ssm_num_v_heads, config.ssm_head_v_dim,
-                config.ssm_key_dim * 2 + config.ssm_value_dim,
-                config.ssm_conv_kernel, device,
-            ))
+            .map(|_| {
+                SsmState::new(
+                    config.ssm_num_v_heads,
+                    config.ssm_head_v_dim,
+                    config.ssm_key_dim * 2 + config.ssm_value_dim,
+                    config.ssm_conv_kernel,
+                    device,
+                )
+            })
             .collect::<CandleResult<Vec<_>>>()?;
 
-        Ok(BonsaiQwen35Cache { attn_caches, ssm_states })
+        Ok(BonsaiQwen35Cache {
+            attn_caches,
+            ssm_states,
+        })
     }
 }
 
@@ -1232,9 +1543,11 @@ impl BonsaiQwen35Cache {
 // ---------------------------------------------------------------------------
 
 fn load_f32_simple(gguf: &Arc<GgufFile>, name: &str) -> CandleResult<Vec<f32>> {
-    let info = gguf.tensor_info(name)
+    let info = gguf
+        .tensor_info(name)
         .map_err(|_e| candle_core::Error::Msg("error".to_string()))?;
-    let data = gguf.tensor_bytes(name)
+    let data = gguf
+        .tensor_bytes(name)
         .map_err(|_e| candle_core::Error::Msg("error".to_string()))?;
     gguf::dequantize_data(data, info.dtype_u32, info.elem_count)
         .map_err(|_e| candle_core::Error::Msg("dequant error".to_string()))
@@ -1242,14 +1555,16 @@ fn load_f32_simple(gguf: &Arc<GgufFile>, name: &str) -> CandleResult<Vec<f32>> {
 
 /// in_dim of a [out, in] weight tensor.
 fn tensor_in_dim(gguf: &Arc<GgufFile>, name: &str) -> CandleResult<usize> {
-    let info = gguf.tensor_info(name)
+    let info = gguf
+        .tensor_info(name)
         .map_err(|_e| candle_core::Error::Msg(format!("no tensor {name}")))?;
     Ok(info.shape[info.shape.len() - 1])
 }
 
 /// out_dim of a [out, in] weight tensor.
 fn tensor_out_dim(gguf: &Arc<GgufFile>, name: &str) -> CandleResult<usize> {
-    let info = gguf.tensor_info(name)
+    let info = gguf
+        .tensor_info(name)
         .map_err(|_e| candle_core::Error::Msg(format!("no tensor {name}")))?;
     Ok(info.shape[0])
 }

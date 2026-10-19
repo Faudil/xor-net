@@ -8,11 +8,20 @@ const EPS: f32 = 1e-6;
 fn assert_close(actual: &[f32], expected: &[f32], tol: f32, msg: &str) {
     assert_eq!(actual.len(), expected.len(), "{}: length mismatch", msg);
     for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
-        assert!((a - e).abs() < tol, "{}: idx {}  got {}, expected {}", msg, i, a, e);
+        assert!(
+            (a - e).abs() < tol,
+            "{}: idx {}  got {}, expected {}",
+            msg,
+            i,
+            a,
+            e
+        );
     }
 }
 
-fn ref_silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
+fn ref_silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
 fn ref_gelu(x: f32) -> f32 {
     let x3 = x * x * x;
     0.5 * x * (1.0 + (0.79788456 * (x + 0.044715 * x3)).tanh())
@@ -121,18 +130,29 @@ fn ternary_dot_product_pack4_matches_scalar() {
     let in_dim = 256;
     let mut rng = 12345u64;
     let mut next = || {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (rng >> 33) as f32
     };
 
     let weights: Vec<f32> = (0..in_dim)
         .map(|_| {
             let r = next();
-            if r < 0.33 { -1.0 } else if r > 0.66 { 1.0 } else { 0.0 }
+            if r < 0.33 {
+                -1.0
+            } else if r > 0.66 {
+                1.0
+            } else {
+                0.0
+            }
         })
         .collect();
     let acts_f32: Vec<f32> = (0..in_dim).map(|_| (next() - 0.5) * 40.0).collect();
-    let acts_i8: Vec<i8> = acts_f32.iter().map(|&x| x.round().max(-127.0).min(127.0) as i8).collect();
+    let acts_i8: Vec<i8> = acts_f32
+        .iter()
+        .map(|&x| x.round().max(-127.0).min(127.0) as i8)
+        .collect();
 
     let packed = pack_1_58bit_4pack(&weights, 1.0);
     let got = ternary_dot_product_pack4(&acts_i8, &packed, in_dim);
@@ -180,5 +200,10 @@ fn silu_inplace_vectorized_matches_scalar() {
             r * r * u
         })
         .collect();
-    assert_close(&g2, &expected_relu2, 1e-2, "silu_inplace vectorized (ReLU²)");
+    assert_close(
+        &g2,
+        &expected_relu2,
+        1e-2,
+        "silu_inplace vectorized (ReLU²)",
+    );
 }

@@ -2,13 +2,15 @@
 //! Usage: cargo run --example bench_bonsai27b --release -- <gguf> [num_tokens]
 use std::sync::Arc;
 use std::time::Instant;
-use xor_net::*;
 use xor_net::models::bonsai_qwen35::*;
+use xor_net::*;
 
 fn main() -> anyhow::Result<()> {
-    let path = std::env::args().nth(1)
+    let path = std::env::args()
+        .nth(1)
         .unwrap_or_else(|| "/tmp/bonsai-27b-q1_0.gguf".to_string());
-    let num_tokens: usize = std::env::args().nth(2)
+    let num_tokens: usize = std::env::args()
+        .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
     let device = candle_core::Device::Cpu;
@@ -17,7 +19,11 @@ fn main() -> anyhow::Result<()> {
     let gguf = Arc::new(GgufFile::open(&path)?);
     let cfg = BonsaiQwen35Config::from_gguf(&gguf)?;
     let model = BonsaiQwen35Model::from_gguf(gguf, &device)?;
-    println!("Model loaded in {:.2}s (64 layers, hidden={})", t0.elapsed().as_secs_f64(), cfg.hidden_size);
+    println!(
+        "Model loaded in {:.2}s (64 layers, hidden={})",
+        t0.elapsed().as_secs_f64(),
+        cfg.hidden_size
+    );
 
     let mut cache = BonsaiQwen35Cache::new(&cfg, &device)?;
     let mut token = 0u32;
@@ -42,7 +48,9 @@ fn main() -> anyhow::Result<()> {
     let per_token = elapsed / num_tokens as f64;
     let per_token_ms = per_token * 1000.0;
     let tps = 1.0 / per_token;
-    println!("Decode: {num_tokens} tokens in {elapsed:.2}s ({per_token_ms:.1} ms/token, {tps:.2} tok/s)");
+    println!(
+        "Decode: {num_tokens} tokens in {elapsed:.2}s ({per_token_ms:.1} ms/token, {tps:.2} tok/s)"
+    );
 
     Ok(())
 }

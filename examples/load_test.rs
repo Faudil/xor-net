@@ -1,16 +1,16 @@
-use xor_net::{AutoModelForCausalLM, QuantizationConfig};
 use std::path::Path;
+use xor_net::{AutoModelForCausalLM, QuantizationConfig};
 
 fn main() -> anyhow::Result<()> {
     let model_dir = Path::new("/home/faudil/RustroverProjects/XorNet/models/bitnet-2b");
 
     println!("Loading from local: {:?}", model_dir);
-    let (model, config) = AutoModelForCausalLM::from_local(
-        model_dir,
-        QuantizationConfig::None,
-    )?;
+    let (model, config) = AutoModelForCausalLM::from_local(model_dir, QuantizationConfig::None)?;
 
-    println!("Model loaded! hidden_size={} layers={}", config.hidden_size, config.num_hidden_layers);
+    println!(
+        "Model loaded! hidden_size={} layers={}",
+        config.hidden_size, config.num_hidden_layers
+    );
 
     let mut cache = xor_net::Cache::new(true, &config)?;
 
@@ -29,7 +29,10 @@ fn main() -> anyhow::Result<()> {
     println!("Generate logits shape: {:?}", logits2.shape);
 
     let stats = xor_net::models::llama::get_profiling_stats();
-    println!("Profiling: blocks={}us lm_head={}us other={}us", stats.0, stats.1, stats.2);
+    println!(
+        "Profiling: blocks={}us lm_head={}us other={}us",
+        stats.0, stats.1, stats.2
+    );
 
     Ok(())
 }

@@ -1,10 +1,10 @@
 use candle_core::{Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::Api};
 use std::time::Instant;
 use tokenizers::Tokenizer;
-use xor_net::{AutoModelForCausalLM, QuantizationConfig};
 use xor_net::bit1_58::quantization::TernaryPackType;
+use xor_net::{AutoModelForCausalLM, QuantizationConfig};
 
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
@@ -23,13 +23,17 @@ fn main() -> anyhow::Result<()> {
 
     let model_id = "1bitLLM/bitnet_b1_58-3B";
     println!("Loading 1.58-bit model {}...", model_id);
-    
-    let quantization = QuantizationConfig::Bit1_58(TernaryPackType::Pack4, xor_net::nn::LmHeadConfig::F32, false);
+
+    let quantization = QuantizationConfig::Bit1_58(
+        TernaryPackType::Pack4,
+        xor_net::nn::LmHeadConfig::F32,
+        false,
+    );
 
     let load_start = Instant::now();
     let (model, config) = AutoModelForCausalLM::from_pretrained(model_id, quantization)?;
     println!("Model loaded in {:.2?}", load_start.elapsed());
-    
+
     let mut cache = xor_net::Cache::new(true, &config)?;
 
     let api = Api::new()?;
@@ -40,15 +44,19 @@ fn main() -> anyhow::Result<()> {
     ));
 
     let tokenizer_filename = repo.get("tokenizer.json")?;
-    let tokenizer = Tokenizer::from_file(tokenizer_filename)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    
+    let tokenizer =
+        Tokenizer::from_file(tokenizer_filename).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
     let prompt = "[System]\nYou are a helpful assistant.\n\n[User]\nHello\n\n[Assistant]\n";
-    let mut tokens = tokenizer.encode(prompt, true).map_err(|e| anyhow::anyhow!(e.to_string()))?.get_ids().to_vec();
-    
+    let mut tokens = tokenizer
+        .encode(prompt, true)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .get_ids()
+        .to_vec();
+
     println!("Prompt: '{}'", prompt);
     let mut logits_processor = LogitsProcessor::new(299792458, Some(0.7), None);
-    
+
     let mut index_pos = 0;
     let max_len = 500;
     let start_gen = Instant::now();
@@ -60,39 +68,54 @@ fn main() -> anyhow::Result<()> {
     for _loop_idx in 0..max_len {
         let context_size = if index_pos == 0 { tokens.len() } else { 1 };
         let start_pos = tokens.len().saturating_sub(context_size);
-        
+
         let start_forward = Instant::now();
         let logits = model.forward(&tokens[start_pos..], index_pos, &mut cache)?;
         total_forward_time += start_forward.elapsed();
-        
+
         let start_sample = Instant::now();
         let logits_shape = logits.shape[2];
         let logits_candle = Tensor::from_vec(logits.into_data(), (logits_shape,), &device)?;
         let next_token = logits_processor.sample(&logits_candle)?;
         total_sample_time += start_sample.elapsed();
-        
+
         tokens.push(next_token);
         index_pos += context_size;
         generated_tokens += 1;
-        
+
         if Some(next_token) == config.bos_token_id || next_token == 2 {
             break;
         }
     }
-    
+
     let generated_text = tokenizer.decode(&tokens, true).unwrap_or(String::new());
     println!("Output: {}", generated_text);
-    
+
     let elapsed = start_gen.elapsed();
     let tps = generated_tokens as f64 / elapsed.as_secs_f64();
-    println!("Generated {} tokens in {:.2?} ({:.2} tokens/sec)", generated_tokens, elapsed, tps);
+    println!(
+        "Generated {} tokens in {:.2?} ({:.2} tokens/sec)",
+        generated_tokens, elapsed, tps
+    );
     println!("  - Model Forward Time: {:.2?}", total_forward_time);
     println!("  - Candle Sampling Time: {:.2?}", total_sample_time);
-    
+
     let (blocks_us, lm_head_us, other_us) = xor_net::models::llama::get_profiling_stats();
-    println!("    * [Profile] Transformer Blocks Total: {:.2}ms ({:.2}ms/token)", blocks_us as f64 / 1000.0, (blocks_us as f64 / 1000.0) / generated_tokens as f64);
-    println!("    * [Profile] LM Head Total: {:.2}ms ({:.2}ms/token)", lm_head_us as f64 / 1000.0, (lm_head_us as f64 / 1000.0) / generated_tokens as f64);
-    println!("    * [Profile] Other Ops Total: {:.2}ms ({:.2}ms/token)", other_us as f64 / 1000.0, (other_us as f64 / 1000.0) / generated_tokens as f64);
-    
+    println!(
+        "    * [Profile] Transformer Blocks Total: {:.2}ms ({:.2}ms/token)",
+        blocks_us as f64 / 1000.0,
+        (blocks_us as f64 / 1000.0) / generated_tokens as f64
+    );
+    println!(
+        "    * [Profile] LM Head Total: {:.2}ms ({:.2}ms/token)",
+        lm_head_us as f64 / 1000.0,
+        (lm_head_us as f64 / 1000.0) / generated_tokens as f64
+    );
+    println!(
+        "    * [Profile] Other Ops Total: {:.2}ms ({:.2}ms/token)",
+        other_us as f64 / 1000.0,
+        (other_us as f64 / 1000.0) / generated_tokens as f64
+    );
+
     Ok(())
 }

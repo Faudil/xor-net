@@ -16,17 +16,17 @@ impl JepaPolicyBlock {
     pub fn new(embed_dim: usize, hidden_dim: usize) -> anyhow::Result<Self> {
         // Initialize mock weights. In a real-world scenario, these would be loaded
         // from a pre-trained checkpoint (e.g., a safetensors file).
-        
+
         // Ternary weights are in {-1, 0, 1}
         let proj_in_weights: Vec<f32> = (0..embed_dim * hidden_dim)
             .map(|i| (i % 3) as f32 - 1.0)
             .collect();
-            
+
         // Bit weights are in {-1, 1}
         let hidden_weights: Vec<f32> = (0..hidden_dim * hidden_dim)
             .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
-            
+
         // Ternary weights are in {-1, 0, 1}
         let proj_out_weights: Vec<f32> = (0..hidden_dim * embed_dim)
             .map(|i| (i % 3) as f32 - 1.0)
@@ -34,25 +34,21 @@ impl JepaPolicyBlock {
 
         // 1.58-bit Layer using Pack4 (optimized for SIMD)
         let proj_in = TernaryLinear::new(
-            embed_dim, 
-            hidden_dim, 
-            &proj_in_weights, 
+            embed_dim,
+            hidden_dim,
+            &proj_in_weights,
             TernaryPackType::Pack4,
             None,
         )?;
 
         // 1-bit Layer
-        let hidden = BitLinear::new(
-            hidden_dim, 
-            hidden_dim, 
-            &hidden_weights
-        )?;
+        let hidden = BitLinear::new(hidden_dim, hidden_dim, &hidden_weights)?;
 
         // 1.58-bit Layer using Pack4
         let proj_out = TernaryLinear::new(
-            hidden_dim, 
-            embed_dim, 
-            &proj_out_weights, 
+            hidden_dim,
+            embed_dim,
+            &proj_out_weights,
             TernaryPackType::Pack4,
             None,
         )?;
@@ -67,17 +63,17 @@ impl JepaPolicyBlock {
     pub fn forward(&self, xs: &FastTensor) -> anyhow::Result<FastTensor> {
         // Project inputs to hidden space using 1.58-bit math
         let x = self.proj_in.forward(xs)?;
-        
+
         // Apply activation function (GELU)
         let x = x.gelu()?;
-        
+
         // Pass through 1-bit linear layer
         let x = self.hidden.forward(&x)?;
         let x = x.gelu()?;
-        
+
         // Project back to original embed_dim
         let out = self.proj_out.forward(&x)?;
-        
+
         // Residual connection (f32)
         out.add(xs)
     }

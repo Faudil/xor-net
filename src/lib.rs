@@ -3,27 +3,27 @@
 pub mod bit1;
 pub mod bit1_58;
 pub mod loader;
+pub mod models;
+pub mod nn;
+pub mod sampler;
 pub mod tensor;
 pub mod util;
-pub mod nn;
-pub mod models;
-pub mod sampler;
 
 #[cfg(feature = "python")]
 pub mod python;
 
-pub use tensor::FastTensor;
-pub use loader::{SafeTensorRepo, SafeTensorLoader};
 pub use bit1::layers::BitLinear;
 pub use bit1_58::layers::TernaryLinear;
 pub use bit1_58::quantization::TernaryPackType;
-pub use models::auto::AutoModelForCausalLM;
-pub use nn::{QuantizationConfig, DynamicLinear};
-pub use models::llama::{Cache, Config, Llama, LlamaConfig, Activation};
-pub use models::bonsai::{BonsaiModel, BonsaiCache};
-pub use models::bonsai_qwen35::{BonsaiQwen35Model, BonsaiQwen35Cache, BonsaiQwen35Config};
 pub use loader::gguf::{BonsaiConfig, GgufFile, is_prism_dtype};
+pub use loader::{SafeTensorLoader, SafeTensorRepo};
+pub use models::auto::AutoModelForCausalLM;
+pub use models::bonsai::{BonsaiCache, BonsaiModel};
+pub use models::bonsai_qwen35::{BonsaiQwen35Cache, BonsaiQwen35Config, BonsaiQwen35Model};
+pub use models::llama::{Activation, Cache, Config, Llama, LlamaConfig};
+pub use nn::{DynamicLinear, QuantizationConfig};
 pub use sampler::Sampler;
+pub use tensor::FastTensor;
 
 pub fn init_threads(num_threads: usize) -> Result<(), Box<dyn std::error::Error>> {
     // Auto ("0"): cap the pool. The BitNet decode GEMV is memory/cache
