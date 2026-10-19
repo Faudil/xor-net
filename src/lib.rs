@@ -2,6 +2,7 @@
 
 pub mod bit1;
 pub mod bit1_58;
+pub mod generation;
 pub mod loader;
 pub mod models;
 pub mod nn;
@@ -22,7 +23,13 @@ pub use models::bonsai::{BonsaiCache, BonsaiModel};
 pub use models::bonsai_qwen35::{BonsaiQwen35Cache, BonsaiQwen35Config, BonsaiQwen35Model};
 pub use models::llama::{Activation, Cache, Config, Llama, LlamaConfig};
 pub use nn::{DynamicLinear, QuantizationConfig};
-pub use sampler::Sampler;
+pub use generation::{
+    ChatMessage, ChatTemplate, FinishReason, Generation, GenerationError, GenerationParams,
+    Generator, Timings, Usage,
+};
+pub use models::llama::causal_lm::LlamaCausalLM;
+pub use models::traits::{CausalLM, Logits, ModelState};
+pub use sampler::{Sampler, SamplingParams};
 pub use tensor::FastTensor;
 
 pub fn init_threads(num_threads: usize) -> Result<(), Box<dyn std::error::Error>> {

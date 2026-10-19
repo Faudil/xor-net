@@ -156,3 +156,10 @@ path = "examples/check_bonsai27b.rs"
 [[example]]
 name = "debug_bonsai27b"
 path = "examples/debug_bonsai27b.rs"
+
+[[example]]
+name = "bonsai_generate"
+path = "examples/bonsai_generate.rs"
+
+[profile.dev]
+debug = "line-tables-only"

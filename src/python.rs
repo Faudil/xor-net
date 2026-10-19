@@ -1,13 +1,19 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 
 use crate::bit1_58::quantization::TernaryPackType;
+use crate::generation::{ChatMessage, GenerationParams, Generator};
 use crate::init_threads;
-use crate::models::auto::AutoModelForCausalLM;
-use crate::models::llama::{Cache, Config, Llama, LlamaConfig};
+use crate::models::llama::causal_lm::LlamaCausalLM;
+use crate::models::llama::{Config, LlamaConfig};
 use crate::nn::{LmHeadConfig, QuantizationConfig};
+use crate::sampler::SamplingParams;
 
 #[pyclass]
 #[derive(Clone)]
@@ -78,13 +84,187 @@ impl ModelConfig {
     }
 }
 
+fn py_err(e: impl std::fmt::Display) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
+
+fn lock(g: &Mutex<Generator>) -> std::sync::MutexGuard<'_, Generator> {
+    g.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Python-side sampling / stopping options, shared by every entry point.
+#[allow(clippy::too_many_arguments)]
+fn build_params(
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    min_p: Option<f32>,
+    repetition_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    stop: Option<Vec<String>>,
+    seed: Option<u64>,
+) -> GenerationParams {
+    GenerationParams::default()
+        .with_max_tokens(max_tokens.unwrap_or(256))
+        .with_stop(stop.unwrap_or_default())
+        .with_sampling(SamplingParams {
+            temperature: temperature.unwrap_or(0.7),
+            top_p: top_p.unwrap_or(0.9),
+            top_k: top_k.unwrap_or(0),
+            min_p: min_p.unwrap_or(0.0),
+            repetition_penalty: repetition_penalty.unwrap_or(1.0),
+            frequency_penalty: frequency_penalty.unwrap_or(0.0),
+            presence_penalty: presence_penalty.unwrap_or(0.0),
+            penalty_last_n: None,
+            seed,
+        })
+}
+
+fn to_messages(messages: Vec<HashMap<String, String>>) -> PyResult<Vec<ChatMessage>> {
+    messages
+        .into_iter()
+        .map(|m| {
+            let role = m.get("role").cloned();
+            let content = m.get("content").cloned();
+            match (role, content) {
+                (Some(r), Some(c)) => Ok(ChatMessage::new(r, c)),
+                _ => Err(PyRuntimeError::new_err(
+                    "each message needs 'role' and 'content' keys",
+                )),
+            }
+        })
+        .collect()
+}
+
+enum StreamMsg {
+    Delta(String),
+    Done(&'static str),
+    Error(String),
+}
+
+/// Iterator over text deltas of a streaming generation. Generation runs on
+/// a background thread; dropping the iterator (or calling `cancel()`)
+/// stops it at the next token.
+#[pyclass]
+pub struct TextStream {
+    rx: Mutex<Receiver<StreamMsg>>,
+    cancel: Arc<AtomicBool>,
+    finish_reason: Option<&'static str>,
+}
+
+#[pymethods]
+impl TextStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<String>> {
+        if self.finish_reason.is_some() {
+            return Ok(None);
+        }
+        let rx = &self.rx;
+        match py.allow_threads(|| rx.lock().unwrap_or_else(|e| e.into_inner()).recv()) {
+            Ok(StreamMsg::Delta(s)) => Ok(Some(s)),
+            Ok(StreamMsg::Done(reason)) => {
+                self.finish_reason = Some(reason);
+                Ok(None)
+            }
+            Ok(StreamMsg::Error(e)) => {
+                self.finish_reason = Some("error");
+                Err(PyRuntimeError::new_err(e))
+            }
+            Err(_) => {
+                self.finish_reason = Some("error");
+                Err(PyRuntimeError::new_err(
+                    "generation thread ended unexpectedly",
+                ))
+            }
+        }
+    }
+
+    /// "stop" / "length" once the stream is exhausted, else None.
+    #[getter]
+    fn finish_reason(&self) -> Option<&'static str> {
+        self.finish_reason
+    }
+
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for TextStream {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 #[pyclass]
 pub struct XorNetModel {
-    model: Llama,
+    generator: Arc<Mutex<Generator>>,
     config: Config,
-    cache: Cache,
-    tokenizer: Arc<tokenizers::Tokenizer>,
-    sampler: crate::Sampler,
+}
+
+impl XorNetModel {
+    fn build(model: LlamaCausalLM, tokenizer_dir: &Path) -> PyResult<Self> {
+        let config = model.config().clone();
+        let generator = Generator::from_dir(Arc::new(model), tokenizer_dir).map_err(py_err)?;
+        Ok(Self {
+            generator: Arc::new(Mutex::new(generator)),
+            config,
+        })
+    }
+
+    fn run(&self, py: Python<'_>, prompt: Prompt, params: GenerationParams) -> PyResult<String> {
+        let generator = &self.generator;
+        py.allow_threads(move || {
+            let mut g = lock(generator);
+            match prompt {
+                Prompt::Text(p) => g.generate(&p, &params),
+                Prompt::Chat(m) => g.chat(&m, &params),
+            }
+        })
+        .map(|out| out.text)
+        .map_err(py_err)
+    }
+
+    fn stream(&self, prompt: Prompt, params: GenerationParams) -> TextStream {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let generator = self.generator.clone();
+        let stop = cancel.clone();
+        std::thread::spawn(move || {
+            let mut g = lock(&generator);
+            let on_text = |d: &str| {
+                if stop.load(Ordering::Relaxed) || tx.send(StreamMsg::Delta(d.to_owned())).is_err()
+                {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            };
+            let res = match prompt {
+                Prompt::Text(p) => g.generate_stream(&p, &params, on_text),
+                Prompt::Chat(m) => g.chat_stream(&m, &params, on_text),
+            };
+            let _ = tx.send(match res {
+                Ok(out) => StreamMsg::Done(out.finish_reason.as_openai_str()),
+                Err(e) => StreamMsg::Error(format!("{e:#}")),
+            });
+        });
+        TextStream {
+            rx: Mutex::new(rx),
+            cancel,
+            finish_reason: None,
+        }
+    }
+}
+
+enum Prompt {
+    Text(String),
+    Chat(Vec<ChatMessage>),
 }
 
 #[pymethods]
@@ -97,43 +277,28 @@ impl XorNetModel {
         num_threads: Option<usize>,
     ) -> PyResult<Self> {
         if let Some(n) = num_threads {
-            init_threads(n).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            init_threads(n).map_err(py_err)?;
         }
-
         let quant_config = quantization
             .map(|q| q.inner)
             .unwrap_or(QuantizationConfig::None);
+        let model = LlamaCausalLM::from_pretrained(model_id, quant_config).map_err(py_err)?;
 
-        let (model, config) = AutoModelForCausalLM::from_pretrained(model_id, quant_config)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let api =
-            hf_hub::api::sync::Api::new().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let api = hf_hub::api::sync::Api::new().map_err(py_err)?;
         let repo = api.repo(hf_hub::Repo::new(
             model_id.to_string(),
             hf_hub::RepoType::Model,
         ));
-
-        let tokenizer_file = repo
-            .get("tokenizer.json")
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let tokenizer = Arc::new(
-            tokenizers::Tokenizer::from_file(&tokenizer_file)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        );
-
-        let cache =
-            Cache::new(true, &config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let sampler = crate::Sampler::new(299792458, Some(0.7), None, 1.0);
-
-        Ok(Self {
-            model,
-            config,
-            cache,
-            tokenizer,
-            sampler,
-        })
+        let tokenizer_file = repo.get("tokenizer.json").map_err(py_err)?;
+        // Optional files land in the same snapshot directory.
+        for optional in ["tokenizer_config.json", "generation_config.json"] {
+            let _ = repo.get(optional);
+        }
+        let dir = tokenizer_file
+            .parent()
+            .ok_or_else(|| py_err("bad tokenizer path"))?
+            .to_path_buf();
+        Self::build(model, &dir)
     }
 
     #[staticmethod]
@@ -144,187 +309,169 @@ impl XorNetModel {
         num_threads: Option<usize>,
     ) -> PyResult<Self> {
         if let Some(n) = num_threads {
-            init_threads(n).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            init_threads(n).map_err(py_err)?;
         }
-
         let quant_config = quantization
             .map(|q| q.inner)
             .unwrap_or(QuantizationConfig::None);
-
-        let model_dir = Path::new(model_dir);
-        let (model, config) = AutoModelForCausalLM::from_local(model_dir, quant_config)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let tokenizer_file = model_dir.join("tokenizer.json");
-        let tokenizer = Arc::new(
-            tokenizers::Tokenizer::from_file(&tokenizer_file)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        );
-
-        let cache =
-            Cache::new(true, &config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let sampler = crate::Sampler::new(299792458, Some(0.7), None, 1.0);
-
-        Ok(Self {
-            model,
-            config,
-            cache,
-            tokenizer,
-            sampler,
-        })
+        let dir = Path::new(model_dir);
+        let model = LlamaCausalLM::from_local(dir, quant_config).map_err(py_err)?;
+        Self::build(model, dir)
     }
 
-    #[pyo3(signature = (prompt, max_tokens=None, temperature=None, top_p=None, top_k=None, seed=None))]
+    /// Returns the completion only (not the prompt).
+    #[pyo3(signature = (prompt, max_tokens=None, temperature=None, top_p=None, top_k=None,
+        min_p=None, repetition_penalty=None, frequency_penalty=None, presence_penalty=None,
+        stop=None, seed=None))]
+    #[allow(clippy::too_many_arguments)]
     fn generate(
-        &mut self,
-        prompt: &str,
+        &self,
+        py: Python<'_>,
+        prompt: String,
         max_tokens: Option<usize>,
         temperature: Option<f32>,
         top_p: Option<f32>,
         top_k: Option<usize>,
+        min_p: Option<f32>,
+        repetition_penalty: Option<f32>,
+        frequency_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
+        stop: Option<Vec<String>>,
         seed: Option<u64>,
     ) -> PyResult<String> {
-        let max_tokens = max_tokens.unwrap_or(512);
-        let temperature = temperature.unwrap_or(0.7);
-        let top_p = top_p.unwrap_or(0.9);
-        let _top_k = top_k.unwrap_or(50);
-        let seed = seed.unwrap_or(299792458);
-
-        self.sampler = crate::Sampler::new(seed, Some(temperature), Some(top_p), 1.0);
-        self.cache =
-            Cache::new(true, &self.config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let encoding = self
-            .tokenizer
-            .encode(prompt, true)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mut tokens = encoding.get_ids().to_vec();
-
-        let bos_token_id = self.config.bos_token_id.unwrap_or(1);
-        let eos_token_ids: Vec<u32> = match &self.config.eos_token_id {
-            Some(crate::models::llama::LlamaEosToks::Single(id)) => vec![*id],
-            Some(crate::models::llama::LlamaEosToks::Multiple(ids)) => ids.clone(),
-            None => vec![2],
-        };
-
-        let mut index_pos = 0;
-        let mut _generated = 0;
-
-        for _ in 0..max_tokens {
-            let context_size = if index_pos == 0 { tokens.len() } else { 1 };
-            let start_pos = tokens.len().saturating_sub(context_size);
-
-            let logits = self
-                .model
-                .forward(&tokens[start_pos..], index_pos, &mut self.cache)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let mut logits = logits.into_data();
-            let next_token = self
-                .sampler
-                .sample(&mut logits, &tokens)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            tokens.push(next_token);
-            index_pos += context_size;
-            _generated += 1;
-
-            if next_token == bos_token_id || eos_token_ids.contains(&next_token) {
-                break;
-            }
-        }
-
-        let output = self
-            .tokenizer
-            .decode(&tokens, true)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        Ok(output)
+        let params = build_params(
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            stop,
+            seed,
+        );
+        self.run(py, Prompt::Text(prompt), params)
     }
 
-    #[pyo3(signature = (prompt, max_tokens=None, temperature=None, top_p=None, top_k=None, seed=None))]
+    /// Returns an iterator of text deltas.
+    #[pyo3(signature = (prompt, max_tokens=None, temperature=None, top_p=None, top_k=None,
+        min_p=None, repetition_penalty=None, frequency_penalty=None, presence_penalty=None,
+        stop=None, seed=None))]
+    #[allow(clippy::too_many_arguments)]
     fn generate_stream(
-        &mut self,
-        prompt: &str,
+        &self,
+        prompt: String,
         max_tokens: Option<usize>,
         temperature: Option<f32>,
         top_p: Option<f32>,
         top_k: Option<usize>,
+        min_p: Option<f32>,
+        repetition_penalty: Option<f32>,
+        frequency_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
+        stop: Option<Vec<String>>,
         seed: Option<u64>,
-    ) -> PyResult<Vec<String>> {
-        let max_tokens = max_tokens.unwrap_or(512);
-        let temperature = temperature.unwrap_or(0.7);
-        let top_p = top_p.unwrap_or(0.9);
-        let _top_k = top_k.unwrap_or(50);
-        let seed = seed.unwrap_or(299792458);
+    ) -> TextStream {
+        let params = build_params(
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            stop,
+            seed,
+        );
+        self.stream(Prompt::Text(prompt), params)
+    }
 
-        self.sampler = crate::Sampler::new(seed, Some(temperature), Some(top_p), 1.0);
-        self.cache =
-            Cache::new(true, &self.config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    /// Chat completion over `[{"role": ..., "content": ...}, ...]` using the
+    /// model's chat template. Returns the assistant reply.
+    #[pyo3(signature = (messages, max_tokens=None, temperature=None, top_p=None, top_k=None,
+        min_p=None, repetition_penalty=None, frequency_penalty=None, presence_penalty=None,
+        stop=None, seed=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn chat(
+        &self,
+        py: Python<'_>,
+        messages: Vec<HashMap<String, String>>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+        top_k: Option<usize>,
+        min_p: Option<f32>,
+        repetition_penalty: Option<f32>,
+        frequency_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
+        stop: Option<Vec<String>>,
+        seed: Option<u64>,
+    ) -> PyResult<String> {
+        let params = build_params(
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            stop,
+            seed,
+        );
+        self.run(py, Prompt::Chat(to_messages(messages)?), params)
+    }
 
-        let encoding = self
-            .tokenizer
-            .encode(prompt, true)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mut tokens = encoding.get_ids().to_vec();
+    /// Streaming chat: an iterator of text deltas.
+    #[pyo3(signature = (messages, max_tokens=None, temperature=None, top_p=None, top_k=None,
+        min_p=None, repetition_penalty=None, frequency_penalty=None, presence_penalty=None,
+        stop=None, seed=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn chat_stream(
+        &self,
+        messages: Vec<HashMap<String, String>>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+        top_k: Option<usize>,
+        min_p: Option<f32>,
+        repetition_penalty: Option<f32>,
+        frequency_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
+        stop: Option<Vec<String>>,
+        seed: Option<u64>,
+    ) -> PyResult<TextStream> {
+        let params = build_params(
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            stop,
+            seed,
+        );
+        Ok(self.stream(Prompt::Chat(to_messages(messages)?), params))
+    }
 
-        let bos_token_id = self.config.bos_token_id.unwrap_or(1);
-        let eos_token_ids: Vec<u32> = match &self.config.eos_token_id {
-            Some(crate::models::llama::LlamaEosToks::Single(id)) => vec![*id],
-            Some(crate::models::llama::LlamaEosToks::Multiple(ids)) => ids.clone(),
-            None => vec![2],
-        };
-
-        let mut index_pos = 0;
-        let mut _generated = 0;
-        let mut outputs = Vec::new();
-
-        for _ in 0..max_tokens {
-            let context_size = if index_pos == 0 { tokens.len() } else { 1 };
-            let start_pos = tokens.len().saturating_sub(context_size);
-
-            let logits = self
-                .model
-                .forward(&tokens[start_pos..], index_pos, &mut self.cache)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let mut logits = logits.into_data();
-            let next_token = self
-                .sampler
-                .sample(&mut logits, &tokens)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            tokens.push(next_token);
-            index_pos += context_size;
-            _generated += 1;
-
-            let current_text = self
-                .tokenizer
-                .decode(&tokens, true)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            outputs.push(current_text);
-
-            if next_token == bos_token_id || eos_token_ids.contains(&next_token) {
-                break;
-            }
-        }
-
-        Ok(outputs)
+    /// Render messages with the chat template (adds the generation prompt).
+    fn apply_chat_template(&self, messages: Vec<HashMap<String, String>>) -> PyResult<String> {
+        let msgs = to_messages(messages)?;
+        lock(&self.generator)
+            .apply_chat_template(&msgs, true)
+            .map_err(py_err)
     }
 
     fn tokenize(&self, text: &str) -> PyResult<Vec<u32>> {
-        let encoding = self
-            .tokenizer
-            .encode(text, true)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(encoding.get_ids().to_vec())
+        lock(&self.generator).encode(text, true).map_err(py_err)
     }
 
     fn decode(&self, tokens: Vec<u32>) -> PyResult<String> {
-        self.tokenizer
-            .decode(&tokens, true)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        lock(&self.generator).decode(&tokens, true).map_err(py_err)
     }
 
     fn config(&self) -> ModelConfig {
@@ -345,5 +492,6 @@ fn xor_net(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<QuantizationConfigPy>()?;
     m.add_class::<ModelConfig>()?;
     m.add_class::<XorNetModel>()?;
+    m.add_class::<TextStream>()?;
     Ok(())
 }

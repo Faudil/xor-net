@@ -9,6 +9,7 @@
 
 pub mod attention;
 pub mod block;
+pub mod causal_lm;
 pub mod mlp;
 
 use crate::bit1_58::quantization::TernaryPackType;
