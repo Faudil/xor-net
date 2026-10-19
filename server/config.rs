@@ -31,6 +31,11 @@ pub struct ServerConfig {
     pub max_tokens_cap: usize,
     pub default_max_tokens: usize,
     pub cors_origin: Option<String>,
+    /// Shared prompt-cache budget in MiB; `None` = auto (a quarter of the
+    /// available memory, at most 1 GiB), `Some(0)` disables the cache.
+    pub prompt_cache_mb: Option<usize>,
+    /// Shortest prefix (tokens) worth a prompt-cache entry.
+    pub prompt_cache_min_tokens: usize,
 }
 
 impl ServerConfig {
@@ -62,6 +67,8 @@ impl ServerConfig {
             max_tokens_cap: 4096,
             default_max_tokens: 512,
             cors_origin: None,
+            prompt_cache_mb: None,
+            prompt_cache_min_tokens: xor_net::prompt_cache::DEFAULT_MIN_TOKENS,
         }
     }
 }
@@ -120,6 +127,13 @@ OPTIONS:
         --default-max-tokens <N> max_tokens when omitted    [XORNET_DEFAULT_MAX_TOKENS] (512)
         --cors-origin <ORIGIN>   enable CORS for this origin (\"*\" for any)
                                                             [XORNET_CORS_ORIGIN] (disabled)
+        --prompt-cache-mb <N>    prompt cache shared by all slots: snapshots of shared prompt
+                                 prefixes (system prompt, chat history), LRU within N MiB;
+                                 0 disables, auto = 1/4 of available RAM capped at 1024
+                                                            [XORNET_PROMPT_CACHE_MB] (auto)
+        --prompt-cache-min-tokens <N>
+                                 shortest prefix worth caching
+                                                            [XORNET_PROMPT_CACHE_MIN_TOKENS] (64)
     -h, --help                   print this help
 ";
 
@@ -240,6 +254,16 @@ const OPTS: &[Opt] = &[
         short: None,
         env: "XORNET_CORS_ORIGIN",
     },
+    Opt {
+        long: "prompt-cache-mb",
+        short: None,
+        env: "XORNET_PROMPT_CACHE_MB",
+    },
+    Opt {
+        long: "prompt-cache-min-tokens",
+        short: None,
+        env: "XORNET_PROMPT_CACHE_MIN_TOKENS",
+    },
 ];
 
 fn num<T: std::str::FromStr>(name: &str, v: &str) -> Result<T, String> {
@@ -332,6 +356,13 @@ pub fn parse(
             "max-tokens-cap" => c.max_tokens_cap = positive(n, &v)?,
             "default-max-tokens" => c.default_max_tokens = positive(n, &v)?,
             "cors-origin" => c.cors_origin = Some(v),
+            "prompt-cache-mb" => {
+                c.prompt_cache_mb = match v.trim() {
+                    "auto" => None,
+                    _ => Some(num(n, &v)?),
+                }
+            }
+            "prompt-cache-min-tokens" => c.prompt_cache_min_tokens = positive(n, &v)?,
             _ => {}
         }
     }
@@ -414,5 +445,26 @@ mod tests {
         assert_eq!(c.reasoning_format, Some(ReasoningFormat::Separate));
         let c = run(&["--reasoning-format=auto"], &[]).unwrap();
         assert_eq!(c.reasoning_format, None);
+    }
+
+    #[test]
+    fn prompt_cache_flags() {
+        let c = run(&[], &[]).unwrap();
+        assert_eq!((c.prompt_cache_mb, c.prompt_cache_min_tokens), (None, 64));
+        let c = run(
+            &["--prompt-cache-mb", "0", "--prompt-cache-min-tokens=128"],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            (c.prompt_cache_mb, c.prompt_cache_min_tokens),
+            (Some(0), 128)
+        );
+        let c = run(&[], &[("XORNET_PROMPT_CACHE_MB", "512")]).unwrap();
+        assert_eq!(c.prompt_cache_mb, Some(512));
+        let c = run(&["--prompt-cache-mb=auto"], &[]).unwrap();
+        assert_eq!(c.prompt_cache_mb, None);
+        assert!(run(&["--prompt-cache-mb", "-1"], &[]).is_err());
+        assert!(run(&["--prompt-cache-min-tokens", "0"], &[]).is_err());
     }
 }

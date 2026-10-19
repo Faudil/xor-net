@@ -39,30 +39,62 @@ pub struct Job {
     pub cancel: Arc<AtomicBool>,
 }
 
+/// Slot affinity: how many leading prompt tokens slot `slot`'s state already
+/// holds (see `Engine::slot_affinity`). Must not block.
+pub type AffinityFn = Box<dyn Fn(usize, &[u32]) -> usize + Send + Sync>;
+
+/// A freed slot may pick any of the first `AFFINITY_WINDOW` queued jobs
+/// (the one whose prompt its state covers best); beyond that, FIFO.
+pub const AFFINITY_WINDOW: usize = 4;
+/// A job at the head of the queue that was passed over this many times is
+/// taken next regardless of affinity (no starvation).
+pub const AFFINITY_MAX_SKIPS: u32 = 4;
+
+struct Queued {
+    job: Job,
+    skipped: u32,
+}
+
 struct QState {
-    jobs: VecDeque<Job>,
+    jobs: VecDeque<Queued>,
+    /// Jobs handed straight to an idle slot (its state matches the prompt
+    /// best), not yet picked up.
+    mailbox: Vec<Option<Job>>,
+    /// Slots blocked in `pop` with nothing to do.
+    idle: Vec<bool>,
     busy: usize,
     shutdown: bool,
 }
 
-/// Bounded FIFO shared by connection threads (producers) and slot workers.
+/// Bounded job queue shared by connection threads (producers) and slot
+/// workers. FIFO, except that with an affinity function a job is matched to
+/// the slot whose state already holds the longest prefix of its prompt:
+/// an arriving job goes to the best idle slot (if any slot has a non-zero
+/// match), and a slot that frees up picks the best match among the first
+/// [`AFFINITY_WINDOW`] queued jobs (ties and zero matches: oldest first; a
+/// head job skipped [`AFFINITY_MAX_SKIPS`] times is taken next).
 /// Poisoning is ignored: the state is always consistent between operations.
 pub struct JobQueue {
     state: Mutex<QState>,
     cv: Condvar,
     cap: usize,
+    affinity: Option<AffinityFn>,
 }
 
 impl JobQueue {
-    pub fn new(cap: usize) -> Self {
+    pub fn new(cap: usize, slots: usize, affinity: Option<AffinityFn>) -> Self {
+        let slots = slots.max(1);
         Self {
             state: Mutex::new(QState {
                 jobs: VecDeque::new(),
+                mailbox: (0..slots).map(|_| None).collect(),
+                idle: vec![false; slots],
                 busy: 0,
                 shutdown: false,
             }),
             cv: Condvar::new(),
             cap,
+            affinity,
         }
     }
 
@@ -73,27 +105,76 @@ impl JobQueue {
     /// Enqueue, or give the job back if the queue is full / shut down.
     pub fn try_push(&self, job: Job) -> Result<(), Box<Job>> {
         let mut g = self.lock();
-        if g.shutdown || g.jobs.len() >= self.cap {
+        let pending = g.jobs.len() + g.mailbox.iter().flatten().count();
+        if g.shutdown || pending >= self.cap {
             return Err(Box::new(job));
         }
-        g.jobs.push_back(job);
+        if let Some(aff) = self.affinity.as_ref().filter(|_| g.jobs.is_empty()) {
+            let best = (0..g.idle.len())
+                .filter(|&s| g.idle[s] && g.mailbox[s].is_none())
+                .map(|s| (aff(s, &job.req.prompt_ids), s))
+                .filter(|&(score, _)| score > 0)
+                .max_by_key(|&(score, s)| (score, std::cmp::Reverse(s)));
+            if let Some((_, slot)) = best {
+                g.idle[slot] = false;
+                g.mailbox[slot] = Some(job);
+                drop(g);
+                self.cv.notify_all();
+                return Ok(());
+            }
+        }
+        g.jobs.push_back(Queued { job, skipped: 0 });
         drop(g);
         self.cv.notify_one();
         Ok(())
     }
 
-    /// Block until a job is available (`None` on shutdown). Marks the caller
-    /// busy until [`JobQueue::finish`].
-    pub fn pop(&self) -> Option<Job> {
+    /// Index of the queued job slot `slot` should run next.
+    fn pick(&self, g: &mut QState, slot: usize) -> usize {
+        let Some(aff) = &self.affinity else {
+            return 0;
+        };
+        if g.jobs.len() < 2 || g.jobs[0].skipped >= AFFINITY_MAX_SKIPS {
+            return 0;
+        }
+        let window = g.jobs.len().min(AFFINITY_WINDOW);
+        let (best, _) = (0..window)
+            .map(|i| (i, aff(slot, &g.jobs[i].job.req.prompt_ids)))
+            .fold(
+                (0, 0),
+                |acc, (i, score)| {
+                    if score > acc.1 { (i, score) } else { acc }
+                },
+            );
+        for q in g.jobs.iter_mut().take(best) {
+            q.skipped += 1;
+        }
+        best
+    }
+
+    /// Block until a job is available for worker `slot` (`None` on
+    /// shutdown). Marks the caller busy until [`JobQueue::finish`].
+    pub fn pop(&self, slot: usize) -> Option<Job> {
         let mut g = self.lock();
+        let slot = slot.min(g.idle.len() - 1);
         loop {
             if g.shutdown {
                 return None;
             }
-            if let Some(j) = g.jobs.pop_front() {
+            let job = match g.mailbox[slot].take() {
+                Some(j) => Some(j),
+                None if !g.jobs.is_empty() => {
+                    let i = self.pick(&mut g, slot);
+                    g.jobs.remove(i).map(|q| q.job)
+                }
+                None => None,
+            };
+            if let Some(j) = job {
+                g.idle[slot] = false;
                 g.busy += 1;
                 return Some(j);
             }
+            g.idle[slot] = true;
             g = self.cv.wait(g).unwrap_or_else(PoisonError::into_inner);
         }
     }
@@ -111,7 +192,7 @@ impl JobQueue {
     /// (queued, busy)
     pub fn stats(&self) -> (usize, usize) {
         let g = self.lock();
-        (g.jobs.len(), g.busy)
+        (g.jobs.len() + g.mailbox.iter().flatten().count(), g.busy)
     }
 }
 
@@ -137,10 +218,12 @@ impl App {
             Some(f) => f == ReasoningFormat::Separate,
             None => engine.chat_template_has_thinking(),
         };
+        let aff_engine = Arc::clone(&engine);
+        let affinity: AffinityFn = Box::new(move |slot, ids| aff_engine.slot_affinity(slot, ids));
         Self {
             engine,
             reasoning,
-            queue: JobQueue::new(cfg.max_queue),
+            queue: JobQueue::new(cfg.max_queue, cfg.slots, Some(affinity)),
             limits: Limits {
                 max_line: cfg.max_header_line,
                 max_headers: cfg.max_headers,
@@ -185,7 +268,7 @@ pub fn spawn_workers(app: &Arc<App>) -> anyhow::Result<Vec<thread::JoinHandle<()
 }
 
 fn worker(app: &App, slot: usize, pool: &rayon::ThreadPool) {
-    while let Some(job) = app.queue.pop() {
+    while let Some(job) = app.queue.pop(slot) {
         if !job.cancel.load(Ordering::Relaxed) {
             run_job(app.engine.as_ref(), slot, &job, pool);
         }
@@ -488,12 +571,15 @@ fn dispatch(req: &Request, app: &App, w: &mut TcpStream, stream: &TcpStream, kee
     match route {
         Route::Health => {
             let (queued, busy) = app.queue.stats();
-            let body = json!({
+            let mut body = json!({
                 "status": "ok",
                 "slots_idle": app.cfg.slots.saturating_sub(busy),
                 "slots_processing": busy,
                 "queued": queued,
             });
+            if let Some(st) = app.engine.prompt_cache_stats() {
+                body["prompt_cache"] = json!(st);
+            }
             send(w, Response::json(200, &body))
         }
         Route::Models => {
@@ -546,6 +632,7 @@ fn generate(
                 m,
             )
         })?;
+    let boundaries = engine.prefix_boundaries(&p.prompt, &p.chat_template_kwargs, &prompt_ids);
     let max_tokens = api::resolve_max_tokens(
         p.max_tokens,
         prompt_ids.len(),
@@ -573,6 +660,7 @@ fn generate(
             sampling,
             stop: p.stop.clone(),
             reasoning: api == Api::Chat && app.reasoning,
+            boundaries,
         },
         tx,
         cancel,
@@ -712,6 +800,126 @@ fn stream_events(
                 );
                 return sse_json(w, &err.body());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::SamplingParams;
+
+    fn job(ids: &[u32]) -> (Job, mpsc::Receiver<Event>) {
+        let (tx, rx) = mpsc::channel();
+        let req = GenRequest {
+            prompt_ids: ids.to_vec(),
+            max_tokens: 1,
+            sampling: SamplingParams::default(),
+            stop: Vec::new(),
+            reasoning: false,
+            boundaries: Vec::new(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        (Job { req, tx, cancel }, rx)
+    }
+
+    /// Slot 0 holds [1, 2, 3], slot 1 holds [9, 9].
+    fn queue(cap: usize) -> JobQueue {
+        let states: [&[u32]; 2] = [&[1, 2, 3], &[9, 9]];
+        let aff: AffinityFn = Box::new(move |slot, ids| {
+            states[slot]
+                .iter()
+                .zip(ids)
+                .take_while(|(a, b)| a == b)
+                .count()
+        });
+        JobQueue::new(cap, 2, Some(aff))
+    }
+
+    #[test]
+    fn freed_slot_prefers_its_prefix_within_window() {
+        let q = queue(16);
+        let mut rxs = Vec::new();
+        for ids in [&[5u32][..], &[9, 9, 1], &[1, 2, 3, 4]] {
+            let (j, rx) = job(ids);
+            rxs.push(rx);
+            assert!(q.try_push(j).is_ok());
+        }
+        assert_eq!(q.pop(1).unwrap().req.prompt_ids, [9, 9, 1]);
+        assert_eq!(q.pop(0).unwrap().req.prompt_ids, [1, 2, 3, 4]);
+        assert_eq!(q.pop(1).unwrap().req.prompt_ids, [5]);
+        assert_eq!(q.stats(), (0, 3));
+
+        // Beyond the window: FIFO.
+        for i in 0..AFFINITY_WINDOW as u32 {
+            let (j, rx) = job(&[100 + i]);
+            rxs.push(rx);
+            assert!(q.try_push(j).is_ok());
+        }
+        let (j, rx) = job(&[1, 2, 3]);
+        rxs.push(rx);
+        assert!(q.try_push(j).is_ok());
+        assert_eq!(q.pop(0).unwrap().req.prompt_ids, [100]);
+    }
+
+    #[test]
+    fn head_job_is_not_starved() {
+        let q = queue(16);
+        let mut rxs = Vec::new();
+        let (j, rx) = job(&[7]);
+        rxs.push(rx);
+        assert!(q.try_push(j).is_ok());
+        for _ in 0..AFFINITY_MAX_SKIPS {
+            let (j, rx) = job(&[1, 2, 3]);
+            rxs.push(rx);
+            assert!(q.try_push(j).is_ok());
+            assert_eq!(q.pop(0).unwrap().req.prompt_ids, [1, 2, 3]);
+        }
+        let (j, rx) = job(&[1, 2, 3]);
+        rxs.push(rx);
+        assert!(q.try_push(j).is_ok());
+        assert_eq!(q.pop(0).unwrap().req.prompt_ids, [7], "skipped too often");
+    }
+
+    #[test]
+    fn arriving_job_goes_to_best_idle_slot() {
+        let q = Arc::new(queue(16));
+        let (tx, rx) = mpsc::channel();
+        let workers: Vec<_> = (0..2)
+            .map(|slot| {
+                let q = Arc::clone(&q);
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    while let Some(j) = q.pop(slot) {
+                        tx.send((slot, j.req.prompt_ids.clone())).unwrap();
+                        q.finish();
+                    }
+                })
+            })
+            .collect();
+        // Wait until both workers are blocked in `pop`.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while q.lock().idle != [true, true] {
+            assert!(Instant::now() < deadline, "workers never went idle");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut rxs = Vec::new();
+        for ids in [&[9u32, 9, 4][..], &[1, 2, 7]] {
+            let (j, r) = job(ids);
+            rxs.push(r);
+            assert!(q.try_push(j).is_ok());
+            let (slot, got) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(got, ids);
+            assert_eq!(slot, if ids[0] == 9 { 1 } else { 0 });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while q.lock().idle != [true, true] {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        q.shutdown();
+        for w in workers {
+            w.join().unwrap();
         }
     }
 }

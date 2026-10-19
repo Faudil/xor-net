@@ -6,6 +6,7 @@ pub mod generation;
 pub mod loader;
 pub mod models;
 pub mod nn;
+pub mod prompt_cache;
 pub mod sampler;
 pub mod tensor;
 pub mod util;
@@ -28,8 +29,9 @@ pub use models::llama::causal_lm::LlamaCausalLM;
 pub use models::llama::{Activation, Cache, Config, Llama, LlamaConfig};
 pub use models::q1::qwen3::{Qwen3Config, Qwen3Model};
 pub use models::q1::qwen35::{Qwen35Config, Qwen35Model};
-pub use models::traits::{CausalLM, Logits, ModelState};
+pub use models::traits::{CausalLM, Logits, ModelState, StateSnapshot};
 pub use nn::{DynamicLinear, QuantizationConfig};
+pub use prompt_cache::{PromptCache, PromptCacheStats};
 pub use sampler::{Sampler, SamplingParams};
 pub use tensor::FastTensor;
 

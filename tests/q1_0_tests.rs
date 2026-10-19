@@ -1,10 +1,13 @@
 //! Equivalence tests for the Q1_0 (1-bit) GEMV/GEMM kernels: every ISA
 //! variant supported by the CPU against the scalar reference, for both block
 //! sizes, odd row counts, row offsets and column counts that exercise the
-//! 32-element tail of the AVX-512 kernel.
+//! 32-element tail of the AVX-512 kernel. All kernels follow the canonical
+//! operation order of `dot_rows_scalar`, so results must be bit-identical
+//! (independent of ISA, row grouping and the number of tokens per call).
 
 use xor_net::bit1::q1_0::{
-    ActRow, Isa, Q1Weight, Q8Acts, dot_rows_isa, dot_rows_scalar, gemm, gemv,
+    ActRow, GemmKernel, Isa, Q1Weight, Q8Acts, TileIsa, dot_rows_isa, dot_rows_scalar, gemm,
+    gemm_with, gemv, perm32,
 };
 use xor_net::loader::gguf::{PRISM_Q1_0, PRISM_Q1_0_G128, PRISM_Q1_0_UPSTREAM};
 
@@ -22,7 +25,8 @@ impl Rng {
     }
 }
 
-/// Random GGUF Q1 tensor with finite scales (including a few zero scales).
+/// Random GGUF Q1 tensor with finite scales (including a few zero and
+/// subnormal scales).
 fn random_weight(rng: &mut Rng, dtype: u32, rows: usize, cols: usize) -> Q1Weight {
     let (block, bbytes, soff) = match dtype {
         PRISM_Q1_0_UPSTREAM => (128, 18, 0),
@@ -36,6 +40,9 @@ fn random_weight(rng: &mut Rng, dtype: u32, rows: usize, cols: usize) -> Q1Weigh
         let r = rng.next();
         let h: u16 = if r.is_multiple_of(17) {
             0
+        } else if r.is_multiple_of(13) {
+            // f16 subnormal scale (exponent field 0).
+            ((r >> 16) as u16 & 0x3ff).max(1) | (((r >> 30) & 1) as u16) << 15
         } else {
             ((((r >> 8) % 12 + 8) as u16) << 10)
                 | ((r >> 16) as u16 & 0x3ff)
@@ -62,27 +69,11 @@ fn random_acts(rng: &mut Rng, n: usize, cols: usize, block: usize) -> (Vec<f32>,
     (x, a)
 }
 
-/// Σ_c |W[r, c] · x̂[c]| per row (x̂ = dequantized activations): the scale
-/// of the rounding error of any summation order.
-fn l1_rows(w: &Q1Weight, acts: &Q8Acts, t: usize, r0: usize, n: usize) -> Vec<f32> {
-    let cols = w.cols();
-    let a = acts.row(t);
-    let mut row = vec![0.0; cols];
-    (r0..r0 + n)
-        .map(|r| {
-            w.dequantize_row_into(r, &mut row);
-            (0..cols)
-                .map(|c| (row[c] * a.q[c] as f32 * a.d[c / a.block]).abs())
-                .sum()
-        })
-        .collect()
-}
-
-fn assert_close(got: &[f32], want: &[f32], l1: &[f32], what: &str) {
+/// Bit-for-bit equality (the kernels share one operation order).
+fn assert_same(got: &[f32], want: &[f32], what: &str) {
     assert_eq!(got.len(), want.len());
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        let tol = 2e-6 * l1[i] + 1e-6;
-        assert!((g - w).abs() <= tol, "{what}[{i}]: got {g}, want {w}");
+        assert!(g.to_bits() == w.to_bits(), "{what}[{i}]: got {g}, want {w}");
     }
 }
 
@@ -117,25 +108,18 @@ fn every_isa_matches_scalar() {
                 let a: ActRow = acts.row(0);
                 let mut want = vec![0.0; rows];
                 dot_rows_scalar(&w, 0, a, &mut want);
-                let l1 = l1_rows(&w, &acts, 0, 0, rows);
                 for &isa in &isas {
                     // Whole matrix, and every (offset, count) window.
                     let mut got = vec![0.0; rows];
                     dot_rows_isa(isa, &w, 0, a, &mut got);
-                    assert_close(
-                        &got,
-                        &want,
-                        &l1,
-                        &format!("{isa:?} dtype {dtype} {rows}x{cols}"),
-                    );
+                    assert_same(&got, &want, &format!("{isa:?} dtype {dtype} {rows}x{cols}"));
                     for r0 in 0..rows.min(6) {
                         for cnt in 1..=(rows - r0).min(6) {
                             let mut g = vec![0.0; cnt];
                             dot_rows_isa(isa, &w, r0, a, &mut g);
-                            assert_close(
+                            assert_same(
                                 &g,
                                 &want[r0..r0 + cnt],
-                                &l1[r0..r0 + cnt],
                                 &format!("{isa:?} window {r0}+{cnt}"),
                             );
                         }
@@ -158,23 +142,189 @@ fn gemv_and_gemm_match_scalar() {
                 }
                 let (_, acts) = random_acts(&mut rng, n, cols, ab);
                 let mut want = vec![0.0; n * rows];
-                let l1: Vec<f32> = (0..n)
-                    .flat_map(|t| l1_rows(&w, &acts, t, 0, rows))
-                    .collect();
                 for t in 0..n {
                     dot_rows_scalar(&w, 0, acts.row(t), &mut want[t * rows..(t + 1) * rows]);
                 }
                 let mut got = vec![0.0; n * rows];
                 gemm(&w, &acts, &mut got);
-                assert_close(&got, &want, &l1, &format!("gemm {rows}x{cols} n={n}"));
+                assert_same(&got, &want, &format!("gemm {rows}x{cols} n={n}"));
                 if n == 1 {
                     let mut g = vec![0.0; rows];
                     gemv(&w, &acts, &mut g);
-                    assert_close(&g, &want, &l1, "gemv");
+                    assert_same(&g, &want, "gemv");
                 }
             }
         }
     }
+}
+
+/// Every multi-token kernel (row kernels and token-tiled kernels of every
+/// supported ISA) against the scalar reference: odd row counts (partial
+/// slabs of 8 / 16 lanes), token counts that are not multiples of the token
+/// tile (including 1), both weight block sizes and both activation blocks.
+#[test]
+fn every_gemm_kernel_matches_scalar() {
+    let mut rng = Rng(11);
+    let kernels = GemmKernel::all_supported();
+    eprintln!("testing Q1 GEMM kernels: {kernels:?}");
+    let shapes: &[(u32, usize, usize)] = &[
+        (PRISM_Q1_0_UPSTREAM, 1, 128),
+        (PRISM_Q1_0_UPSTREAM, 7, 256),
+        (PRISM_Q1_0_UPSTREAM, 17, 384),
+        (PRISM_Q1_0_UPSTREAM, 33, 1152),
+        (PRISM_Q1_0_G128, 24, 512),
+        (PRISM_Q1_0, 9, 32),
+        (PRISM_Q1_0, 15, 96),
+        (PRISM_Q1_0, 16, 160),
+        (PRISM_Q1_0, 31, 544),
+        (PRISM_Q1_0, 40, 2048),
+    ];
+    for &(dtype, rows, cols) in shapes {
+        let w = random_weight(&mut rng, dtype, rows, cols);
+        for ab in [32, 128]
+            .into_iter()
+            .filter(|ab| w.block().is_multiple_of(*ab))
+        {
+            for n in [1usize, 2, 3, 4, 5, 8, 9, 13, 17] {
+                let (_, acts) = random_acts(&mut rng, n, cols, ab);
+                let mut want = vec![0.0; n * rows];
+                for t in 0..n {
+                    dot_rows_scalar(&w, 0, acts.row(t), &mut want[t * rows..(t + 1) * rows]);
+                }
+                for &k in &kernels {
+                    let mut got = vec![f32::NAN; n * rows];
+                    gemm_with(k, &w, &acts, &mut got);
+                    assert_same(
+                        &got,
+                        &want,
+                        &format!("{k:?} dtype {dtype} {rows}x{cols} act{ab} n={n}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tiled_gemm_parallel_split_matches_scalar() {
+    // Enough rows and tokens for several slabs per task and several token
+    // blocks (> 256 tokens).
+    let mut rng = Rng(5);
+    let (rows, cols) = (203, 256);
+    let w = random_weight(&mut rng, PRISM_Q1_0_UPSTREAM, rows, cols);
+    let n = 530;
+    let (_, acts) = random_acts(&mut rng, n, cols, 32);
+    let mut want = vec![0.0; n * rows];
+    for t in 0..n {
+        dot_rows_scalar(&w, 0, acts.row(t), &mut want[t * rows..(t + 1) * rows]);
+    }
+    for t in [
+        TileIsa::Avx2,
+        TileIsa::AvxVnni,
+        TileIsa::Avx512Bw,
+        TileIsa::Avx512Vnni,
+    ] {
+        if !t.supported() {
+            continue;
+        }
+        let mut got = vec![f32::NAN; n * rows];
+        gemm_with(GemmKernel::Tiled(t), &w, &acts, &mut got);
+        assert_same(&got, &want, &format!("{t:?} split"));
+    }
+}
+
+#[test]
+fn activation_side_data_is_consistent() {
+    let mut rng = Rng(9);
+    for ab in [32, 128] {
+        let (_, acts) = random_acts(&mut rng, 3, 384, ab);
+        for t in 0..3 {
+            let a = acts.row(t);
+            for k in 0..384 / 32 {
+                let blk = &a.q[32 * k..32 * (k + 1)];
+                for (e, &v) in blk.iter().enumerate() {
+                    assert_eq!(a.qp[32 * k + perm32(e)], v);
+                }
+                let s: i32 = blk.iter().map(|&v| v as i32).sum();
+                assert_eq!(a.nsum[k], -s);
+            }
+        }
+    }
+}
+
+/// `Q8Acts::quantize` (SIMD path where available) against a scalar
+/// statement of the block quantizer, bit for bit: zero blocks, ties at
+/// .5, NaN and infinite elements, tiny and huge magnitudes.
+#[test]
+fn quantize_matches_reference_bitwise() {
+    let mut rng = Rng(21);
+    for block in [32usize, 128] {
+        let cols = 1024;
+        let n = 3;
+        let mut x: Vec<f32> = (0..n * cols).map(|_| rng.f32() * 3.0).collect();
+        // Block 0: zeros; block 1: exact ties (amax 127 -> id 1.0);
+        // block 2: a NaN; block 3: an infinity; block 4: tiny values.
+        x[..block].fill(0.0);
+        for (i, v) in x[block..2 * block].iter_mut().enumerate() {
+            *v = (i as f32 - 64.0) + 0.5;
+        }
+        x[block] = 127.0;
+        x[2 * block + 3] = f32::NAN;
+        x[3 * block + 1] = f32::INFINITY;
+        x[4 * block..5 * block].iter_mut().for_each(|v| *v *= 1e-30);
+        x[5 * block + 7] = -0.0;
+        let mut a = Q8Acts::new();
+        a.quantize(&x, n, cols, block);
+        for t in 0..n {
+            let r = a.row(t);
+            for (b, xb) in x[t * cols..(t + 1) * cols].chunks_exact(block).enumerate() {
+                let amax = xb.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                let (want_d, want_q): (f32, Vec<i8>) = if amax == 0.0 || !amax.is_finite() {
+                    (if amax == 0.0 { 0.0 } else { f32::NAN }, vec![0; block])
+                } else {
+                    let id = 127.0 / amax;
+                    let q = xb
+                        .iter()
+                        .map(|&v| {
+                            let r = (v * id).round_ties_even();
+                            if r.is_nan() {
+                                0
+                            } else {
+                                r.clamp(-127.0, 127.0) as i8
+                            }
+                        })
+                        .collect();
+                    (amax / 127.0, q)
+                };
+                assert_eq!(r.d[b].to_bits(), want_d.to_bits(), "d block {b} row {t}");
+                assert_eq!(
+                    &r.q[b * block..(b + 1) * block],
+                    &want_q[..],
+                    "q block {b} row {t}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic]
+fn gemm_rejects_wrong_output_length() {
+    let mut rng = Rng(1);
+    let w = random_weight(&mut rng, PRISM_Q1_0_UPSTREAM, 4, 256);
+    let (_, acts) = random_acts(&mut rng, 3, 256, 32);
+    let mut out = vec![0.0; 11];
+    gemm_with(GemmKernel::best(), &w, &acts, &mut out);
+}
+
+#[test]
+#[should_panic]
+fn gemm_rejects_wrong_activation_cols() {
+    let mut rng = Rng(1);
+    let w = random_weight(&mut rng, PRISM_Q1_0_UPSTREAM, 4, 256);
+    let (_, acts) = random_acts(&mut rng, 3, 128, 32);
+    let mut out = vec![0.0; 12];
+    gemm_with(GemmKernel::best(), &w, &acts, &mut out);
 }
 
 #[test]

@@ -47,6 +47,8 @@ pub struct CpuFeatures {
     pub avx512dq: bool,
     pub avx512vl: bool,
     pub avx512vnni: bool,
+    /// AVX-VNNI: VEX-encoded `vpdpbusd` on ymm (Alder Lake+, Zen 5+).
+    pub avxvnni: bool,
 }
 
 impl CpuFeatures {
@@ -63,6 +65,7 @@ impl CpuFeatures {
                 avx512dq: std::is_x86_feature_detected!("avx512dq"),
                 avx512vl: std::is_x86_feature_detected!("avx512vl"),
                 avx512vnni: std::is_x86_feature_detected!("avx512vnni"),
+                avxvnni: std::is_x86_feature_detected!("avxvnni"),
             };
             detected.capped(std::env::var("XORNET_FORCE_ISA").ok().as_deref())
         }
@@ -73,7 +76,9 @@ impl CpuFeatures {
     }
 
     /// Mask out features above the ISA named by `XORNET_FORCE_ISA`
-    /// (`scalar`, `avx2`, `avx512bw`; anything else, or unset, keeps all).
+    /// (`scalar`, `avx2`, `avxvnni`, `avx512bw`; anything else, or unset,
+    /// keeps all). `avx2` is plain AVX2 (no AVX-VNNI); `avxvnni` is AVX2 plus
+    /// AVX-VNNI without AVX-512.
     /// It can only *lower* the dispatch level, never claim a feature the CPU
     /// lacks, so it is safe to honour in release builds. CI uses it to run the
     /// whole test-suite through the AVX2 and scalar paths on AVX-512 runners.
@@ -81,7 +86,10 @@ impl CpuFeatures {
     fn capped(mut self, isa: Option<&str>) -> Self {
         match isa.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
             Some("scalar") => self = Self::default(),
-            Some("avx2") => {
+            Some(level @ ("avx2" | "avxvnni")) => {
+                if level == "avx2" {
+                    self.avxvnni = false;
+                }
                 self.avx512f = false;
                 self.avx512bw = false;
                 self.avx512dq = false;
@@ -117,6 +125,12 @@ impl CpuFeatures {
     #[inline(always)]
     pub fn avx512_tier(&self) -> bool {
         self.avx2_tier() && self.avx512f && self.avx512bw && self.avx512dq && self.avx512vl
+    }
+
+    /// [`Self::avx2_tier`] + AVX-VNNI (`vpdpbusd` on ymm registers).
+    #[inline(always)]
+    pub fn avx_vnni(&self) -> bool {
+        self.avx2_tier() && self.avxvnni
     }
 
     /// `avx512f` + `avx512bw` + `avx512vnni` (`vpdpbusd` on zmm registers).
@@ -228,12 +242,15 @@ mod tests {
             avx512dq: true,
             avx512vl: true,
             avx512vnni: true,
+            avxvnni: true,
         };
         assert_eq!(all.capped(None), all);
         assert_eq!(all.capped(Some("bogus")), all);
         assert_eq!(all.capped(Some("scalar")), CpuFeatures::default());
         let avx2 = all.capped(Some(" AVX2 "));
-        assert!(avx2.avx2_fma() && !avx2.avx512bw() && !avx2.avx512_vnni());
+        assert!(avx2.avx2_fma() && !avx2.avx512bw() && !avx2.avx512_vnni() && !avx2.avx_vnni());
+        let vnni = all.capped(Some("avxvnni"));
+        assert!(vnni.avx_vnni() && !vnni.avx512bw());
         let bw = all.capped(Some("avx512bw"));
         assert!(bw.avx512bw() && !bw.avx512_vnni());
         // Never raises: a CPU without AVX2 stays without it.

@@ -56,8 +56,81 @@ pub trait ModelState: Any + Send {
         false
     }
 
+    /// Deep copy of the first `len` positions (`len <=` the positions fed so
+    /// far), for a prompt cache (see [`crate::prompt_cache::PromptCache`]).
+    /// The copy holds only what those positions need (about `len` x the
+    /// per-token KV size, plus any fixed-size recurrent state), never the
+    /// state's spare capacity or scratch buffers. `None` if this state cannot
+    /// represent that prefix: recurrent states only support the current
+    /// length and the checkpoint (see [`checkpoint`](Self::checkpoint)), and
+    /// states without snapshot support (the default) never do.
+    fn snapshot(&self, len: usize) -> Option<StateSnapshot> {
+        let _ = len;
+        None
+    }
+
+    /// Overwrite this state with `snap` (taken from a state of the *same*
+    /// model): afterwards it holds exactly [`snap.len()`](StateSnapshot::len)
+    /// positions, as if those tokens had just been fed (any checkpoint is
+    /// discarded). Returns `false`, leaving the state untouched, if the
+    /// snapshot comes from another model type or shape.
+    fn restore(&mut self, snap: &StateSnapshot) -> bool {
+        let _ = snap;
+        false
+    }
+
     /// Downcasting hook for the owning model implementation.
     fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+/// An immutable copy of a [`ModelState`] prefix, made by
+/// [`ModelState::snapshot`] and consumed by [`ModelState::restore`]. The
+/// payload is model specific; snapshots are `Send + Sync` so one can be
+/// restored concurrently into several states (e.g. server slots).
+pub struct StateSnapshot {
+    len: usize,
+    bytes: usize,
+    data: Box<dyn Any + Send + Sync>,
+}
+
+impl StateSnapshot {
+    /// Wrap a model-specific payload covering `len` positions and holding
+    /// about `bytes` bytes of heap memory.
+    pub fn new<T: Any + Send + Sync>(len: usize, bytes: usize, data: T) -> Self {
+        Self {
+            len,
+            bytes,
+            data: Box::new(data),
+        }
+    }
+
+    /// Number of sequence positions the snapshot covers.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Approximate heap size (used for the prompt cache's byte budget).
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The payload, if it has type `T`.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.data.downcast_ref::<T>()
+    }
+}
+
+impl std::fmt::Debug for StateSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateSnapshot")
+            .field("len", &self.len)
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A decoder-only language model.

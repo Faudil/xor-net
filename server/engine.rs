@@ -6,14 +6,16 @@
 //! delegates all of it to `xor_net::generation::Generator`.
 
 use std::ops::ControlFlow;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use anyhow::anyhow;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use xor_net::generation::{
     FinishReason as GenFinish, GenerationParams, Generator, ReasoningFormat, StreamEvent, Timings,
+    common_prefix,
 };
+use xor_net::prompt_cache::PromptCacheStats;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChatMessage {
@@ -101,6 +103,8 @@ pub struct GenRequest {
     pub stop: Vec<String>,
     /// Split `<think>…</think>` off into reasoning events.
     pub reasoning: bool,
+    /// Prefix boundaries of the prompt (see [`Engine::prefix_boundaries`]).
+    pub boundaries: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +126,9 @@ pub struct GenResult {
     pub completion_tokens: usize,
     pub stop_word: Option<String>,
     pub timings: Option<Timings>,
+    /// Prompt tokens reused instead of recomputed (slot state or prompt
+    /// cache).
+    pub cached_tokens: usize,
 }
 
 /// The model as seen by the server.
@@ -142,6 +149,28 @@ pub trait Engine: Send + Sync {
         prompt: &Prompt,
         template_kwargs: &Map<String, Value>,
     ) -> Result<Vec<u32>, String>;
+    /// Prompt positions where later requests are likely to diverge (chat:
+    /// end of the system prompt, end of the history); prompt-cache
+    /// insertion points. Empty by default.
+    fn prefix_boundaries(
+        &self,
+        prompt: &Prompt,
+        template_kwargs: &Map<String, Value>,
+        ids: &[u32],
+    ) -> Vec<usize> {
+        let _ = (prompt, template_kwargs, ids);
+        Vec::new()
+    }
+    /// How many leading tokens of `ids` slot `slot`'s current state already
+    /// holds (slot affinity for scheduling). Must not block: 0 if unknown.
+    fn slot_affinity(&self, slot: usize, ids: &[u32]) -> usize {
+        let _ = (slot, ids);
+        0
+    }
+    /// Shared prompt-cache counters, if a cache is enabled.
+    fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
+        None
+    }
     /// Run one generation on worker slot `slot`. `on_event` receives text
     /// and reasoning deltas; returning `ControlFlow::Break` aborts promptly.
     fn generate(
@@ -245,6 +274,34 @@ impl Engine for GeneratorEngine {
         Ok(ids)
     }
 
+    fn prefix_boundaries(
+        &self,
+        prompt: &Prompt,
+        template_kwargs: &Map<String, Value>,
+        ids: &[u32],
+    ) -> Vec<usize> {
+        match prompt {
+            Prompt::Chat(msgs) => {
+                lock(&self.base).chat_prefix_boundaries(msgs, template_kwargs, ids)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn slot_affinity(&self, slot: usize, ids: &[u32]) -> usize {
+        match self.slots.get(slot).map(Mutex::try_lock) {
+            Some(Ok(g)) => common_prefix(g.processed_tokens(), ids),
+            Some(Err(TryLockError::Poisoned(p))) => {
+                common_prefix(p.into_inner().processed_tokens(), ids)
+            }
+            _ => 0,
+        }
+    }
+
+    fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
+        lock(&self.base).prompt_cache().map(|c| c.stats())
+    }
+
     fn generate(
         &self,
         slot: usize,
@@ -274,7 +331,12 @@ impl Engine for GeneratorEngine {
             .get(slot)
             .ok_or_else(|| anyhow!("no generator for slot {slot}"))?;
         let mut g = lock(slot);
-        let out = g.generate_from_tokens_events(&req.prompt_ids, &params, on_event)?;
+        let out = g.generate_from_tokens_with_boundaries(
+            &req.prompt_ids,
+            &params,
+            &req.boundaries,
+            on_event,
+        )?;
         let finish = match out.finish_reason {
             GenFinish::Stop => FinishReason::Eos,
             GenFinish::StopString => FinishReason::StopString,
@@ -286,6 +348,7 @@ impl Engine for GeneratorEngine {
             completion_tokens: out.usage.completion_tokens,
             stop_word: out.stop_string,
             timings: Some(out.timings),
+            cached_tokens: out.usage.cached_prompt_tokens,
         })
     }
 }
@@ -456,6 +519,7 @@ pub mod mock {
                 completion_tokens: n,
                 stop_word: stops.matched().map(str::to_owned),
                 timings: None,
+                cached_tokens: 0,
             };
             let mut n = 0;
             for &b in self.script.iter().take(req.max_tokens) {

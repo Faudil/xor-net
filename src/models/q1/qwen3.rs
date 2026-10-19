@@ -7,7 +7,7 @@
 
 use crate::bit1::q1_0::Q8Acts;
 use crate::loader::gguf::GgufFile;
-use crate::models::traits::{CausalLM, Logits, ModelState, downcast_state};
+use crate::models::traits::{CausalLM, Logits, ModelState, StateSnapshot, downcast_state};
 use rayon::prelude::*;
 
 use super::{
@@ -126,9 +126,39 @@ impl ModelState for Qwen3State {
         // Pure KV cache: positions `>= len` are rewritten before being read.
         true
     }
+    fn snapshot(&self, len: usize) -> Option<StateSnapshot> {
+        let kv = self
+            .kv
+            .iter()
+            .map(|c| c.prefix_copy(len))
+            .collect::<Option<Vec<_>>>()?;
+        let bytes = kv.iter().map(KvCache::bytes).sum();
+        Some(StateSnapshot::new(len, bytes, Qwen3Snapshot { kv }))
+    }
+    fn restore(&mut self, snap: &StateSnapshot) -> bool {
+        let Some(s) = snap.downcast_ref::<Qwen3Snapshot>() else {
+            return false;
+        };
+        if s.kv.len() != self.kv.len()
+            || !self.kv.iter().zip(&s.kv).all(|(d, s)| d.can_load_prefix(s))
+        {
+            return false;
+        }
+        for (d, s) in self.kv.iter_mut().zip(&s.kv) {
+            if d.load_prefix(s).is_err() {
+                return false;
+            }
+        }
+        true
+    }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+}
+
+/// [`StateSnapshot`] payload: compact per-layer KV prefixes.
+struct Qwen3Snapshot {
+    kv: Vec<KvCache>,
 }
 
 impl Qwen3State {

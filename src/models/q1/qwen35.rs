@@ -22,7 +22,7 @@ use rayon::prelude::*;
 
 use crate::bit1::q1_0::Q8Acts;
 use crate::loader::gguf::GgufFile;
-use crate::models::traits::{CausalLM, Logits, ModelState, downcast_state};
+use crate::models::traits::{CausalLM, Logits, ModelState, StateSnapshot, downcast_state};
 use crate::nn::fast_attention_simd::{dot_product_f32, rms_norm};
 use crate::util::with_best_simd;
 
@@ -272,9 +272,85 @@ impl ModelState for Qwen35State {
     fn needs_checkpoint(&self) -> bool {
         true
     }
+
+    /// KV prefixes plus the recurrent state at `len`, which must be the
+    /// current length or the checkpoint.
+    fn snapshot(&self, len: usize) -> Option<StateSnapshot> {
+        let (conv, ssm) = if len == self.len {
+            (&self.conv, &self.ssm)
+        } else if self.ckpt.len == Some(len) {
+            (&self.ckpt.conv, &self.ckpt.ssm)
+        } else {
+            return None;
+        };
+        let kv = self
+            .kv
+            .iter()
+            .map(|c| match c {
+                Some(c) => c.prefix_copy(len).map(Some),
+                None => Some(None),
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let snap = Qwen35Snapshot {
+            kv,
+            conv: conv.clone(),
+            ssm: ssm.clone(),
+        };
+        let bytes = snap.kv.iter().flatten().map(KvCache::bytes).sum::<usize>()
+            + snap
+                .conv
+                .iter()
+                .chain(&snap.ssm)
+                .map(|v| v.len() * 4)
+                .sum::<usize>();
+        Some(StateSnapshot::new(len, bytes, snap))
+    }
+
+    fn restore(&mut self, snap: &StateSnapshot) -> bool {
+        let Some(s) = snap.downcast_ref::<Qwen35Snapshot>() else {
+            return false;
+        };
+        let same_len = |a: &[Vec<f32>], b: &[Vec<f32>]| {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.len() == y.len())
+        };
+        let kv_ok = s.kv.len() == self.kv.len()
+            && self.kv.iter().zip(&s.kv).all(|(d, s)| match (d, s) {
+                (Some(d), Some(s)) => d.can_load_prefix(s),
+                (None, None) => true,
+                _ => false,
+            });
+        if !kv_ok || !same_len(&self.conv, &s.conv) || !same_len(&self.ssm, &s.ssm) {
+            return false;
+        }
+        for (d, s) in self.kv.iter_mut().zip(&s.kv) {
+            if let (Some(d), Some(s)) = (d, s)
+                && d.load_prefix(s).is_err()
+            {
+                return false;
+            }
+        }
+        for (d, s) in self.conv.iter_mut().zip(&s.conv) {
+            d.copy_from_slice(s);
+        }
+        for (d, s) in self.ssm.iter_mut().zip(&s.ssm) {
+            d.copy_from_slice(s);
+        }
+        self.len = snap.len();
+        self.ckpt.len = None;
+        true
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+}
+
+/// [`StateSnapshot`] payload: compact KV prefixes of the attention layers
+/// and the recurrent (conv + DeltaNet) state at the snapshot position.
+struct Qwen35Snapshot {
+    kv: Vec<Option<KvCache>>,
+    conv: Vec<Vec<f32>>,
+    ssm: Vec<Vec<f32>>,
 }
 
 fn resize(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
@@ -306,6 +382,23 @@ fn delta_row(sj: &mut [f32], k: &[f32], q: &[f32], vj: f32, beta: f32, decay: f3
     dot_product_f32(sj, q)
 }
 
+/// From this many tokens on, the element-wise GDN / gate loops run in
+/// parallel over tokens (same per-element arithmetic as the sequential
+/// loops).
+const PAR_TOKENS: usize = 4;
+
+/// `o[ch] += w[ch] * x[ch]` (one depthwise-conv tap over all channels).
+#[inline]
+fn conv_tap(o: &mut [f32], w: &[f32], x: &[f32]) {
+    #[inline(always)]
+    fn tap(o: &mut [f32], w: &[f32], x: &[f32]) {
+        for ((o, &w), &x) in o.iter_mut().zip(w).zip(x) {
+            *o += w * x;
+        }
+    }
+    with_best_simd!(tap(o, w, x))
+}
+
 /// `x / sqrt(Σx² + eps)` (llama.cpp `build_gdn_l2_norm`).
 fn l2_norm(x: &mut [f32], eps: f32) {
     let ss: f32 = x.iter().map(|v| v * v).sum();
@@ -335,26 +428,59 @@ impl GdnMixer {
         let ba = resize(&mut s.b, n * 2 * nv);
         self.ba.forward(hbuf, n, &mut s.acts, ba);
 
-        // Causal depthwise conv over [history (K-1 rows); new rows] + SiLU.
+        // Causal depthwise conv over [history (K-1 rows); new rows] + SiLU,
+        // then per key head: L2-normalize q, k; q *= 1/sqrt(hk).
         let conv_out = resize(&mut s.c, n * cd);
         let hist = kk - 1;
-        for t in 0..n {
-            let o = &mut conv_out[t * cd..(t + 1) * cd];
-            o.fill(0.0);
-            for j in 0..kk {
-                // window row t + j of [history; new]
-                let r = t + j;
-                let src: &[f32] = if r < hist {
-                    &conv_state[r * cd..(r + 1) * cd]
-                } else {
-                    &qkvz[(r - hist) * w..(r - hist) * w + cd]
-                };
-                for ch in 0..cd {
-                    o[ch] += self.conv[ch * kk + j] * src[ch];
-                }
+        let qscale = 1.0 / (hk as f32).sqrt();
+        // Window row r of [history; new].
+        let window = |r: usize| -> &[f32] {
+            if r < hist {
+                &conv_state[r * cd..(r + 1) * cd]
+            } else {
+                &qkvz[(r - hist) * w..(r - hist) * w + cd]
             }
-            for v in o.iter_mut() {
-                *v *= sigmoid(*v);
+        };
+        let norm_qk = |row: &mut [f32]| {
+            for h in 0..2 * nk {
+                l2_norm(&mut row[h * hk..(h + 1) * hk], c.eps);
+            }
+            row[..kd].iter_mut().for_each(|v| *v *= qscale);
+        };
+        if n >= PAR_TOKENS {
+            // Prefill: parallel over tokens, conv taps transposed to
+            // `[kk][cd]` so the channel loop vectorizes. Every element is
+            // computed exactly as in the sequential path below.
+            let taps: Vec<f32> = (0..kk)
+                .flat_map(|j| (0..cd).map(move |ch| self.conv[ch * kk + j]))
+                .collect();
+            conv_out
+                .par_chunks_exact_mut(cd)
+                .enumerate()
+                .for_each(|(t, o)| {
+                    o.fill(0.0);
+                    for j in 0..kk {
+                        conv_tap(o, &taps[j * cd..(j + 1) * cd], window(t + j));
+                    }
+                    for v in o.iter_mut() {
+                        *v *= sigmoid(*v);
+                    }
+                    norm_qk(o);
+                });
+        } else {
+            for t in 0..n {
+                let o = &mut conv_out[t * cd..(t + 1) * cd];
+                o.fill(0.0);
+                for j in 0..kk {
+                    let src = window(t + j);
+                    for ch in 0..cd {
+                        o[ch] += self.conv[ch * kk + j] * src[ch];
+                    }
+                }
+                for v in o.iter_mut() {
+                    *v *= sigmoid(*v);
+                }
+                norm_qk(o);
             }
         }
         // New history = last K-1 rows of [history; new].
@@ -370,16 +496,6 @@ impl GdnMixer {
                 new_hist[r * cd..(r + 1) * cd].copy_from_slice(src);
             }
             conv_state.copy_from_slice(&new_hist);
-        }
-
-        // Per token: L2-normalize q, k per key head; q *= 1/sqrt(hk).
-        let qscale = 1.0 / (hk as f32).sqrt();
-        for t in 0..n {
-            let row = &mut conv_out[t * cd..(t + 1) * cd];
-            for h in 0..2 * nk {
-                l2_norm(&mut row[h * hk..(h + 1) * hk], c.eps);
-            }
-            row[..kd].iter_mut().for_each(|v| *v *= qscale);
         }
 
         // Delta rule, parallel over value heads, sequential over tokens.
@@ -409,16 +525,21 @@ impl GdnMixer {
                 });
             });
         // Gated RMS norm per head: rms(o_h) * norm * silu(z_h).
-        for t in 0..n {
+        let gate = |(t, ot): (usize, &mut [f32])| {
             let z = &qkvz[t * w + cd..(t + 1) * w];
             for vh in 0..nv {
-                let oo = &mut o[t * vd + vh * hv..t * vd + (vh + 1) * hv];
+                let oo = &mut ot[vh * hv..(vh + 1) * hv];
                 oo.copy_from_slice(&tmp[(vh * n + t) * hv..(vh * n + t + 1) * hv]);
                 rms_norm(oo, &self.norm, c.eps);
                 for (a, &zz) in oo.iter_mut().zip(&z[vh * hv..(vh + 1) * hv]) {
                     *a *= zz * sigmoid(zz);
                 }
             }
+        };
+        if n >= PAR_TOKENS {
+            o.par_chunks_exact_mut(vd).enumerate().for_each(gate);
+        } else {
+            o.chunks_exact_mut(vd).enumerate().for_each(gate);
         }
         self.out.forward(o, n, &mut s.acts, out);
     }
@@ -469,8 +590,17 @@ impl AttnMixer {
         }
         let att = resize(&mut s.d, n * qd);
         attention(q, n, pos, nh, kv, 1.0 / (hd as f32).sqrt(), att);
-        for (a, &g) in att.iter_mut().zip(gate.iter()) {
-            *a *= sigmoid(g);
+        let apply_gate = |(a, g): (&mut [f32], &[f32])| {
+            for (a, &g) in a.iter_mut().zip(g) {
+                *a *= sigmoid(g);
+            }
+        };
+        if n >= PAR_TOKENS {
+            att.par_chunks_mut(qd)
+                .zip(gate.par_chunks(qd))
+                .for_each(apply_gate);
+        } else {
+            att.chunks_mut(qd).zip(gate.chunks(qd)).for_each(apply_gate);
         }
         self.o.forward(att, n, &mut s.acts, out);
     }

@@ -497,11 +497,14 @@ pub fn finish_reason(r: FinishReason) -> &'static str {
     }
 }
 
-pub fn usage(prompt: usize, completion: usize) -> Value {
+/// OpenAI `usage`; `prompt_tokens_details.cached_tokens` counts prompt
+/// tokens reused from a slot's state or the shared prompt cache.
+pub fn usage(prompt: usize, res: &GenResult) -> Value {
     json!({
         "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "total_tokens": prompt + completion,
+        "completion_tokens": res.completion_tokens,
+        "total_tokens": prompt + res.completion_tokens,
+        "prompt_tokens_details": {"cached_tokens": res.cached_tokens},
     })
 }
 
@@ -560,7 +563,7 @@ pub fn full_body(
                     "logprobs": Value::Null,
                     "finish_reason": finish,
                 }],
-                "usage": usage(m.prompt_tokens, res.completion_tokens),
+                "usage": usage(m.prompt_tokens, res),
             })
         }
         Api::Completions => json!({
@@ -574,7 +577,7 @@ pub fn full_body(
                 "logprobs": Value::Null,
                 "finish_reason": finish,
             }],
-            "usage": usage(m.prompt_tokens, res.completion_tokens),
+            "usage": usage(m.prompt_tokens, res),
         }),
         Api::LlamaCpp => return llama_final(m, text, res),
     };
@@ -597,6 +600,7 @@ fn llama_final(m: &RespMeta, text: &str, res: &GenResult) -> Value {
         "model": m.model,
         "tokens_predicted": res.completion_tokens,
         "tokens_evaluated": m.prompt_tokens,
+        "tokens_cached": res.cached_tokens,
         "stop_type": stop_type,
         "stopping_word": res.stop_word.clone().unwrap_or_default(),
         "truncated": false,
@@ -688,7 +692,7 @@ pub fn final_chunks(api: Api, m: &RespMeta, res: &GenResult, include_usage: bool
                     "model": m.model,
                     "choices": [],
                 });
-                u["usage"] = usage(m.prompt_tokens, res.completion_tokens);
+                u["usage"] = usage(m.prompt_tokens, res);
                 out.push(u);
             } else {
                 out.push(last);
@@ -984,6 +988,7 @@ mod tests {
             completion_tokens: 2,
             stop_word: None,
             timings: None,
+            cached_tokens: 1,
         };
         let v = full_body(Api::Chat, &m, "4", Some("2+2"), &res);
         assert_eq!(v["choices"][0]["message"]["reasoning_content"], "2+2");
@@ -1029,11 +1034,13 @@ mod tests {
             completion_tokens: 2,
             stop_word: None,
             timings: None,
+            cached_tokens: 1,
         };
         let c = final_chunks(Api::Chat, &m, &res, true);
         assert_eq!(c.len(), 2);
         assert_eq!(c[0]["choices"][0]["finish_reason"], "length");
         assert_eq!(c[1]["usage"]["total_tokens"], 5);
+        assert_eq!(c[1]["usage"]["prompt_tokens_details"]["cached_tokens"], 1);
         assert_eq!(c[1]["choices"].as_array().map(Vec::len), Some(0));
         let c = final_chunks(Api::Completions, &m, &res, false);
         assert_eq!(c.len(), 1);

@@ -124,7 +124,12 @@ fn main() {
         .skip(1)
         .find(|a| !a.starts_with('-'))
         .filter(|a| !a.is_empty());
-    let _ = xor_net::init_threads(0);
+    // `XORNET_BENCH_THREADS=N` overrides the default pool size.
+    let threads = std::env::var("XORNET_BENCH_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let _ = xor_net::init_threads(threads);
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
 
     // ── Ternary pack4 GEMV (rayon, as used in decode) ────────────────────
@@ -187,7 +192,9 @@ fn main() {
 
     // ── Q1_0 (1-bit Bonsai) GEMV / GEMM ──────────────────────────────────
     {
-        use xor_net::bit1::q1_0::{ByteBuf, Isa, Q1Weight, Q8Acts, dot_rows_isa, gemm, gemv};
+        use xor_net::bit1::q1_0::{
+            ByteBuf, GemmKernel, Isa, Q1Weight, Q8Acts, dot_rows_isa, gemm, gemm_with, gemv,
+        };
         let q1 = |rng: &mut Rng, rows: usize, cols: usize, block: usize| -> Q1Weight {
             let bits: Vec<u8> = (0..rows * cols / 8).map(|_| rng.byte()).collect();
             let scales: Vec<u8> = (0..rows * cols / block)
@@ -241,23 +248,115 @@ fn main() {
                         );
                     }
                 }
-                if rows == 12288 && block == 128 {
-                    let n = 64;
-                    let xs: Vec<f32> = (0..n * cols).map(|_| rng.f32()).collect();
-                    let mut acts = Q8Acts::new();
-                    acts.quantize(&xs, n, cols, ab);
-                    let mut out = vec![0.0f32; n * rows];
-                    run_bw(
-                        &filter,
-                        &format!("q1_gemm {name} act{ab} n=64 (mt, weight bytes x n)"),
-                        20,
-                        w.nbytes() * n,
-                        || {
-                            gemm(&w, &acts, &mut out);
-                            black_box(&out);
-                        },
-                    );
+                if rows == 4096 && ab == 32 {
+                    // Short multi-token calls (chat turns, speculative
+                    // chunks): tiled vs per-token row kernels.
+                    for n in [2usize, 4, 8, 16] {
+                        let xs: Vec<f32> = (0..n * cols).map(|_| rng.f32()).collect();
+                        let mut acts = Q8Acts::new();
+                        acts.quantize(&xs, n, cols, ab);
+                        let mut out = vec![0.0f32; n * rows];
+                        for k in [GemmKernel::best(), GemmKernel::Rows(Isa::best())] {
+                            run_bw(
+                                &filter,
+                                &format!("q1_gemm_small {name} n={n} {k:?} (mt, x n)"),
+                                100,
+                                w.nbytes() * n,
+                                || {
+                                    gemm_with(k, &w, &acts, &mut out);
+                                    black_box(&out);
+                                },
+                            );
+                        }
+                    }
                 }
+                if rows == 12288 && block == 128 {
+                    let one = rayon::ThreadPoolBuilder::new()
+                        .num_threads(1)
+                        .build()
+                        .unwrap();
+                    for n in [64usize, 512] {
+                        let xs: Vec<f32> = (0..n * cols).map(|_| rng.f32()).collect();
+                        let mut acts = Q8Acts::new();
+                        acts.quantize(&xs, n, cols, ab);
+                        let mut out = vec![0.0f32; n * rows];
+                        let iters = if n > 64 { 5 } else { 20 };
+                        run_bw(
+                            &filter,
+                            &format!("q1_gemm {name} act{ab} n={n} (mt, weight bytes x n)"),
+                            iters,
+                            w.nbytes() * n,
+                            || {
+                                gemm(&w, &acts, &mut out);
+                                black_box(&out);
+                            },
+                        );
+                        // Per-thread throughput of every multi-token kernel.
+                        for k in GemmKernel::all_supported() {
+                            if k == GemmKernel::Rows(Isa::Scalar) {
+                                continue;
+                            }
+                            run_bw(
+                                &filter,
+                                &format!("q1_gemm {name} act{ab} n={n} {k:?} (1 thread, x n)"),
+                                3,
+                                w.nbytes() * n,
+                                || {
+                                    one.install(|| gemm_with(k, &w, &acts, &mut out));
+                                    black_box(&out);
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // One Bonsai-1.7B layer's projections at prefill sizes (quantize +
+        // GEMM of qkv, o, gate_up, down).
+        {
+            let shapes = [
+                (4096usize, 2048usize),
+                (2048, 2048),
+                (12288, 2048),
+                (2048, 6144),
+            ];
+            let ws: Vec<Q1Weight> = shapes
+                .iter()
+                .map(|&(r, c)| q1(&mut rng, r, c, 128))
+                .collect();
+            for n in [128usize, 512] {
+                let xs: Vec<Vec<f32>> = shapes
+                    .iter()
+                    .map(|&(_, c)| (0..n * c).map(|_| rng.f32()).collect())
+                    .collect();
+                let mut outs: Vec<Vec<f32>> =
+                    shapes.iter().map(|&(r, _)| vec![0.0; n * r]).collect();
+                let mut acts = Q8Acts::new();
+                let bytes: usize = ws.iter().map(|w| w.nbytes() * n).sum();
+                run_bw(
+                    &filter,
+                    &format!("q1_layer 1.7B quantize+gemm x4 n={n} (mt, x n)"),
+                    10,
+                    bytes,
+                    || {
+                        for ((w, x), o) in ws.iter().zip(&xs).zip(outs.iter_mut()) {
+                            acts.quantize(x, n, w.cols(), 32);
+                            gemm(w, &acts, o);
+                        }
+                        black_box(&outs);
+                    },
+                );
+                run(
+                    &filter,
+                    &format!("q1_layer 1.7B quantize only x4 n={n}"),
+                    10,
+                    || {
+                        for (w, x) in ws.iter().zip(&xs) {
+                            acts.quantize(x, n, w.cols(), 32);
+                        }
+                        black_box(&acts);
+                    },
+                );
             }
         }
         // DRAM-bound decode sweep: 28 distinct layers (qkv, o, gate_up, down)
@@ -533,6 +632,29 @@ fn model_benches(filter: &Option<String>, rng: &mut Rng) {
                 2000,
                 || {
                     attention(black_box(&q), 1, ctx, nh, &kv, 0.088, &mut out);
+                    black_box(&out);
+                },
+            );
+        }
+        // Causal prefill of n tokens from position 0 (one layer).
+        for &n in &[512usize, 2048] {
+            let mut kv = KvCache::new(nkv, hd, 4096);
+            kv.reserve(n, 0).unwrap();
+            for p in 0..n {
+                for h in 0..nkv {
+                    let k = rand_vec(rng, hd, 0.0, 1.0);
+                    let v = rand_vec(rng, hd, 0.0, 1.0);
+                    kv.store(h, p, &k, &v);
+                }
+            }
+            let q = rand_vec(rng, n * nh * hd, 0.0, 1.0);
+            let mut out = vec![0.0f32; n * nh * hd];
+            run(
+                filter,
+                &format!("q1 attention prefill n={n} (16/8 heads)"),
+                if n > 512 { 5 } else { 20 },
+                || {
+                    attention(black_box(&q), n, 0, nh, &kv, 0.088, &mut out);
                     black_box(&out);
                 },
             );

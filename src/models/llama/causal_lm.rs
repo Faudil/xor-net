@@ -5,7 +5,7 @@ use std::path::Path;
 
 use super::{Cache, Config, Llama, LlamaEosToks, RopeTables};
 use crate::models::auto::AutoModelForCausalLM;
-use crate::models::traits::{CausalLM, Logits, ModelState, downcast_state};
+use crate::models::traits::{CausalLM, Logits, ModelState, StateSnapshot, downcast_state};
 use crate::nn::QuantizationConfig;
 
 impl ModelState for Cache {
@@ -22,9 +22,86 @@ impl ModelState for Cache {
         true
     }
 
+    /// Compact copy of the f32 K/V rows `< len` of every layer. Not
+    /// supported with the optional u8 cache or once positions have wrapped.
+    fn snapshot(&self, len: usize) -> Option<StateSnapshot> {
+        let rc = self.ring_cache.as_ref()?;
+        if !rc.u8_buffers.is_empty() || len > rc.max_seq_len {
+            return None;
+        }
+        let (heads, hd, cap) = (rc.num_kv_heads, rc.head_dim, rc.max_seq_len);
+        let take = |bufs: &[Vec<f32>]| -> Vec<Vec<f32>> {
+            bufs.iter()
+                .map(|b| {
+                    let mut out = Vec::with_capacity(heads * len * hd);
+                    if !b.is_empty() {
+                        for h in 0..heads {
+                            out.extend_from_slice(&b[h * cap * hd..(h * cap + len) * hd]);
+                        }
+                    }
+                    out
+                })
+                .collect()
+        };
+        let snap = LlamaSnapshot {
+            k: take(&rc.k_buffers),
+            v: take(&rc.v_buffers),
+            heads,
+            head_dim: hd,
+        };
+        let bytes = snap.k.iter().chain(&snap.v).map(|b| b.len() * 4).sum();
+        Some(StateSnapshot::new(len, bytes, snap))
+    }
+
+    fn restore(&mut self, snap: &StateSnapshot) -> bool {
+        let len = snap.len();
+        let (Some(s), Some(rc)) = (
+            snap.downcast_ref::<LlamaSnapshot>(),
+            self.ring_cache.as_mut(),
+        ) else {
+            return false;
+        };
+        let (heads, hd) = (rc.num_kv_heads, rc.head_dim);
+        let rows = heads * len * hd;
+        if !rc.u8_buffers.is_empty()
+            || (s.heads, s.head_dim) != (heads, hd)
+            || s.k.len() != rc.k_buffers.len()
+            || s.v.len() != rc.v_buffers.len()
+            || len > rc.max_capacity
+            || s.k.iter().chain(&s.v).any(|b| b.len() != rows)
+        {
+            return false;
+        }
+        rc.reserve(len);
+        let cap = rc.max_seq_len;
+        if len > cap {
+            return false;
+        }
+        for (dst, src) in rc
+            .k_buffers
+            .iter_mut()
+            .zip(&s.k)
+            .chain(rc.v_buffers.iter_mut().zip(&s.v))
+        {
+            for h in 0..heads {
+                dst[h * cap * hd..(h * cap + len) * hd]
+                    .copy_from_slice(&src[h * len * hd..(h + 1) * len * hd]);
+            }
+        }
+        true
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+}
+
+/// [`StateSnapshot`] payload: per layer `[heads][len][head_dim]` f32 K / V.
+struct LlamaSnapshot {
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+    heads: usize,
+    head_dim: usize,
 }
 
 /// A loaded [`Llama`] plus the config fields generation needs.

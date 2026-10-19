@@ -9,6 +9,11 @@
 //!     pool of `--threads-per-slot` threads, sharing one `Arc` model; each
 //!     slot owns a `Generator` fork (state / KV cache, sampler). Defaults
 //!     split the physical cores over 2 slots (see `config::default_parallelism`).
+//!   * One `PromptCache` shared by all slots (`--prompt-cache-mb`): state
+//!     snapshots at the end of the system prompt and of the chat history, so
+//!     a shared prefix is prefilled once across requests and slots. The job
+//!     queue matches jobs to the slot whose state holds the longest prefix
+//!     of their prompt (small lookahead window, no starvation).
 //!   * Hand-rolled, defensive HTTP/1.1 (no async runtime): thread per
 //!     connection with a connection cap, bounded job queue, size limits and
 //!     timeouts everywhere. The release profile uses `panic = "abort"`, so
@@ -37,6 +42,7 @@ use tokenizers::Tokenizer;
 use xor_net::generation::Generator;
 use xor_net::models::traits::CausalLM;
 use xor_net::nn::LmHeadConfig;
+use xor_net::prompt_cache::PromptCache;
 use xor_net::{AutoModelForCausalLM, LlamaCausalLM, QuantizationConfig, TernaryPackType};
 
 use crate::config::{Parsed, ServerConfig};
@@ -159,8 +165,26 @@ fn main() -> anyhow::Result<()> {
     // The global pool only serves loading; decoding runs in per-slot pools.
     xor_net::init_threads(cfg.slots * cfg.threads_per_slot).map_err(|e| anyhow!(e.to_string()))?;
 
-    let (generator, default_id) = load(&cfg)?;
+    let (mut generator, default_id) = load(&cfg)?;
     println!("Model loaded.");
+    let cache_bytes = match cfg.prompt_cache_mb {
+        Some(mb) => mb.saturating_mul(1 << 20),
+        None => PromptCache::default_budget(),
+    };
+    if cache_bytes > 0 {
+        // Set before the slots fork the generator: they all share it.
+        generator.set_prompt_cache(Some(Arc::new(PromptCache::new(
+            cache_bytes,
+            cfg.prompt_cache_min_tokens,
+        ))));
+        println!(
+            "Prompt cache: {} MiB, prefixes >= {} tokens",
+            cache_bytes >> 20,
+            cfg.prompt_cache_min_tokens
+        );
+    } else {
+        println!("Prompt cache: disabled");
+    }
     let id = cfg.model_id.clone().unwrap_or(default_id);
     let engine = GeneratorEngine::new(generator, cfg.slots, id);
     println!(

@@ -167,5 +167,13 @@ path = "examples/bonsai_generate.rs"
 name = "bonsai_bench"
 path = "examples/bonsai_bench.rs"
 
+[[example]]
+name = "bonsai_logits_check"
+path = "examples/bonsai_logits_check.rs"
+
 [profile.dev]
 debug = "line-tables-only"
+
+[[example]]
+name = "prompt_cache_check"
+path = "examples/prompt_cache_check.rs"

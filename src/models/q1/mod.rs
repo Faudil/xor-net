@@ -9,6 +9,7 @@
 //! RoPE tables (incl. YaRN), the growable [`KvCache`] and causal [`attention`].
 //! All activations are plain row-major `f32` (`[tokens, features]`).
 
+pub mod flash;
 pub mod format;
 pub mod qwen3;
 pub mod qwen35;
@@ -372,6 +373,54 @@ impl KvCache {
     pub fn bytes(&self) -> usize {
         (self.k.len() + self.v.len()) * 2
     }
+
+    /// Compact copy of positions `< len` (capacity exactly `len`), for state
+    /// snapshots. `None` if `len` exceeds the capacity.
+    pub fn prefix_copy(&self, len: usize) -> Option<KvCache> {
+        if len > self.cap {
+            return None;
+        }
+        let hd = self.head_dim;
+        let take = |src: &[f16]| {
+            let mut out = Vec::with_capacity(self.kv_heads * len * hd);
+            for h in 0..self.kv_heads {
+                let o = h * self.cap * hd;
+                out.extend_from_slice(&src[o..o + len * hd]);
+            }
+            out
+        };
+        Some(KvCache {
+            kv_heads: self.kv_heads,
+            head_dim: hd,
+            cap: len,
+            max_len: self.max_len,
+            k: take(&self.k),
+            v: take(&self.v),
+        })
+    }
+
+    /// Whether [`load_prefix`](Self::load_prefix) of `src` can succeed.
+    pub fn can_load_prefix(&self, src: &KvCache) -> bool {
+        src.kv_heads == self.kv_heads && src.head_dim == self.head_dim && src.cap <= self.max_len
+    }
+
+    /// Overwrite positions `< src.cap` with a [`prefix_copy`](Self::prefix_copy)
+    /// (growing as needed); later positions are left as they are.
+    pub fn load_prefix(&mut self, src: &KvCache) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.can_load_prefix(src),
+            "KV cache: snapshot shape mismatch"
+        );
+        let len = src.cap;
+        self.reserve(len, 0)?;
+        let hd = self.head_dim;
+        for h in 0..self.kv_heads {
+            let (d, s) = (h * self.cap * hd, h * len * hd);
+            self.k[d..d + len * hd].copy_from_slice(&src.k[s..s + len * hd]);
+            self.v[d..d + len * hd].copy_from_slice(&src.v[s..s + len * hd]);
+        }
+        Ok(())
+    }
 }
 
 /// Keys per split-K work item of [`attention`].
@@ -394,13 +443,16 @@ struct AttnPartial {
 /// whose K/V are already stored in `cache`.
 ///
 /// `q`: `[n][heads * head_dim]`; `out`: `[n][heads * head_dim]`. Query head
-/// `h` reads KV head `h / (heads / kv_heads)`. Work is split into items of
-/// (block of up to [`ATTN_QBLOCK`] query rows, KV head, chunk of
-/// [`ATTN_CHUNK`] keys): an item converts its K/V chunk to f32 once and
-/// serves every query head of the group and every query row of the block.
-/// Chunks are merged with the usual log-sum-exp rescaling (flash-decoding),
-/// so long contexts use all threads even for a single query row. `scale`
-/// multiplies the logits.
+/// `h` reads KV head `h / (heads / kv_heads)`. `scale` multiplies the
+/// logits.
+///
+/// Head dims that [`flash::supported`] accepts (multiples of 64: all Bonsai
+/// models) use the blocked, batch-invariant [`flash::attention`]: a row's
+/// result is bit-identical whether it is computed alone (decode) or with
+/// other rows (prefill). Other head dims use the split-K path below: items
+/// of (block of up to [`ATTN_QBLOCK`] query rows, KV head, chunk of
+/// [`ATTN_CHUNK`] keys) merged with log-sum-exp rescaling
+/// (flash-decoding); it computes each row independently as well.
 pub fn attention(
     q: &[f32],
     n: usize,
@@ -420,6 +472,9 @@ pub fn attention(
     assert_eq!(q.len(), n * heads * hd);
     assert_eq!(out.len(), n * heads * hd);
     assert!(pos + n <= cache.cap, "attention: positions beyond cache");
+    if flash::supported(hd) {
+        return flash::attention(q, n, pos, heads, cache, scale, out);
+    }
     let max_chunks = (pos + n).div_ceil(ATTN_CHUNK);
 
     // Items: (query block, kv head, chunk) for every chunk visible to the

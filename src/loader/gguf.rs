@@ -334,7 +334,8 @@ pub fn fp16_to_f32(half: u16) -> f32 {
                 e -= 1;
             }
             m &= 0x03ff;
-            let new_exp = (127 - 15 + e + 1) as u32;
+            // Value = 1.m · 2^e (normalized); f32 biased exponent 127 + e.
+            let new_exp = (127 + e) as u32;
             f32::from_bits((sign << 16) | (new_exp << 23) | (m << 13))
         }
     } else if exp == 31 {
@@ -936,6 +937,21 @@ impl BonsaiConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every f16 bit pattern converts exactly (subnormals included); NaNs
+    /// stay NaN with the same sign.
+    #[test]
+    fn fp16_to_f32_is_exact_for_all_values() {
+        for h in 0..=u16::MAX {
+            let got = fp16_to_f32(h);
+            let want = half::f16::from_bits(h).to_f32();
+            if want.is_nan() {
+                assert!(got.is_nan() && got.is_sign_negative() == want.is_sign_negative());
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "f16 {h:#06x}");
+            }
+        }
+    }
 
     #[test]
     fn test_dequantize_q1_0_upstream() {
