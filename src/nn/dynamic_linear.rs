@@ -301,11 +301,12 @@ fn int4_dot_row(w_packed: &[u8], q_in: &[i8], in_dim: usize) -> i32 {
     let mut dot = 0i32;
     for (&b, in_chunk) in w_packed[..pairs]
         .iter()
-        .zip(q_in[..pairs * 2].chunks_exact(2))
+        .zip(q_in[..pairs * 2].as_chunks::<2>().0)
     {
         let q0 = ((b & 0x0F) as i8) << 4 >> 4;
         let q1 = ((b & 0xF0) as i8) >> 4;
-        dot += (in_chunk[0] as i32) * (q0 as i32) + (in_chunk[1] as i32) * (q1 as i32);
+        let [a0, a1] = *in_chunk;
+        dot += (a0 as i32) * (q0 as i32) + (a1 as i32) * (q1 as i32);
     }
     if in_dim % 2 == 1 {
         // Odd `in_dim`: the final byte holds only the low nibble.

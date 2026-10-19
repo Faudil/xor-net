@@ -12,7 +12,9 @@
 //! dot product with the i8 activations:
 //! - pre-VNNI: `_mm512_maddubs_epi16` (u8=1 × i8, horizontally summed to i16)
 //!   followed by `_mm512_madd_epi16` (i16 pairs summed to i32);
-//! - VNNI: a single `_mm512_dpbusd_epi32` does `acc += Σ (u8=1)·(i8)` directly.
+//! - VNNI: the LUT yields the unsigned `w + 1 ∈ {0, 1, 2}` instead, and two
+//!   `_mm512_dpbusd_epi32` accumulate `Σ (w+1)·a` and `Σ a` (no sign fix-up
+//!   or mask ops at all); the result is their difference.
 //!
 //! Multiple independent accumulators are kept live so the ~5-cycle multiply
 //! latency is hidden by instruction-level parallelism.
@@ -352,14 +354,20 @@ fn vnni_prefetch_bytes() -> usize {
     v
 }
 
-/// AVX-512 VNNI pack4 kernel (`vpdpbusd`, 16 accumulators). The decode GEMV
+/// AVX-512 VNNI pack4 kernel (`vpdpbusd`, 16 accumulator chains). The decode GEMV
 /// hot loop on Zen 4/5 and Ice Lake+.
+///
+/// Instead of building signed `±a` bytes (two compares, a masked subtract
+/// and a masked move per 64 weights), the codes are mapped to the unsigned
+/// "weight + 1" `u ∈ {0, 1, 2}` and fed straight into `vpdpbusd` as the
+/// unsigned operand: `Σ a·w = Σ a·u − Σ a`. `Σ a` is a second `vpdpbusd`
+/// against all-ones. Both sums are exact in `i32` (no saturation; `vpdpbusd`
+/// does not saturate), so the result is bit-identical to the scalar kernel
+/// for *any* `i8` activation, `-128` included.
 ///
 /// # Safety
 /// The CPU must support `avx512f`, `avx512bw` and `avx512vnni`;
 /// `a_i8.len() >= total_elems` and `b_pack4.len() >= total_elems.div_ceil(4)`.
-/// Activations should be in `[-127, 127]` (see the module docs) for an exact
-/// result.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 pub unsafe fn ternary_dot_product_pack4_avx512_vnni(
@@ -372,100 +380,81 @@ pub unsafe fn ternary_dot_product_pack4_avx512_vnni(
     let pf = vnni_prefetch_bytes();
 
     let zero = _mm512_setzero_si512();
-    // 16 independent accumulators hide the ~5-cycle dpbusd latency.
-    let mut acc = [zero; 16];
     let ones_u8 = _mm512_set1_epi8(1);
     let mask3 = _mm512_set1_epi32(0x03);
-    let lut = _mm512_set_epi8(
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-        0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 1, 0, -1,
-    );
+    // Code -> weight + 1: 0b00 (-1) -> 0, 0b01 (0) -> 1, 0b10 (+1) -> 2,
+    // 0b11 (unused, decodes to 0) -> 1. Only indices 0..=3 occur.
+    let lut = _mm512_set4_epi32(0, 0, 0, 0x0102_0100);
+
+    // One 64-weight chunk: `acc += Σ u·a`, `asum += Σ a` (per i32 lane).
+    macro_rules! chunk {
+        ($i:expr, $acc:expr, $asum:expr) => {{
+            let i = $i;
+            let acts = _mm512_loadu_si512(a_ptr.add(i));
+            let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(b_ptr.add(i * 16) as *const __m128i));
+            let p0 = _mm512_and_si512(w32, mask3);
+            let p1 = _mm512_and_si512(_mm512_srli_epi32(w32, 2), mask3);
+            let p2 = _mm512_and_si512(_mm512_srli_epi32(w32, 4), mask3);
+            let p3 = _mm512_and_si512(_mm512_srli_epi32(w32, 6), mask3);
+            let packed = _mm512_or_si512(
+                _mm512_or_si512(p0, _mm512_slli_epi32(p1, 8)),
+                _mm512_or_si512(_mm512_slli_epi32(p2, 16), _mm512_slli_epi32(p3, 24)),
+            );
+            let u = _mm512_shuffle_epi8(lut, packed);
+            $acc = _mm512_dpbusd_epi32($acc, u, acts);
+            $asum = _mm512_dpbusd_epi32($asum, ones_u8, acts);
+        }};
+    }
 
     let chunks64 = total_elems / 64;
-    let step16 = chunks64 / 16 * 16;
     let mut idx = 0usize;
 
-    while idx < step16 {
+    // 8 chunks per step with 8 product + 8 sum accumulators: 16 independent
+    // `vpdpbusd` chains hide its latency.
+    let mut acc = [zero; 8];
+    let mut asum = [zero; 8];
+    while idx + 8 <= chunks64 {
         _mm_prefetch(b_ptr.wrapping_add(idx * 16 + pf) as *const i8, _MM_HINT_NTA);
-
-        macro_rules! block {
-            ($k:expr) => {{
-                let acts = _mm512_loadu_si512(a_ptr.add(idx + $k));
-                let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(
-                    b_ptr.add((idx + $k) * 16) as *const __m128i
-                ));
-                let p0 = _mm512_and_si512(w32, mask3);
-                let p1 = _mm512_and_si512(_mm512_srli_epi32(w32, 2), mask3);
-                let p2 = _mm512_and_si512(_mm512_srli_epi32(w32, 4), mask3);
-                let p3 = _mm512_and_si512(_mm512_srli_epi32(w32, 6), mask3);
-                let packed = _mm512_or_si512(
-                    _mm512_or_si512(p0, _mm512_slli_epi32(p1, 8)),
-                    _mm512_or_si512(_mm512_slli_epi32(p2, 16), _mm512_slli_epi32(p3, 24)),
-                );
-                let w = _mm512_shuffle_epi8(lut, packed);
-                let pos_mask = _mm512_cmp_epi8_mask(w, zero, 6);
-                let zero_mask = _mm512_cmp_epi8_mask(w, zero, 0);
-                let neg_a = _mm512_sub_epi8(zero, acts);
-                let blend = _mm512_mask_blend_epi8(pos_mask, neg_a, acts);
-                let sa = _mm512_mask_mov_epi8(blend, zero_mask, zero);
-                // dpbusd: acc += Σ (u8=1) * (i8=sa) = Σ sa, one i32 per 4 bytes.
-                acc[$k] = _mm512_dpbusd_epi32(acc[$k], ones_u8, sa);
-            }};
-        }
-
-        block!(0);
-        block!(1);
-        block!(2);
-        block!(3);
-        block!(4);
-        block!(5);
-        block!(6);
-        block!(7);
-        block!(8);
-        block!(9);
-        block!(10);
-        block!(11);
-        block!(12);
-        block!(13);
-        block!(14);
-        block!(15);
-
-        idx += 16;
+        chunk!(idx, acc[0], asum[0]);
+        chunk!(idx + 1, acc[1], asum[1]);
+        chunk!(idx + 2, acc[2], asum[2]);
+        chunk!(idx + 3, acc[3], asum[3]);
+        chunk!(idx + 4, acc[4], asum[4]);
+        chunk!(idx + 5, acc[5], asum[5]);
+        chunk!(idx + 6, acc[6], asum[6]);
+        chunk!(idx + 7, acc[7], asum[7]);
+        idx += 8;
     }
-
-    // Merge the 16 accumulators.
-    let mut merged = acc[0];
-    for v in &acc[1..] {
-        merged = _mm512_add_epi32(merged, *v);
-    }
-
-    // Cleanup: remaining chunks (< 16) accumulate into `merged`.
-    while idx < chunks64 {
+    // Remaining chunks (< 8) still spread over independent accumulators.
+    if idx + 4 <= chunks64 {
         _mm_prefetch(b_ptr.wrapping_add(idx * 16 + pf) as *const i8, _MM_HINT_NTA);
-        let acts = _mm512_loadu_si512(a_ptr.add(idx));
-        let w32 = _mm512_cvtepu8_epi32(_mm_loadu_si128(b_ptr.add(idx * 16) as *const __m128i));
-        let p0 = _mm512_and_si512(w32, mask3);
-        let p1 = _mm512_and_si512(_mm512_srli_epi32(w32, 2), mask3);
-        let p2 = _mm512_and_si512(_mm512_srli_epi32(w32, 4), mask3);
-        let p3 = _mm512_and_si512(_mm512_srli_epi32(w32, 6), mask3);
-        let packed = _mm512_or_si512(
-            _mm512_or_si512(p0, _mm512_slli_epi32(p1, 8)),
-            _mm512_or_si512(_mm512_slli_epi32(p2, 16), _mm512_slli_epi32(p3, 24)),
-        );
-        let w = _mm512_shuffle_epi8(lut, packed);
-        let pos_mask = _mm512_cmp_epi8_mask(w, zero, 6);
-        let zero_mask = _mm512_cmp_epi8_mask(w, zero, 0);
-        let neg_a = _mm512_sub_epi8(zero, acts);
-        let blend = _mm512_mask_blend_epi8(pos_mask, neg_a, acts);
-        let sa = _mm512_mask_mov_epi8(blend, zero_mask, zero);
-        merged = _mm512_dpbusd_epi32(merged, ones_u8, sa);
-        idx += 1;
+        chunk!(idx, acc[0], asum[0]);
+        chunk!(idx + 1, acc[1], asum[1]);
+        chunk!(idx + 2, acc[2], asum[2]);
+        chunk!(idx + 3, acc[3], asum[3]);
+        idx += 4;
+    }
+    if idx + 2 <= chunks64 {
+        chunk!(idx, acc[4], asum[4]);
+        chunk!(idx + 1, acc[5], asum[5]);
+        idx += 2;
+    }
+    if idx < chunks64 {
+        chunk!(idx, acc[6], asum[6]);
     }
 
-    let mut tmp = [0i32; 16];
-    _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, merged);
-    let mut total = tmp.iter().sum::<i32>();
+    let a01 = _mm512_add_epi32(acc[0], acc[1]);
+    let a23 = _mm512_add_epi32(acc[2], acc[3]);
+    let a45 = _mm512_add_epi32(acc[4], acc[5]);
+    let a67 = _mm512_add_epi32(acc[6], acc[7]);
+    let s01 = _mm512_add_epi32(asum[0], asum[1]);
+    let s23 = _mm512_add_epi32(asum[2], asum[3]);
+    let s45 = _mm512_add_epi32(asum[4], asum[5]);
+    let s67 = _mm512_add_epi32(asum[6], asum[7]);
+    let prod = _mm512_add_epi32(_mm512_add_epi32(a01, a23), _mm512_add_epi32(a45, a67));
+    let sum = _mm512_add_epi32(_mm512_add_epi32(s01, s23), _mm512_add_epi32(s45, s67));
+    // No lane can overflow: each chunk adds at most 4 · 2 · 128 per lane.
+    let mut total = _mm512_reduce_add_epi32(_mm512_sub_epi32(prod, sum));
     total += pack4_tail(a_i8, b_pack4, chunks64 * 64, total_elems);
     total
 }
