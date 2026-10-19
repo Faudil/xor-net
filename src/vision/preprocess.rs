@@ -106,7 +106,7 @@ impl Preprocess {
         let mut out =
             tf_legacy_resize_bicubic(rgb, width, off_y, off_x, crop, crop, self.size, self.size);
         out.data.par_chunks_mut(3 * 1024).for_each(|chunk| {
-            for px in chunk.chunks_exact_mut(3) {
+            for px in chunk.as_chunks_mut::<3>().0 {
                 for ((v, &m), &s) in px.iter_mut().zip(&self.mean).zip(&self.std) {
                     *v = (*v - m) / s;
                 }
@@ -225,7 +225,7 @@ pub fn tf_legacy_resize_bicubic(
             let r = ty.idx.map(|y| {
                 &rgb[(off_y + y) * stride + off_x * 3..(off_y + y) * stride + (off_x + crop_w) * 3]
             });
-            for (o, tx) in orow.chunks_exact_mut(3).zip(&xs) {
+            for (o, tx) in orow.as_chunks_mut::<3>().0.iter_mut().zip(&xs) {
                 for (c, oc) in o.iter_mut().enumerate() {
                     // TF interpolates along y for each of the 4 x taps, then
                     // along x, in exactly this order.

@@ -110,8 +110,7 @@ fn fast_qwen3_matches_reference() -> anyhow::Result<()> {
         .flatten_all()?
         .to_vec1()?;
     let mut f = fast.forward_tokens(&ids, 0, &mut st)?;
-    let mut pos = ids.len();
-    for step in 0..=steps {
+    for (step, pos) in (0..=steps).zip(ids.len()..) {
         let s = compare(&r, &f);
         eprintln!(
             "step {step:2}: max|Δlogit| {:.4} (rel {:.4}) KL {:.2e} top1 {} ref-top1 rank in fast {}",
@@ -128,7 +127,6 @@ fn fast_qwen3_matches_reference() -> anyhow::Result<()> {
             .flatten_all()?
             .to_vec1()?;
         f = fast.forward_tokens(&[next], pos, &mut st)?;
-        pos += 1;
     }
 
     // Free-running greedy decode of the fast model from the same prompt.

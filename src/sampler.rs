@@ -219,8 +219,8 @@ fn exp_inplace(v: &mut [f32], max: f32) -> f32 {
 #[inline(always)]
 fn exp_inplace_lanes(v: &mut [f32], max: f32) -> f32 {
     let mut acc = [0.0f32; LANES];
-    let mut chunks = v.chunks_exact_mut(LANES);
-    for c in &mut chunks {
+    let (chunks, rem) = v.as_chunks_mut::<LANES>();
+    for c in chunks {
         for (x, a) in c.iter_mut().zip(acc.iter_mut()) {
             let e = fast_exp_neg(*x - max);
             *x = e;
@@ -228,7 +228,7 @@ fn exp_inplace_lanes(v: &mut [f32], max: f32) -> f32 {
         }
     }
     let mut sum = 0.0f32;
-    for x in chunks.into_remainder() {
+    for x in rem {
         let e = fast_exp_neg(*x - max);
         *x = e;
         sum += e;
@@ -259,8 +259,8 @@ fn scale_sanitize_max(v: &mut [f32], inv_temp: f32) -> f32 {
 #[inline(always)]
 fn scale_sanitize_max_lanes(v: &mut [f32], inv_temp: f32) -> f32 {
     let mut m = [f32::NEG_INFINITY; LANES];
-    let mut chunks = v.chunks_exact_mut(LANES);
-    for c in &mut chunks {
+    let (chunks, rem) = v.as_chunks_mut::<LANES>();
+    for c in chunks {
         for (x, mx) in c.iter_mut().zip(m.iter_mut()) {
             let y = sanitize(*x * inv_temp);
             *x = y;
@@ -268,7 +268,7 @@ fn scale_sanitize_max_lanes(v: &mut [f32], inv_temp: f32) -> f32 {
         }
     }
     let mut mx = f32::NEG_INFINITY;
-    for x in chunks.into_remainder() {
+    for x in rem {
         let y = sanitize(*x * inv_temp);
         *x = y;
         mx = fmax(mx, y);
@@ -286,16 +286,13 @@ fn max_of(v: &[f32]) -> f32 {
 #[inline(always)]
 fn max_of_lanes(v: &[f32]) -> f32 {
     let mut m = [f32::NEG_INFINITY; LANES];
-    let mut chunks = v.chunks_exact(LANES);
-    for c in &mut chunks {
+    let (chunks, rem) = v.as_chunks::<LANES>();
+    for c in chunks {
         for (x, mx) in c.iter().zip(m.iter_mut()) {
             *mx = fmax(*mx, *x);
         }
     }
-    let tail = chunks
-        .remainder()
-        .iter()
-        .fold(f32::NEG_INFINITY, |a, &b| fmax(a, b));
+    let tail = rem.iter().fold(f32::NEG_INFINITY, |a, &b| fmax(a, b));
     m.iter().fold(tail, |a, &b| fmax(a, b))
 }
 
@@ -322,13 +319,13 @@ fn masked_sum(w: &[f32], thr: f32) -> f32 {
 #[inline(always)]
 fn masked_sum_lanes(w: &[f32], thr: f32) -> f32 {
     let mut acc = [0.0f32; LANES];
-    let mut chunks = w.chunks_exact(LANES);
-    for c in &mut chunks {
+    let (chunks, rem) = w.as_chunks::<LANES>();
+    for c in chunks {
         for (x, a) in c.iter().zip(acc.iter_mut()) {
             *a += if *x >= thr { *x } else { 0.0 };
         }
     }
-    let tail: f32 = chunks.remainder().iter().filter(|&&x| x >= thr).sum();
+    let tail: f32 = rem.iter().filter(|&&x| x >= thr).sum();
     tail + acc.iter().sum::<f32>()
 }
 
@@ -369,8 +366,8 @@ fn masked_sum_count(w: &[f32], thr: f32) -> (f32, usize) {
 fn masked_sum_count_lanes(w: &[f32], thr: f32) -> (f32, usize) {
     let mut acc = [0.0f32; LANES];
     let mut cnt = [0u32; LANES];
-    let mut chunks = w.chunks_exact(LANES);
-    for c in &mut chunks {
+    let (chunks, rem) = w.as_chunks::<LANES>();
+    for c in chunks {
         for ((x, a), n) in c.iter().zip(acc.iter_mut()).zip(cnt.iter_mut()) {
             let keep = *x >= thr;
             *a += if keep { *x } else { 0.0 };
@@ -379,7 +376,7 @@ fn masked_sum_count_lanes(w: &[f32], thr: f32) -> (f32, usize) {
     }
     let mut s = acc.iter().sum::<f32>();
     let mut n = cnt.iter().map(|&c| c as usize).sum::<usize>();
-    for &x in chunks.remainder() {
+    for &x in rem {
         if x >= thr {
             s += x;
             n += 1;

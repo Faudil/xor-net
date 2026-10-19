@@ -22,8 +22,10 @@ fn convert_to_f32_vec(bytes: &[u8], dtype: Dtype) -> anyhow::Result<Vec<f32>> {
                 anyhow::bail!("F32 bytes length not multiple of 4: {}", bytes.len());
             }
             Ok(bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| f32::from_le_bytes(c))
                 .collect())
         }
         Dtype::BF16 => {
@@ -31,8 +33,10 @@ fn convert_to_f32_vec(bytes: &[u8], dtype: Dtype) -> anyhow::Result<Vec<f32>> {
                 anyhow::bail!("BF16 bytes length not multiple of 2: {}", bytes.len());
             }
             Ok(bytes
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| f32::from_bits((u16::from_le_bytes(c) as u32) << 16))
                 .collect())
         }
         Dtype::F16 => {
@@ -41,8 +45,8 @@ fn convert_to_f32_vec(bytes: &[u8], dtype: Dtype) -> anyhow::Result<Vec<f32>> {
             }
             let count = bytes.len() / 2;
             let mut out = vec![0.0f32; count];
-            for (o, c) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-                let f16_val = u16::from_le_bytes([c[0], c[1]]);
+            for (o, &c) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+                let f16_val = u16::from_le_bytes(c);
                 let sign = (f16_val & 0x8000) as u32;
                 let exp = (f16_val & 0x7c00) >> 10;
                 let mant = f16_val & 0x03ff;

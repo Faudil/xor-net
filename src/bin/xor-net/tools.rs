@@ -286,7 +286,7 @@ fn info_gguf(path: &Path, info: &mut Info) -> anyhow::Result<()> {
         *by_type.entry(gguf_dtype_name(t.dtype_u32)).or_default() += t.elem_count as u64;
     }
     let mut q: Vec<_> = by_type.into_iter().collect();
-    q.sort_by(|a, b| b.1.cmp(&a.1));
+    q.sort_by_key(|e| std::cmp::Reverse(e.1));
     info.row(
         "quantization",
         q.iter()

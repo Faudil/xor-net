@@ -398,7 +398,13 @@ impl Q8Acts {
         }
         if block == SUB {
             self.lane_d.resize(n * cols / 4, 0.0);
-            for (ld, &d) in self.lane_d.chunks_exact_mut(SUB / 4).zip(&self.d) {
+            for (ld, &d) in self
+                .lane_d
+                .as_chunks_mut::<{ SUB / 4 }>()
+                .0
+                .iter_mut()
+                .zip(&self.d)
+            {
                 ld.fill(d);
             }
         } else {

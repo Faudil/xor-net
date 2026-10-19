@@ -831,7 +831,9 @@ fn image_from_py(
         return match shape.as_slice() {
             [h, w, 3] => Ok((data, *w, *h)),
             [h, w, 4] => Ok((
-                data.chunks_exact(4)
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
                     .flat_map(|p| [p[0], p[1], p[2]])
                     .collect(),
                 *w,

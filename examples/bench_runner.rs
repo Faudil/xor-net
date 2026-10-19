@@ -254,16 +254,14 @@ fn run_single(
     let mut nt = sampler.sample(&mut ld, &toks)?;
     toks.push(nt);
 
-    let mut idx = prompt_len;
     let t_decode = Instant::now();
     let mut gen_n = 1usize;
     let mut eos_hit = eos.contains(&nt);
-    for _ in 1..tokens {
+    for idx in prompt_len..prompt_len + tokens.saturating_sub(1) {
         let logits = model.forward(&[nt], idx, &mut cache)?;
         let mut ld = logits.into_data();
         nt = sampler.sample(&mut ld, &toks)?;
         toks.push(nt);
-        idx += 1;
         gen_n += 1;
         if eos.contains(&nt) {
             eos_hit = true;

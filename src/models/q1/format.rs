@@ -317,8 +317,10 @@ impl XqReader {
         let b = self.buf(r)?;
         anyhow::ensure!(r.1.is_multiple_of(4), ".xq1: f32 tensor length");
         Ok(b.as_slice()
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
             .collect())
     }
 

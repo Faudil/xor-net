@@ -102,14 +102,14 @@ fn finish(matches: u64, a: &[u8], b: &[u8], total_bits: usize) -> f32 {
 pub fn xnor_dot_product_scalar(a: &[u8], b: &[u8], total_bits: usize) -> f32 {
     check_xnor_args(a, b, total_bits);
     let mut matches = 0u64;
-    let mut ca = a.chunks_exact(8);
-    let mut cb = b.chunks_exact(8);
-    for (x, y) in (&mut ca).zip(&mut cb) {
-        let va = u64::from_le_bytes(x.try_into().unwrap());
-        let vb = u64::from_le_bytes(y.try_into().unwrap());
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (x, y) in ca.iter().zip(cb) {
+        let va = u64::from_le_bytes(*x);
+        let vb = u64::from_le_bytes(*y);
         matches += (!(va ^ vb)).count_ones() as u64;
     }
-    for (&x, &y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (&x, &y) in ra.iter().zip(rb) {
         matches += (!(x ^ y)).count_ones() as u64;
     }
     finish(matches, a, b, total_bits)

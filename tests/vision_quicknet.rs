@@ -21,8 +21,10 @@ fn f32s(st: &SafeTensors, name: &str) -> (Vec<f32>, Vec<usize>) {
     let t = st.tensor(name).unwrap();
     (
         t.data()
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| f32::from_le_bytes(b))
             .collect(),
         t.shape().to_vec(),
     )
@@ -169,8 +171,10 @@ fn quicknet_layerwise() {
             };
             let r: Vec<f32> = t
                 .data()
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| f32::from_le_bytes(b))
                 .collect();
             let d = max_abs_diff(&y.data, &r);
             // Sign disagreements (what the next binary layer would see).

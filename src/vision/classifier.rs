@@ -27,8 +27,10 @@ impl TensorSource for StSource<'_> {
         );
         let v = t
             .data()
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| f32::from_le_bytes(b))
             .collect();
         Ok((v, t.shape().to_vec()))
     }
@@ -45,8 +47,10 @@ impl TensorSource for StSource<'_> {
         );
         let v = t
             .data()
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&b| u64::from_le_bytes(b))
             .collect();
         Ok((v, t.shape().to_vec()))
     }
