@@ -66,13 +66,7 @@ path = "examples/dump_logits_for_compare.rs"
 name = "check_8b_accuracy"
 path = "examples/check_8b_accuracy.rs"
 
-[[example]]
-name = "run_bonsai"
-path = "examples/run_bonsai.rs"
 
-[[example]]
-name = "load_bonsai"
-path = "examples/load_bonsai.rs"
 
 [[example]]
 name = "batch_bench"
@@ -107,6 +101,10 @@ name = "convert_sparse"
 path = "src/bin/convert_sparse.rs"
 
 [[bin]]
+name = "bonsai_convert"
+path = "src/bin/bonsai_convert.rs"
+
+[[bin]]
 name = "xor-net-server"
 path = "server/main.rs"
 
@@ -119,6 +117,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokenizers = "0.23.1"
 ahash = "0.8"
+half = "2.7"
 safetensors = "0.5.2"
 memmap2 = "0.9.11"
 minijinja = { version = "2.24", features = ["json", "loader", "loop_controls", "preserve_order"] }
@@ -147,29 +146,21 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
-[[example]]
-name = "bench_bonsai27b"
-path = "examples/bench_bonsai27b.rs"
 
-[[example]]
-name = "gemv_bench"
-path = "examples/gemv_bench.rs"
 
 [[example]]
 name = "bw_bench"
 path = "examples/bw_bench.rs"
 
-[[example]]
-name = "check_bonsai27b"
-path = "examples/check_bonsai27b.rs"
 
-[[example]]
-name = "debug_bonsai27b"
-path = "examples/debug_bonsai27b.rs"
 
 [[example]]
 name = "bonsai_generate"
 path = "examples/bonsai_generate.rs"
+
+[[example]]
+name = "bonsai_bench"
+path = "examples/bonsai_bench.rs"
 
 [profile.dev]
 debug = "line-tables-only"

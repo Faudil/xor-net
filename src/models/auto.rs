@@ -1,5 +1,7 @@
+use crate::generation::Generator;
 use crate::loader::{SafeTensorLoader, SafeTensorRepo, sparse_loader::SparseFile};
 use crate::models::llama::{Config, Llama, LlamaConfig};
+use crate::models::traits::CausalLM;
 use crate::nn::QuantizationConfig;
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use std::path::Path;
@@ -7,6 +9,24 @@ use std::path::Path;
 pub struct AutoModelForCausalLM;
 
 impl AutoModelForCausalLM {
+    /// Load a 1-bit Bonsai model from a `.gguf` file (dispatching on
+    /// `general.architecture`: `qwen3` → dense, `qwen35` → hybrid) or from a
+    /// converted `.xq1` file (see [`crate::models::q1::format`]).
+    pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Box<dyn CausalLM>> {
+        crate::models::q1::load_causal_lm(path)
+    }
+
+    /// Like [`Self::from_file`], wrapped in a ready-to-use [`Generator`]
+    /// with the model's tokenizer, chat template and EOS ids. The tokenizer
+    /// is taken from `tokenizer_json` if given, else from the tokenizer
+    /// embedded in the model file (`tokenizer.ggml.*` metadata).
+    pub fn generator_from_file(
+        path: impl AsRef<Path>,
+        tokenizer_json: Option<&Path>,
+    ) -> anyhow::Result<Generator> {
+        crate::models::q1::load_generator(path, tokenizer_json)
+    }
+
     pub fn from_local(
         model_dir: &Path,
         quantization_config: QuantizationConfig,

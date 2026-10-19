@@ -373,7 +373,7 @@ pub fn dequantize_q1_0(data: &[u8], elem_count: usize) -> Vec<f32> {
 /// Dequantize upstream Q1_0 (type 41): 128 elements, 18 bytes per block.
 /// Layout: [fp16_scale: 2B LE][signs: 16B (128 bits)]
 /// Note: scale comes FIRST, then signs.
-/// Encoding: bit=0 → +scale, bit=1 → −scale
+/// Encoding (ggml `dequantize_row_q1_0`): bit=1 → +scale, bit=0 → −scale.
 pub fn dequantize_q1_0_upstream(data: &[u8], elem_count: usize) -> Vec<f32> {
     const BLOCK_ELEMS: usize = 128;
     const BLOCK_BYTES: usize = 18;
@@ -389,7 +389,7 @@ pub fn dequantize_q1_0_upstream(data: &[u8], elem_count: usize) -> Vec<f32> {
             let byte_idx = i >> 3;
             let bit_idx = i & 7;
             let bit = (signs[byte_idx] >> bit_idx) & 1;
-            out[base_out + i] = if bit == 0 { scale } else { -scale };
+            out[base_out + i] = if bit == 1 { scale } else { -scale };
         }
     }
     out
@@ -584,6 +584,29 @@ impl GgufFile {
         Ok(&self.mmap[start as usize..end as usize])
     }
 
+    /// Drop the resident pages of tensor `name` from this mapping (a hint:
+    /// call it after the tensor was copied/repacked so that loading a model
+    /// does not keep both copies resident). Later reads stay valid: the pages
+    /// are re-read from the file.
+    pub fn release_tensor(&self, name: &str) {
+        #[cfg(unix)]
+        if let Some(info) = self.metadata.tensor_infos.get(name) {
+            let start = (self.metadata.tensor_data_offset + info.offset) as usize;
+            // SAFETY: the mapping is read-only and file-backed (`Mmap::map`),
+            // so MADV_DONTNEED only discards clean pages that are re-faulted
+            // from the unchanged file on the next access; no data changes.
+            unsafe {
+                let _ = self.mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    start,
+                    info.byte_size as usize,
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = name;
+    }
+
     /// Dequantize a tensor to f32. Handles standard dtypes (F32, F16, BF16)
     /// and PRISM 1-bit types (42, 43).
     pub fn dequantize_tensor(&self, name: &str) -> anyhow::Result<Vec<f32>> {
@@ -689,56 +712,116 @@ pub fn dequantize_data(data: &[u8], dtype: u32, elem_count: usize) -> anyhow::Re
 // Tokenizer extraction from GGUF metadata
 // ---------------------------------------------------------------------------
 
-/// Build a BPE tokenizer from the tokenizer data embedded in the GGUF
-/// (tokenizer.ggml.tokens / merges / special token ids).
-pub fn build_tokenizer(gguf: &GgufFile) -> anyhow::Result<tokenizers::Tokenizer> {
-    use tokenizers::models::bpe::BpeBuilder;
-    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+/// GGUF `tokenizer.ggml.token_type` values (llama.cpp `llama_token_type`).
+const TOKEN_TYPE_CONTROL: u32 = 3;
+const TOKEN_TYPE_USER_DEFINED: u32 = 4;
 
+/// Pre-tokenizer split regex for a `tokenizer.ggml.pre` value.
+fn bpe_pre_regex(pre: &str) -> anyhow::Result<&'static str> {
+    Ok(match pre {
+        // Qwen3.5 (adds combining marks \p{M} to the letter classes)
+        "qwen35" => {
+            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+        }
+        // Qwen2 / Qwen3
+        "qwen2" => {
+            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+        }
+        // Llama 3
+        "llama-bpe" | "llama3" => {
+            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+        }
+        other => anyhow::bail!(
+            "unsupported GGUF tokenizer pre-tokenizer {other:?}; pass a tokenizer.json instead"
+        ),
+    })
+}
+
+/// Build a byte-level BPE tokenizer (GGUF `tokenizer.ggml.model == "gpt2"`)
+/// from the tokenizer embedded in the GGUF metadata.
+///
+/// The result is equivalent to the model's HF `tokenizer.json`: NFC
+/// normalizer, the regex split of `tokenizer.ggml.pre` followed by the
+/// byte-level mapping, byte-level decoder, and every CONTROL token
+/// registered as a special added token (USER_DEFINED tokens as non-special
+/// added tokens), so `<|im_start|>` etc. are matched atomically and
+/// `skip_special_tokens` drops exactly the control tokens.
+pub fn build_tokenizer(gguf: &GgufFile) -> anyhow::Result<tokenizers::Tokenizer> {
     let meta = &gguf.metadata.metadata;
+    let model = meta
+        .get("tokenizer.ggml.model")
+        .and_then(|v| v.to_string())
+        .unwrap_or("gpt2");
+    anyhow::ensure!(
+        model == "gpt2",
+        "unsupported GGUF tokenizer model {model:?}; pass a tokenizer.json instead"
+    );
+    let pre = meta
+        .get("tokenizer.ggml.pre")
+        .and_then(|v| v.to_string())
+        .unwrap_or("default");
+    let regex = bpe_pre_regex(pre)?;
 
     let tokens = meta
         .get("tokenizer.ggml.tokens")
         .and_then(|v| v.to_string_vec())
         .ok_or_else(|| anyhow::anyhow!("missing tokenizer.ggml.tokens"))?;
-
-    let mut vocab: ahash::AHashMap<String, u32> = ahash::AHashMap::default();
-    for (i, t) in tokens.iter().enumerate() {
-        vocab.insert(t.to_string(), i as u32);
-    }
-
-    let mut merges: Vec<(String, String)> = Vec::new();
-    if let Some(merge_strs) = meta
+    let types: Vec<u32> = match meta.get("tokenizer.ggml.token_type") {
+        Some(Value::Array(a)) => a.iter().map(|v| v.to_u32().unwrap_or(1)).collect(),
+        _ => vec![1; tokens.len()],
+    };
+    anyhow::ensure!(types.len() == tokens.len(), "token_type length mismatch");
+    let merges: Vec<&str> = meta
         .get("tokenizer.ggml.merges")
         .and_then(|v| v.to_string_vec())
-    {
-        for m in merge_strs {
-            // merges are stored as "a b"
-            if let Some((a, b)) = m.split_once(' ') {
-                merges.push((a.to_string(), b.to_string()));
-            }
+        .ok_or_else(|| anyhow::anyhow!("missing tokenizer.ggml.merges"))?;
+
+    let mut vocab = serde_json::Map::with_capacity(tokens.len());
+    let mut added = Vec::new();
+    for (i, (t, &ty)) in tokens.iter().zip(&types).enumerate() {
+        if !vocab.contains_key(*t) {
+            vocab.insert(t.to_string(), serde_json::json!(i));
+        }
+        if ty == TOKEN_TYPE_CONTROL || ty == TOKEN_TYPE_USER_DEFINED {
+            added.push(serde_json::json!({
+                "id": i, "content": t, "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": ty == TOKEN_TYPE_CONTROL,
+            }));
         }
     }
-
-    let bpe = BpeBuilder::default()
-        .vocab_and_merges(vocab, merges)
-        .build()
-        .map_err(|e| anyhow::anyhow!("BPE build: {e}"))?;
-
-    // Qwen-style: byte-level pretokenizer with prefix space
-    let byte_level = ByteLevel::new(true, true, true);
-    let mut tokenizer = tokenizers::Tokenizer::new(bpe);
-    tokenizer.with_pre_tokenizer(Some(byte_level));
-
-    // Add special tokens (for decode round-trips)
-    let specials = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"];
-    let added: Vec<tokenizers::AddedToken> = specials
+    let merges: Vec<serde_json::Value> = merges
         .iter()
-        .map(|s| tokenizers::AddedToken::from(s.to_string(), true))
-        .collect();
-    let _ = tokenizer.add_special_tokens(added);
-
-    Ok(tokenizer)
+        .map(|m| {
+            let (a, b) = m
+                .split_once(' ')
+                .ok_or_else(|| anyhow::anyhow!("malformed merge {m:?}"))?;
+            Ok(serde_json::json!([a, b]))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let byte_level = serde_json::json!({
+        "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false
+    });
+    let json = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": added,
+        "normalizer": {"type": "NFC"},
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+            {"type": "Split", "pattern": {"Regex": regex}, "behavior": "Isolated", "invert": false},
+            byte_level.clone(),
+        ]},
+        "post_processor": byte_level.clone(),
+        "decoder": byte_level,
+        "model": {
+            "type": "BPE", "dropout": null, "unk_token": null,
+            "continuing_subword_prefix": "", "end_of_word_suffix": "",
+            "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+            "vocab": vocab, "merges": merges,
+        },
+    });
+    tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&json)?)
+        .map_err(|e| anyhow::anyhow!("building tokenizer from GGUF metadata: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -855,24 +938,24 @@ mod tests {
 
     #[test]
     fn test_dequantize_q1_0_upstream() {
-        // One block: 128 elements, scale=2.0, all bits=0 → +scale
+        // One block: 128 elements, scale=2.0, all bits=0 → -scale (ggml)
         let mut data = vec![0u8; 18];
         data[0] = 0x00; // fp16 scale = 2.0
         data[1] = 0x40;
-        // bits all 0 → +scale
+        // bits all 0 → -scale
         let out = dequantize_q1_0_upstream(&data, 128);
         assert_eq!(out.len(), 128);
         for &val in &out {
-            assert!((val - 2.0).abs() < 1e-6, "expected +2.0 got {val}");
+            assert!((val + 2.0).abs() < 1e-6, "expected -2.0 got {val}");
         }
 
-        // All bits=1 → -scale
+        // All bits=1 → +scale
         let mut data = vec![0xFFu8; 18];
         data[0] = 0x00; // fp16 scale = 2.0
         data[1] = 0x40;
         let out = dequantize_q1_0_upstream(&data, 128);
         for &val in &out {
-            assert!((val - (-2.0)).abs() < 1e-6, "expected -2.0 got {val}");
+            assert!((val - 2.0).abs() < 1e-6, "expected +2.0 got {val}");
         }
     }
 

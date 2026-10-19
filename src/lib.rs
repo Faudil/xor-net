@@ -17,19 +17,19 @@ pub mod python;
 pub use bit1::layers::BitLinear;
 pub use bit1_58::layers::TernaryLinear;
 pub use bit1_58::quantization::TernaryPackType;
-pub use loader::gguf::{BonsaiConfig, GgufFile, is_prism_dtype};
-pub use loader::{SafeTensorLoader, SafeTensorRepo};
-pub use models::auto::AutoModelForCausalLM;
-pub use models::bonsai::{BonsaiCache, BonsaiModel};
-pub use models::bonsai_qwen35::{BonsaiQwen35Cache, BonsaiQwen35Config, BonsaiQwen35Model};
-pub use models::llama::{Activation, Cache, Config, Llama, LlamaConfig};
-pub use nn::{DynamicLinear, QuantizationConfig};
 pub use generation::{
     ChatMessage, ChatTemplate, FinishReason, Generation, GenerationError, GenerationParams,
     Generator, Timings, Usage,
 };
+pub use loader::gguf::{BonsaiConfig, GgufFile, is_prism_dtype};
+pub use loader::{SafeTensorLoader, SafeTensorRepo};
+pub use models::auto::AutoModelForCausalLM;
 pub use models::llama::causal_lm::LlamaCausalLM;
+pub use models::llama::{Activation, Cache, Config, Llama, LlamaConfig};
+pub use models::q1::qwen3::{Qwen3Config, Qwen3Model};
+pub use models::q1::qwen35::{Qwen35Config, Qwen35Model};
 pub use models::traits::{CausalLM, Logits, ModelState};
+pub use nn::{DynamicLinear, QuantizationConfig};
 pub use sampler::{Sampler, SamplingParams};
 pub use tensor::FastTensor;
 

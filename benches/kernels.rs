@@ -62,6 +62,32 @@ fn run<F: FnMut()>(filter: &Option<String>, name: &str, iters: usize, mut f: F) 
     );
 }
 
+/// Like [`run`], also reporting effective bandwidth for `bytes` per call.
+fn run_bw<F: FnMut()>(filter: &Option<String>, name: &str, iters: usize, bytes: usize, mut f: F) {
+    if let Some(flt) = filter
+        && !name.contains(flt.as_str())
+    {
+        return;
+    }
+    for _ in 0..(iters / 10).max(3) {
+        f();
+    }
+    let mut samples: Vec<Duration> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = Instant::now();
+        f();
+        samples.push(t.elapsed());
+    }
+    samples.sort();
+    let median = samples[samples.len() / 2];
+    println!(
+        "{:<60} median {:>10.2} us   {:>7.1} GB/s",
+        name,
+        median.as_secs_f64() * 1e6,
+        bytes as f64 / median.as_secs_f64() / 1e9
+    );
+}
+
 /// Random ternary weights packed as pack4 (codes 0b00/0b01/0b10 only).
 fn random_pack4(rng: &mut Rng, in_dim: usize, out_dim: usize) -> Vec<u8> {
     let bpr = in_dim.div_ceil(4);
@@ -151,6 +177,110 @@ fn main() {
             let out = lin.forward_with_quantized(&xs, &q, inv).unwrap();
             black_box(&out);
         });
+    }
+
+    // ── Q1_0 (1-bit Bonsai) GEMV / GEMM ──────────────────────────────────
+    {
+        use xor_net::bit1::q1_0::{ByteBuf, Isa, Q1Weight, Q8Acts, dot_rows_isa, gemm, gemv};
+        let q1 = |rng: &mut Rng, rows: usize, cols: usize, block: usize| -> Q1Weight {
+            let bits: Vec<u8> = (0..rows * cols / 8).map(|_| rng.byte()).collect();
+            let scales: Vec<u8> = (0..rows * cols / block)
+                .flat_map(|_| (0x2000u16 | (rng.byte() as u16)).to_le_bytes())
+                .collect();
+            Q1Weight::new(
+                rows,
+                cols,
+                block,
+                ByteBuf::from_vec(bits),
+                ByteBuf::from_vec(scales),
+            )
+            .unwrap()
+        };
+        // Single matrices (L3-resident after warm-up): Bonsai-1.7B shapes.
+        for &(name, rows, cols, block) in &[
+            ("qkv 4096x2048", 4096usize, 2048usize, 128usize),
+            ("gate_up 12288x2048", 12288, 2048, 128),
+            ("down 2048x6144", 2048, 6144, 128),
+            ("gate_up b32 12288x2048", 12288, 2048, 32),
+            ("lm_head 151669x2048", 151669, 2048, 128),
+        ] {
+            let w = q1(&mut rng, rows, cols, block);
+            let x: Vec<f32> = (0..cols).map(|_| rng.f32()).collect();
+            let act_blocks: &[usize] = if block == 128 { &[32, 128] } else { &[32] };
+            for &ab in act_blocks {
+                let mut acts = Q8Acts::new();
+                acts.quantize(&x, 1, cols, ab);
+                let mut out = vec![0.0f32; rows];
+                run_bw(&filter, &format!("q1_gemv {name} act{ab} (mt)"), 200, w.nbytes(), || {
+                    gemv(&w, &acts, &mut out);
+                    black_box(&out);
+                });
+                if rows <= 4096 {
+                    for isa in Isa::all_supported() {
+                        run_bw(
+                            &filter,
+                            &format!("q1_rows {name} act{ab} {isa:?} (1 thread)"),
+                            50,
+                            w.nbytes(),
+                            || {
+                                dot_rows_isa(isa, &w, 0, acts.row(0), &mut out);
+                                black_box(&out);
+                            },
+                        );
+                    }
+                }
+                if rows == 12288 && block == 128 {
+                    let n = 64;
+                    let xs: Vec<f32> = (0..n * cols).map(|_| rng.f32()).collect();
+                    let mut acts = Q8Acts::new();
+                    acts.quantize(&xs, n, cols, ab);
+                    let mut out = vec![0.0f32; n * rows];
+                    run_bw(
+                        &filter,
+                        &format!("q1_gemm {name} act{ab} n=64 (mt, weight bytes x n)"),
+                        20,
+                        w.nbytes() * n,
+                        || {
+                            gemm(&w, &acts, &mut out);
+                            black_box(&out);
+                        },
+                    );
+                }
+            }
+        }
+        // DRAM-bound decode sweep: 28 distinct layers (qkv, o, gate_up, down)
+        // of Bonsai-1.7B = 0.21 GB of weights, far beyond L3.
+        let layers: Vec<[Q1Weight; 4]> = (0..28)
+            .map(|_| {
+                [
+                    q1(&mut rng, 4096, 2048, 128),
+                    q1(&mut rng, 2048, 2048, 128),
+                    q1(&mut rng, 12288, 2048, 128),
+                    q1(&mut rng, 2048, 6144, 128),
+                ]
+            })
+            .collect();
+        let total: usize = layers.iter().flatten().map(|w| w.nbytes()).sum();
+        let x: Vec<f32> = (0..6144).map(|_| rng.f32()).collect();
+        let (mut a2k, mut a6k) = (Q8Acts::new(), Q8Acts::new());
+        a2k.quantize(&x[..2048], 1, 2048, 32);
+        a6k.quantize(&x, 1, 6144, 32);
+        let mut out = vec![0.0f32; 12288];
+        run_bw(
+            &filter,
+            "q1_gemv 1.7B 28-layer sweep act32 (mt, DRAM)",
+            30,
+            total,
+            || {
+                for l in &layers {
+                    for w in l {
+                        let a = if w.cols() == 2048 { &a2k } else { &a6k };
+                        gemv(w, a, &mut out[..w.rows()]);
+                    }
+                }
+                black_box(&out);
+            },
+        );
     }
 
     // ── Element-wise kernels ─────────────────────────────────────────────

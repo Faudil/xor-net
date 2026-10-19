@@ -1,11 +1,21 @@
+//! Reference (oracle) implementation of the dense Bonsai / Qwen3 model in
+//! candle: every projection dequantizes its GGUF Q1_0 weights to f32 and
+//! runs an f32 matmul. Very slow (~0.15 tok/s on Bonsai-1.7B) but simple;
+//! used only to validate `xor_net::models::q1::qwen3` (tests/bonsai_reference.rs).
+//!
+//! Formerly `src/models/bonsai.rs`, with two fixes so it follows HF Qwen3
+//! exactly: Q/K RMS norms are applied *before* RoPE, and YaRN rope scaling
+//! from the GGUF metadata is honoured.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use candle_core::Result as CandleResult;
 use candle_core::shape::D;
 use candle_core::{Device, Tensor};
 
-use crate::loader::gguf;
-use crate::loader::gguf::{BonsaiConfig, GgufFile};
+use xor_net::loader::gguf;
+use xor_net::loader::gguf::{BonsaiConfig, GgufFile};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -170,17 +180,16 @@ impl CausalSelfAttention {
         let k = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?;
         let v = v.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?;
 
-        // RoPE (only on full seq for prefill, single token on decode)
-        let q = apply_rotary(&q, _cos, _sin, seq_pos)?;
-        let k = apply_rotary(&k, _cos, _sin, seq_pos)?;
-
-        // Q/K norms (RMS norm on head_dim after RoPE)
+        // Q/K norms (RMS norm over head_dim), then RoPE (HF Qwen3Attention).
         let q_norm_f32 = self.q_norm.load_f32()?;
         let k_norm_f32 = self.k_norm.load_f32()?;
         let q_norm_w = Tensor::from_vec(q_norm_f32, self.head_dim, x.device())?;
         let k_norm_w = Tensor::from_vec(k_norm_f32, self.head_dim, x.device())?;
         let q = rms_norm(&q, &q_norm_w, self.rms_norm_eps)?;
         let k = rms_norm(&k, &k_norm_w, self.rms_norm_eps)?;
+
+        let q = apply_rotary(&q, _cos, _sin, seq_pos)?;
+        let k = apply_rotary(&k, _cos, _sin, seq_pos)?;
 
         // Transpose to [batch, n_heads, seq, head_dim] for cache and attention
         let q = q.transpose(1, 2)?;
@@ -347,7 +356,11 @@ pub struct BonsaiModel {
 }
 
 impl BonsaiModel {
-    pub fn from_gguf(gguf: Arc<GgufFile>, device: &Device) -> anyhow::Result<Self> {
+    pub fn from_gguf(
+        gguf: Arc<GgufFile>,
+        max_seq_len: usize,
+        device: &Device,
+    ) -> anyhow::Result<Self> {
         let config = BonsaiConfig::from_gguf_metadata(&gguf.metadata.metadata)?;
 
         let emb_info = gguf.tensor_info("token_embd.weight")?;
@@ -470,11 +483,13 @@ impl BonsaiModel {
             });
         }
 
+        let yarn = yarn_params(&gguf, &config.architecture);
         let (cos, sin) = precompute_rope(
-            config.hidden_size,
+            config.head_dim * config.num_attention_heads,
             config.num_attention_heads,
-            config.max_position_embeddings,
+            max_seq_len.min(config.max_position_embeddings),
             config.rope_theta as f64,
+            yarn,
             device,
         )?;
 
@@ -534,27 +549,69 @@ impl BonsaiModel {
 // Pre-compute RoPE
 // ---------------------------------------------------------------------------
 
+/// YaRN `(factor, original_context)` from `{arch}.rope.scaling.*`.
+fn yarn_params(g: &GgufFile, arch: &str) -> Option<(f64, f64)> {
+    let ty = g
+        .get_metadata(&format!("{arch}.rope.scaling.type"))?
+        .to_string()?;
+    if ty != "yarn" {
+        return None;
+    }
+    let factor = g
+        .get_metadata(&format!("{arch}.rope.scaling.factor"))?
+        .to_f32()? as f64;
+    let orig = g
+        .get_metadata(&format!("{arch}.rope.scaling.original_context_length"))?
+        .to_u32()? as f64;
+    Some((factor, orig))
+}
+
+/// cos/sin tables `[max_seq_len, head_dim/2]`, following HF
+/// `_compute_default_rope_parameters` / `_compute_yarn_parameters`
+/// (beta_fast = 32, beta_slow = 1, truncate = true).
 fn precompute_rope(
     hidden_size: usize,
     n_head: usize,
     max_seq_len: usize,
     theta: f64,
+    yarn: Option<(f64, f64)>,
     device: &Device,
 ) -> CandleResult<(Tensor, Tensor)> {
     let head_dim = hidden_size / n_head;
     let half = head_dim / 2;
-    let mut inv_freq = Vec::with_capacity(half);
-    for i in 0..half {
-        inv_freq.push(1.0 / theta.powf((2 * i) as f64 / head_dim as f64));
-    }
+    let dim = head_dim as f64;
+    let pos_freqs: Vec<f64> = (0..half)
+        .map(|i| theta.powf((2 * i) as f64 / dim))
+        .collect();
+    let (inv_freq, attention_factor): (Vec<f64>, f64) = match yarn {
+        Some((factor, orig)) if factor > 1.0 => {
+            let corr = |rot: f64| {
+                dim * (orig / (rot * 2.0 * std::f64::consts::PI)).ln() / (2.0 * theta.ln())
+            };
+            let low = corr(32.0).floor().max(0.0);
+            let high = corr(1.0).ceil().min(dim - 1.0);
+            let high = if low == high { high + 0.001 } else { high };
+            let inv = (0..half)
+                .map(|i| {
+                    let ramp = ((i as f64 - low) / (high - low)).clamp(0.0, 1.0);
+                    let extrapolation_factor = 1.0 - ramp;
+                    let interp = 1.0 / (factor * pos_freqs[i]);
+                    let extrap = 1.0 / pos_freqs[i];
+                    interp * (1.0 - extrapolation_factor) + extrap * extrapolation_factor
+                })
+                .collect();
+            (inv, 0.1 * factor.ln() + 1.0)
+        }
+        _ => (pos_freqs.iter().map(|p| 1.0 / p).collect(), 1.0),
+    };
 
     let mut cos_data = vec![0.0f32; max_seq_len * half];
     let mut sin_data = vec![0.0f32; max_seq_len * half];
     for pos in 0..max_seq_len {
         for i in 0..half {
             let freq = pos as f64 * inv_freq[i];
-            cos_data[pos * half + i] = freq.cos() as f32;
-            sin_data[pos * half + i] = freq.sin() as f32;
+            cos_data[pos * half + i] = (freq.cos() * attention_factor) as f32;
+            sin_data[pos * half + i] = (freq.sin() * attention_factor) as f32;
         }
     }
 
@@ -600,7 +657,6 @@ impl BonsaiCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loader::gguf::PRISM_Q1_0_UPSTREAM;
     use candle_core::Device;
 
     #[test]
@@ -793,14 +849,14 @@ mod tests {
         data[19] = 0x40; // fp16 2.0
         data[20] = 0xFF; // bits: 11111111...
 
-        let out = crate::loader::gguf::dequantize_q1_0_upstream(&data, elem_count);
+        let out = xor_net::loader::gguf::dequantize_q1_0_upstream(&data, elem_count);
         assert_eq!(out.len(), elem_count);
 
-        // Block 0: scale=1.0, bit=0 → +1.0, bit=1 → -1.0
+        // Block 0: scale=1.0, bit=1 → +1.0, bit=0 → -1.0 (ggml convention)
         // 0x55 = 01010101, LSB first: bit0=1, bit1=0, bit2=1, bit3=0, bit4=1, bit5=0, bit6=1, bit7=0
-        // → -1, +1, -1, +1, -1, +1, -1, +1
+        // → +1, -1, +1, -1, +1, -1, +1, -1
         for i in 0..8 {
-            let expected = if (i % 2) == 0 { -1.0 } else { 1.0 };
+            let expected = if (i % 2) == 0 { 1.0 } else { -1.0 };
             assert!(
                 (out[i] - expected).abs() < 1e-6,
                 "block0[{i}]: got {}, expected {}",
@@ -809,12 +865,11 @@ mod tests {
             );
         }
 
-        // Block 1: scale=2.0, bit=0 → +2.0, bit=1 → -2.0
-        // 0xFF on first byte → all bits=1 → all -2.0
+        // Block 1: scale=2.0, 0xFF on first byte → all bits=1 → all +2.0
         for i in 128..136 {
             assert!(
-                (out[i] - (-2.0)).abs() < 1e-6,
-                "block1[{i}]: got {}, expected -2.0",
+                (out[i] - 2.0).abs() < 1e-6,
+                "block1[{i}]: got {}, expected 2.0",
                 out[i]
             );
         }
@@ -823,7 +878,7 @@ mod tests {
     #[test]
     fn test_precompute_rope_inv_freq() {
         let device = &Device::Cpu;
-        let (cos, sin) = precompute_rope(2048, 16, 10, 1_000_000.0, device).unwrap();
+        let (cos, sin) = precompute_rope(2048, 16, 10, 1_000_000.0, None, device).unwrap();
         // cos shape: [10, 64] (max_seq_len=10, half=64)
         assert_eq!(cos.dims(), &[10, 64]);
         assert_eq!(sin.dims(), &[10, 64]);
