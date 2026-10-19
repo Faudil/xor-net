@@ -1,4 +1,4 @@
-//! Loader for the XorSparse on-disk container (see `SPARSE_FORMAT.md`).
+//! Loader for the XorSparse on-disk container (see `docs/formats.md`).
 //!
 //! The container is a flat, header+`blob` file: little-endian metadata followed
 //! by each tensor's sparse blob (the exact per-row layout produced by

@@ -2,13 +2,37 @@
 name = "xor-net"
 version = "0.1.0"
 edition = "2024"
+# AVX-512 intrinsics are stable since 1.89 (let-chains need 1.88).
+rust-version = "1.89"
 autoexamples = false
+autobenches = false
 license = "MIT"
+authors = ["Faudil Puttilli"]
 repository = "https://github.com/faudil/xor-net"
+documentation = "https://docs.rs/xor-net"
 description = "High-performance CPU inference engine for 1-bit and 1.58-bit quantized LLMs using SIMD-accelerated bitwise operations"
 readme = "README.md"
-categories = ["machine-learning", "science", "wasm"]
-keywords = ["llm", "quantization", "1bit", "1.58bit", "inference"]
+categories = ["science", "algorithms"]
+keywords = ["llm", "quantization", "1bit", "inference", "simd"]
+# Only what is needed to build the library, binaries, examples, tests and
+# benches; models/, scripts/, bench logs and local caches stay out of the
+# published crate.
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/src/**/*.rs",
+    "/server/**/*.rs",
+    "/examples/**/*.rs",
+    "/benches/**/*.rs",
+    "/tests/**/*.rs",
+]
+
+[package.metadata.docs.rs]
+# `python` needs a Python toolchain and `cli` only adds binaries.
+no-default-features = true
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
 [[example]]
 name = "run_3b"
@@ -19,36 +43,16 @@ name = "run_2b"
 path = "examples/run_2b.rs"
 
 [[example]]
-name = "run_benchmark"
-path = "examples/run_benchmark.rs"
-
-[[example]]
 name = "simple_usage"
 path = "examples/simple_usage.rs"
-
-[[example]]
-name = "jepa_policy"
-path = "examples/jepa_policy.rs"
-
-[[example]]
-name = "bench_layer"
-path = "examples/bench_layer.rs"
 
 [[example]]
 name = "bench_memory"
 path = "examples/bench_memory.rs"
 
 [[example]]
-name = "load_test"
-path = "examples/load_test.rs"
-
-[[example]]
 name = "run_llama3_8b_158"
 path = "examples/run_llama3_8b_158.rs"
-
-[[example]]
-name = "dump_logits"
-path = "examples/dump_logits.rs"
 
 [[example]]
 name = "chat"
@@ -66,8 +70,6 @@ path = "examples/dump_logits_for_compare.rs"
 name = "check_8b_accuracy"
 path = "examples/check_8b_accuracy.rs"
 
-
-
 [[example]]
 name = "batch_bench"
 path = "examples/batch_bench.rs"
@@ -77,20 +79,12 @@ name = "bench_runner"
 path = "examples/bench_runner.rs"
 
 [[example]]
-name = "test_prompt"
-path = "examples/test_prompt.rs"
-
-[[example]]
 name = "classify"
 path = "examples/classify.rs"
 
 [[example]]
 name = "classify_kernels"
 path = "examples/classify_kernels.rs"
-
-[[bench]]
-name = "bench_simd"
-harness = false
 
 [[bench]]
 name = "kernels"
@@ -108,10 +102,20 @@ path = "src/bin/bonsai_convert.rs"
 name = "xor-net-server"
 path = "server/main.rs"
 
+# The `xor-net` command-line tool (run / chat / convert / bench / info /
+# classify). Needs the `cli` feature for image decoding and Ctrl-C handling:
+#   cargo install --path . --features cli
+[[bin]]
+name = "xor-net"
+path = "src/bin/xor-net/main.rs"
+required-features = ["cli"]
+
 [dependencies]
 anyhow = "1.0.103"
 candle-core = "0.11.0"
-hf-hub = "0.5.0"
+# Blocking (ureq + rustls) client only: no tokio/reqwest and no OpenSSL, so
+# wheels and binaries carry no system TLS dependency.
+hf-hub = { version = "0.5.0", default-features = false, features = ["ureq"] }
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -123,6 +127,10 @@ memmap2 = "0.9.11"
 minijinja = { version = "2.24", features = ["json", "loader", "loop_controls", "preserve_order"] }
 minijinja-contrib = { version = "2.24", features = ["pycompat"] }
 pyo3 ={ version = "0.23", features = ["extension-module", "abi3-py310", "generate-import-lib"], optional = true }
+# CLI / Python only (never pulled into the core library): image decoding for
+# `xor-net classify` / `ImageClassifier.predict_file`, Ctrl-C for `xor-net chat`.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+ctrlc = { version = "3.4", optional = true }
 
 [dev-dependencies]
 candle-nn = "0.11.0"
@@ -138,21 +146,14 @@ jemallocator = "0.5.4"
 
 [features]
 default = []
-python = ["pyo3"]
+python = ["pyo3", "dep:image"]
+cli = ["dep:image", "dep:ctrlc"]
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-
-
-
-[[example]]
-name = "bw_bench"
-path = "examples/bw_bench.rs"
-
-
 
 [[example]]
 name = "bonsai_generate"

@@ -873,3 +873,117 @@ pub fn batched_dot_product(
         out,
     )
 }
+
+// ──────────────────────────── f16 <-> f32 slices ────────────────────────────
+//
+// `half`'s slice conversions detect F16C at run time but then call a
+// non-inlinable `#[target_feature]` helper per 8 elements, which costs more
+// than the conversion itself unless the whole crate is built with
+// `target-cpu=native`. These convert a whole slice inside one kernel.
+
+/// AVX-512F `f16 -> f32`.
+///
+/// # Safety
+/// The CPU must support `avx512f`; `dst.len() == src.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn f16_to_f32_slice_avx512(src: &[half::f16], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len());
+    let n = src.len();
+    let (s, d) = (src.as_ptr() as *const u16, dst.as_mut_ptr());
+    let mut i = 0;
+    while i + 16 <= n {
+        let h = _mm256_loadu_si256(s.add(i) as *const __m256i);
+        _mm512_storeu_ps(d.add(i), _mm512_cvtph_ps(h));
+        i += 16;
+    }
+    while i + 8 <= n {
+        let h = _mm_loadu_si128(s.add(i) as *const __m128i);
+        _mm256_storeu_ps(d.add(i), _mm256_cvtph_ps(h));
+        i += 8;
+    }
+    for j in i..n {
+        dst[j] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(src[j].to_bits() as i32)));
+    }
+}
+
+/// F16C `f16 -> f32`.
+///
+/// # Safety
+/// The CPU must support `avx` and `f16c`; `dst.len() == src.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,f16c")]
+pub unsafe fn f16_to_f32_slice_f16c(src: &[half::f16], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len());
+    let n = src.len();
+    let (s, d) = (src.as_ptr() as *const u16, dst.as_mut_ptr());
+    let mut i = 0;
+    while i + 8 <= n {
+        let h = _mm_loadu_si128(s.add(i) as *const __m128i);
+        _mm256_storeu_ps(d.add(i), _mm256_cvtph_ps(h));
+        i += 8;
+    }
+    for j in i..n {
+        dst[j] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(src[j].to_bits() as i32)));
+    }
+}
+
+/// `dst[i] = src[i] as f32` (exact). Panics if the lengths differ.
+#[inline]
+pub fn f16_to_f32_slice(src: &[half::f16], dst: &mut [f32]) {
+    assert_eq!(src.len(), dst.len(), "f16_to_f32_slice: length mismatch");
+    #[cfg(target_arch = "x86_64")]
+    {
+        let f = cpu_features();
+        // SAFETY: features detected; lengths checked above.
+        if f.avx512f {
+            return unsafe { f16_to_f32_slice_avx512(src, dst) };
+        }
+        if f.avx2 && f.f16c {
+            return unsafe { f16_to_f32_slice_f16c(src, dst) };
+        }
+    }
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d = s.to_f32();
+    }
+}
+
+/// F16C `f32 -> f16`, round to nearest even.
+///
+/// # Safety
+/// The CPU must support `avx` and `f16c`; `dst.len() == src.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,f16c")]
+pub unsafe fn f32_to_f16_slice_f16c(src: &[f32], dst: &mut [half::f16]) {
+    debug_assert_eq!(src.len(), dst.len());
+    let n = src.len();
+    let (s, d) = (src.as_ptr(), dst.as_mut_ptr() as *mut u16);
+    let mut i = 0;
+    while i + 8 <= n {
+        let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm256_loadu_ps(s.add(i)));
+        _mm_storeu_si128(d.add(i) as *mut __m128i, h);
+        i += 8;
+    }
+    for j in i..n {
+        let h = _mm_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm_set_ss(src[j]));
+        dst[j] = half::f16::from_bits(_mm_extract_epi16::<0>(h) as u16);
+    }
+}
+
+/// `dst[i] = f16::from_f32(src[i])` (round to nearest even, like `half`).
+/// Panics if the lengths differ.
+#[inline]
+pub fn f32_to_f16_slice(src: &[f32], dst: &mut [half::f16]) {
+    assert_eq!(src.len(), dst.len(), "f32_to_f16_slice: length mismatch");
+    #[cfg(target_arch = "x86_64")]
+    {
+        let f = cpu_features();
+        // SAFETY: features detected; lengths checked above.
+        if f.avx2 && f.f16c {
+            return unsafe { f32_to_f16_slice_f16c(src, dst) };
+        }
+    }
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = half::f16::from_f32(s);
+    }
+}

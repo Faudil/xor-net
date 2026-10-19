@@ -11,11 +11,11 @@ use anyhow::Result;
 /// Issue a non-temporal prefetch for the leading cache line of a projection's
 /// packed ternary weights (no-op for non-ternary projections).
 fn prefetch_proj(lin: &DynamicLinear) {
-    if let LinearKind::Ternary(t) = &lin.inner {
-        if let Some(ptr) = t.prefetch_ptr() {
-            unsafe {
-                crate::models::llama::prefetch_weight(ptr);
-            }
+    if let LinearKind::Ternary(t) = &lin.inner
+        && let Some(ptr) = t.prefetch_ptr()
+    {
+        unsafe {
+            crate::models::llama::prefetch_weight(ptr);
         }
     }
 }

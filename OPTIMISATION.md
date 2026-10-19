@@ -16,7 +16,7 @@ as `xor_net`.
 Custom block-64 sparse format (`mask: u64` + compact sign bits), offline
 converter (`convert_sparse`), loader (`SparseFile`, magic `XORSPARE1`), and an
 opt-in engine path (`XORNET_WEIGHT_FMT=sparse`). Documented in
-`SPARSE_FORMAT.md`. Lossless bit-identical output to `pack4`, verified by
+`docs/formats.md`. Lossless bit-identical output to `pack4`, verified by
 unit tests in `src/bit1_58/simd.rs::sparse_correctness_tests`.
 
 Result: **~49 tok/s sparse vs ~51 tok/s dense**, output identical. On-disk

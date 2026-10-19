@@ -24,6 +24,7 @@ use crate::bit1::q1_0::Q8Acts;
 use crate::loader::gguf::GgufFile;
 use crate::models::traits::{CausalLM, Logits, ModelState, downcast_state};
 use crate::nn::fast_attention_simd::{dot_product_f32, rms_norm};
+use crate::util::with_best_simd;
 
 use super::{
     Embedding, KvCache, Linear, Rope, Yarn, attention, gguf_vec, meta_f32, meta_u32, rms_norm_rows,
@@ -225,6 +226,20 @@ fn softplus(x: f32) -> f32 {
     if x > 20.0 { x } else { x.exp().ln_1p() }
 }
 
+/// One state row of the gated delta rule: `s *= decay`, then
+/// `s += (v_j - s·k) * beta * k`; returns `s·q`. A function so `s` and `k`
+/// are known not to alias and the loops vectorize (under `with_best_simd!`).
+#[inline(always)]
+fn delta_row(sj: &mut [f32], k: &[f32], q: &[f32], vj: f32, beta: f32, decay: f32) -> f32 {
+    sj.iter_mut().for_each(|e| *e *= decay);
+    let sk = dot_product_f32(sj, k);
+    let d = (vj - sk) * beta;
+    for (e, &ki) in sj.iter_mut().zip(k) {
+        *e += d * ki;
+    }
+    dot_product_f32(sj, q)
+}
+
 /// `x / sqrt(Σx² + eps)` (llama.cpp `build_gdn_l2_norm`).
 fn l2_norm(x: &mut [f32], eps: f32) {
     let ss: f32 = x.iter().map(|v| v * v).sum();
@@ -311,25 +326,21 @@ impl GdnMixer {
             .enumerate()
             .for_each(|(vh, (st, oh))| {
                 let kh = vh % nk; // tiled V-head order (see module docs)
-                for t in 0..n {
-                    let row = &conv_out[t * cd..(t + 1) * cd];
-                    let q = &row[kh * hk..(kh + 1) * hk];
-                    let k = &row[kd + kh * hk..kd + (kh + 1) * hk];
-                    let v = &row[2 * kd + vh * hv..2 * kd + (vh + 1) * hv];
-                    let beta = sigmoid(ba[t * 2 * nv + vh]);
-                    let alpha = ba[t * 2 * nv + nv + vh];
-                    let decay = (softplus(alpha + self.dt_bias[vh]) * self.ssm_a[vh]).exp();
-                    let ot = &mut oh[t * hv..(t + 1) * hv];
-                    for (j, sj) in st.chunks_exact_mut(hk).enumerate() {
-                        sj.iter_mut().for_each(|e| *e *= decay);
-                        let sk = dot_product_f32(sj, k);
-                        let d = (v[j] - sk) * beta;
-                        for (e, &ki) in sj.iter_mut().zip(k) {
-                            *e += d * ki;
+                with_best_simd!({
+                    for t in 0..n {
+                        let row = &conv_out[t * cd..(t + 1) * cd];
+                        let q = &row[kh * hk..(kh + 1) * hk];
+                        let k = &row[kd + kh * hk..kd + (kh + 1) * hk];
+                        let v = &row[2 * kd + vh * hv..2 * kd + (vh + 1) * hv];
+                        let beta = sigmoid(ba[t * 2 * nv + vh]);
+                        let alpha = ba[t * 2 * nv + nv + vh];
+                        let decay = (softplus(alpha + self.dt_bias[vh]) * self.ssm_a[vh]).exp();
+                        let ot = &mut oh[t * hv..(t + 1) * hv];
+                        for (j, sj) in st.chunks_exact_mut(hk).enumerate() {
+                            ot[j] = delta_row(sj, k, q, v[j], beta, decay);
                         }
-                        ot[j] = dot_product_f32(sj, q);
                     }
-                }
+                });
             });
         // Gated RMS norm per head: rms(o_h) * norm * silu(z_h).
         for t in 0..n {

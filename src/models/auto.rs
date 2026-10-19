@@ -61,11 +61,7 @@ impl AutoModelForCausalLM {
                 // Fallback: glob any *.safetensors files
                 let mut entries: Vec<_> = std::fs::read_dir(model_dir)?
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .map_or(false, |ext| ext == "safetensors")
-                    })
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
                     .map(|e| e.path())
                     .collect();
                 entries.sort();

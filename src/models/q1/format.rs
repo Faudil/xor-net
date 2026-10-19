@@ -1,6 +1,6 @@
 //! `.xq1`: a converted, mmap-friendly file format for Bonsai 1-bit models.
 //!
-//! Converting a GGUF once (`bonsai_convert in.gguf out.xq1`) moves all the
+//! Converting a GGUF once (`xor-net convert in.gguf out.xq1`) moves all the
 //! load-time work offline: the Q1_0 blocks are already split into sign bits
 //! and f16 scales, Q/K/V and gate/up are pre-fused, and the tokenizer and
 //! chat template are embedded. Loading is an `mmap` plus a JSON header parse:
@@ -270,6 +270,42 @@ impl XqReader {
 
     pub fn has(&self, name: &str) -> bool {
         self.header.tensors.contains_key(name)
+    }
+
+    /// Number of stored tensors.
+    pub fn tensor_count(&self) -> usize {
+        self.header.tensors.len()
+    }
+
+    /// Total number of weights over all stored tensors (fused projections
+    /// count once per original weight; a tied LM head is not stored).
+    pub fn param_count(&self) -> u64 {
+        self.header
+            .tensors
+            .values()
+            .map(|e| match e {
+                Entry::Q1 { rows, cols, .. } => (*rows * *cols) as u64,
+                Entry::F32 { shape, .. } => shape.iter().product::<usize>() as u64,
+            })
+            .sum()
+    }
+
+    /// Q1 block size (elements per f16 scale) of the 1-bit tensors, if any.
+    pub fn q1_block(&self) -> Option<usize> {
+        self.header.tensors.values().find_map(|e| match e {
+            Entry::Q1 { block, .. } => Some(*block),
+            _ => None,
+        })
+    }
+
+    /// The embedded HF Jinja chat template, if any.
+    pub fn chat_template(&self) -> Option<&str> {
+        self.header.chat_template.as_deref()
+    }
+
+    /// Whether a tokenizer is embedded.
+    pub fn has_tokenizer(&self) -> bool {
+        self.header.tokenizer.is_some()
     }
 
     fn buf(&self, (off, len): (usize, usize)) -> anyhow::Result<ByteBuf> {

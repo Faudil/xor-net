@@ -1,281 +1,247 @@
 # xor-net
 
-`xor-net` is a high-performance **CPU** inference engine for **1-bit (binary)** and
-**1.58-bit (ternary)** quantized LLMs, built on the [Hugging Face Candle](https://github.com/huggingface/candle)
-framework in Rust. It replaces floating-point matrix multiplications with bitwise
-and integer SIMD ops, drastically cutting memory footprint and latency on modern
-x86 CPUs.
+**Fast, sound CPU inference for 1-bit and 1.58-bit models.**
 
-It is no longer just a kernel demo: it now ships a full LLaMA-class transformer
-runtime, an OpenAI/llama.cpp-compatible HTTP server, a lossless sparse-weight
-format, per-phase profiling, and a **comprehensive multi-config benchmark
-harness**. See [`OPTIMISATION.md`](OPTIMISATION.md) for the measured throughput
-analysis that drove the design.
+xor-net runs models whose weights are *natively* binary or ternary (PrismML
+Bonsai Q1_0, Microsoft BitNet b1.58, binary CNNs) on ordinary CPUs, with
+hand-written AVX-512 / AVX2 kernels, runtime ISA dispatch and a scalar
+fallback everywhere. It is a Rust library with a CLI, an OpenAI-compatible
+server and Python bindings.
 
----
+It is deliberately narrow: it does **not** run fp16 / int4 / int8 models.
+If your model is 1-bit or 1.58-bit, xor-net aims to be the fastest and most
+memory-frugal way to run it on a CPU.
 
-## Features
-
-- **1-bit quantization (BitNet b1.0)** : input binarization + row-aligned
-  bitpacked weights; matmul via AVX2 XNOR + popcount (`_mm256_xor_si256`,
-  `vpshufb` popcount). Scalar `count_ones()` fallback when AVX2 is absent.
-- **1.58-bit quantization (BitNet b1.58)** : ternary `{-1, 0, +1}` weights in two
-  packing layouts:
-  - **Pack4**: 4 weights/byte (2 bits/weight), fastest decode.
-  - **Pack5**: 5 weights/byte (base-3), ~20% smaller on disk than Pack4.
-  - Dynamic absmax → `i8` activation scaling; AVX-512 VNNI `_mm512_dpbusd` kernel
-    with 16 accumulators, plus an AVX2 `_mm256_sign_epi8` path.
-- **Lossless XorSparse weights** an opt-in block-64 sparse container
-  (`XORNET_WEIGHT_FMT=sparse`, magic `XORSPARE1`) that stores only non-zero ternary
-  signs. Bit-identical to `pack4` (verified by unit tests) and ~18% smaller on disk.
-  Built offline with `convert_sparse`, documented in [`SPARSE_FORMAT.md`](SPARSE_FORMAT.md).
-- **Configurable LM head** : the language-model head can run in `F32`, `F16`,
-  `Int8`, `Int4`, or `Ternary` precision independently of the transformer blocks.
-  `Int4` + partial-select sampling is the default single-stream configuration.
-- **Fast sampler** : greedy / temperature / top-p with a reused index buffer and
-  `select_nth_unstable` partial selection (no per-token allocation or full vocab
-  sort).
-- **Concurrency**  the decoder is memory/cache-bound, so aggregate throughput
-  scales with *physical cores*. The server and `batch_bench` example serve many
-  independent streams (each on its own 1-thread rayon pool) to reach ~110 tok/s
-  aggregate on a 6-core box vs ~59 tok/s single-stream.
-- **OpenAI-compatible server** : `xor-net-server` exposes `/v1/completions`,
-  `/v1/chat/completions` (SSE + non-stream), `/v1/models`, and the llama.cpp
-  legacy `/completion`, hand-rolled over HTTP/1.1 (no async framework).
-- **Speculative decoding (experimental)** : `XORNET_SPEC=N` drafts `N` tokens per
-  step; currently slower than greedy on this engine (the verify pass dominates).
-- **Python bindings** : optional `pyo3` extension module behind the `python` feature.
-- **Multi-config benchmark harness** : `bench_runner` + `scripts/bench_all.sh`
-  sweep the full configuration matrix and log every run to JSONL + CSV.
-
----
+```text
+$ xor-net run Bonsai-1.7B.xq1 -p "The capital of France is" -n 24 --greedy --echo
+loaded Bonsai-1.7B.xq1 in 0.15s (8 threads)
+The capital of France is Paris, and the capital of Spain is Madrid. Which of the following is the correct answer? A. Paris B.
+5 prompt (0 cached) + 24 completion tokens | prefill 7.5 tok/s | decode 164.4 tok/s | finish length | load 0.15s | peak RSS 345 MB
+```
 
 ## Supported models
 
-| Model | Hub id | Notes |
-|-------|--------|-------|
-| BitNet b1.58 2B-4T | `microsoft/bitnet-b1.58-2B-4T` | Default; downloaded to `models/bitnet-2b` |
-| BitNet b1.58 3B | `1bitLLM/bitnet_b1_58-3B` | |
-| LLaMA-3 8B 1.58 | `HF1BitLLM/Llama3-8B-1.58-100B-tokens` | |
+Measured on a Ryzen 5 9600X (6 cores Zen 5, AVX-512 VNNI, DDR5-5600 dual
+channel), single stream, decode with 6-8 threads.
 
-More are coming like Bonsai-27B or other based on qwen's architecture
+| Model | Type | File | Decode | Prefill | Peak RSS |
+|-------|------|------|-------:|--------:|---------:|
+| [Bonsai 1.7B](https://huggingface.co/prism-ml/Bonsai-1.7B-gguf) | 1-bit Q1_0, Qwen3 dense | 248 MB | **150-164 tok/s** | 300-380 tok/s | 300-350 MB |
+| [Bonsai 4B](https://huggingface.co/prism-ml/Bonsai-4B-gguf) | 1-bit Q1_0, Qwen3 dense | 572 MB | **~64 tok/s** | not measured | not measured |
+| [Bonsai 8B](https://huggingface.co/prism-ml/Bonsai-8B-gguf) | 1-bit Q1_0, Qwen3 dense | 1.16 GB | **41-44 tok/s** | not measured | 1.1-1.4 GB |
+| [Bonsai 27B](https://huggingface.co/prism-ml/Bonsai-27B-gguf) | 1-bit Q1_0, Qwen3.5 hybrid (attention + Gated DeltaNet) | 3.8 GB | **11-12 tok/s** | not measured | 3.7 GB |
+| [BitNet b1.58 2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | 1.58-bit ternary, Llama-style | safetensors | **~74 tok/s** | not measured | not measured |
+| [BitNet b1.58 3B](https://huggingface.co/1bitLLM/bitnet_b1_58-3B) | 1.58-bit ternary | safetensors | not measured | | |
+| [Llama3-8B-1.58](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) | 1.58-bit ternary | safetensors | not measured | | |
+| QuickNet (Larq Zoo) | binary CNN, ImageNet top-1 63.3% | 4.4 MB | **~0.7 ms / image** (6 threads, ~10x faster than TF/Larq) | | ~15 MB |
 
-Any local directory with `config.json` + `*.safetensors` (and optionally
-`model.safetensors.index.json`) is also accepted in place of a hub id.
+Bonsai models load from the published `.gguf` or from xor-net's `.xq1`
+format (same weights, bit for bit, mmapped for near-instant start-up; see
+[docs/formats.md](docs/formats.md)). Decode is memory-bandwidth bound, so
+throughput scales with bytes per token: expect proportionally lower numbers
+on DDR4 or single-channel machines. For aggregate throughput, serve several
+streams on separate cores (BitNet 2B: ~110 tok/s aggregate with 6 streams on
+this box, see [OPTIMISATION.md](OPTIMISATION.md)).
 
----
-
-## Project structure
-
-```text
-src/
-├── lib.rs                 # Crate root; init_threads() global rayon pool
-├── bit1/                  # 1-bit engine
-│   ├── layers.rs          # BitLinear (Candle Module)
-│   ├── ops.rs             # CPU forward pass
-│   ├── quantization.rs    # Row-wise bitpacking
-│   └── simd.rs            # AVX2 XNOR + popcount kernel
-├── bit1_58/               # 1.58-bit engine
-│   ├── layers.rs          # TernaryLinear
-│   ├── ops.rs             # absmax + de-quant forward
-│   ├── quantization.rs    # Pack4 / Pack5 packing + i8 scaling
-│   ├── simd.rs            # AVX2 sign / AVX-512 VNNI kernels + sparse
-│   └── sparse.rs          # XorSparse encode/decode
-├── nn/                    # QuantizationConfig, LmHeadConfig, DynamicLinear
-├── models/                # AutoModelForCausalLM, Llama runtime, loader
-├── sampler.rs             # Partial-select sampler
-└── tensor.rs              # FastTensor (packed f32/i8 workspace)
-server/                    # xor-net-server binary (OpenAI/llama-compatible)
-examples/                  # run_2b, run_3b, run_llama3_8b_158, chat,
-                           # batch_bench, bench_runner, bench_layer,
-                           # bench_memory, check_accuracy, dump_logits, ...
-scripts/                   # bench_all.sh, jsonl_to_csv.py, convert_bitnet.py
-src/bin/convert_sparse.rs  # Build a XorSparse .sparse container
-```
-
----
-
-## Getting started
-
-### Prerequisites
-
-- A Rust toolchain supporting the **2024 edition**.
-- An **x86_64** CPU with **AVX2**. AVX-512 VNNI is used automatically when
-  available; otherwise execution falls back to scalar/AVX2 paths.
-- (~10 GB free) for the 2B weights if downloading from the Hub.
-
-### Build
+## Quickstart
 
 ```bash
-cargo build --release                 # library + examples
-cargo build --release --bin xor-net-server
+# 1. Install the CLI (Rust >= 1.89; the release build uses fat LTO, so give it a few minutes)
+cargo install --git https://github.com/faudil/xor-net xor-net --features cli
+
+# 2. Run: downloads Bonsai 1.7B (248 MB) into the Hugging Face cache on first use
+xor-net run prism-ml/Bonsai-1.7B-gguf -p "Explain 1-bit LLMs in one paragraph." --chat
+
+# 3. Chat
+xor-net chat prism-ml/Bonsai-1.7B-gguf
 ```
 
-### Quick inference
+Optional: convert once to `.xq1` for faster loading and page-cache sharing:
 
 ```bash
-# 2B BitNet, Int4 LM head, 8 threads (auto-capped)
-XORNET_THREADS=8 cargo run --release --example run_2b
-
-# 3B BitNet
-cargo run --release --example run_3b
-
-# 8B LLaMA 1.58
-cargo run --release --example run_llama3_8b_158
-
-# Interactive chat (local 2B or HF 3B/8B)
-XORNET_MODEL=models/bitnet-2b cargo run --release --example chat
+xor-net convert prism-ml/Bonsai-8B-gguf          # writes ./Bonsai-8B.xq1, verified lossless
+xor-net chat Bonsai-8B.xq1
 ```
 
-### Configuration matrix
+## CLI
 
-Every run is parameterized by three enums (see `src/nn/dynamic_linear.rs`):
+| command | |
+|---------|-|
+| `xor-net run <model> -p "..." [-n N] [--temp T] [--top-k K] [--top-p P] [--seed S] [--stop STR] [--chat] [--no-think] [-t N]` | stream a completion to stdout, stats to stderr (`-q` to silence) |
+| `xor-net chat <model> [--system "..."] [--no-think] [--show-thinking]` | interactive multi-turn chat; Ctrl-C stops a reply; `/reset`, `/system`, `/think on\|off`, `/exit` |
+| `xor-net convert <in.gguf> [out.xq1]` | lossless GGUF -> `.xq1` conversion |
+| `xor-net bench <model> [-p 128] [-n 64] [-t N]` | prefill / decode tok/s and peak RSS |
+| `xor-net info <model> [--template]` | architecture, layers, context, params, quantization, size, chat template |
+| `xor-net classify <img>... [-m quicknet.safetensors] [-k 5]` | ImageNet classification with a binary CNN |
+| `xor-net pull <owner/repo>` | download from the Hub, print the path |
+| `xor-net serve [...]` | start `xor-net-server` |
+
+`<model>` is a `.gguf` / `.xq1` file, a Llama/BitNet safetensors directory,
+or a Hub id (`prism-ml/Bonsai-8B-gguf`, `owner/repo:file.gguf`). Full
+reference: [docs/cli.md](docs/cli.md).
+
+## Rust
+
+```toml
+[dependencies]
+xor-net = { git = "https://github.com/faudil/xor-net" }
+```
+
+### Generate and stream
 
 ```rust
-pub enum QuantizationConfig {
-    None,                                  // F32 baseline
-    Bit1(LmHeadConfig),                    // 1-bit
-    Bit1_58(TernaryPackType, LmHeadConfig, bool /* inverted scale */),
+use std::ops::ControlFlow;
+use xor_net::models::source::{load_generator, LoadOptions};
+use xor_net::{GenerationParams, SamplingParams};
+
+fn main() -> anyhow::Result<()> {
+    xor_net::init_threads(0).map_err(|e| anyhow::anyhow!("{e}"))?; // auto, max 8
+    // A path (.gguf / .xq1 / safetensors dir) or a Hub id.
+    let mut g = load_generator("prism-ml/Bonsai-1.7B-gguf", &LoadOptions::default())?;
+
+    let params = GenerationParams::default()
+        .with_max_tokens(64)
+        .with_sampling(SamplingParams::default().with_temperature(0.7).with_top_p(0.8).with_top_k(20))
+        .with_stop(["\n\n"]);
+    let out = g.generate_stream("The capital of France is", &params, |delta| {
+        print!("{delta}");
+        ControlFlow::Continue(()) // ControlFlow::Break(()) cancels
+    })?;
+    println!("\n{:?}, {:.1} tok/s", out.finish_reason, out.timings.decode_tok_per_s());
+    Ok(())
 }
-
-pub enum TernaryPackType { Pack4, Pack5 }
-
-pub enum LmHeadConfig { F32, F16, Int8, Int4, Ternary }
 ```
 
-A typical high-throughput setup (current default):
+Bonsai files can also be loaded directly with
+`xor_net::AutoModelForCausalLM::generator_from_file("Bonsai-8B.xq1", None)`.
+
+### Chat, multi-turn and reasoning
 
 ```rust
-QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, /*inverted*/ true)
+use xor_net::{ChatMessage, GenerationParams, ReasoningFormat, StreamEvent};
+
+let mut history = vec![
+    ChatMessage::system("You are a concise assistant."),
+    ChatMessage::user("What is a 1-bit LLM?"),
+];
+let params = GenerationParams::default()
+    .with_max_tokens(256)
+    .with_enable_thinking(false)                     // templates that read `enable_thinking`
+    .with_reasoning_format(ReasoningFormat::Separate); // <think> content -> out.reasoning
+let out = g.chat_stream_events(&history, &params, |ev| {
+    match ev {
+        StreamEvent::Text(t) => print!("{t}"),
+        StreamEvent::Reasoning(r) => eprint!("{r}"),
+    }
+    std::ops::ControlFlow::Continue(())
+})?;
+history.push(ChatMessage::assistant(out.text));    // next turn reuses the cached prefix when possible
 ```
 
-Thread count is the dominant single-stream lever: `init_threads(0)` auto-caps at 8
-(beyond that, L2/L3 thrash regresses throughput on this hardware). Use the
-**server** or `batch_bench` for aggregate throughput via concurrency instead.
+`Generator` owns one model state; `g.fork()` gives another generator that
+shares the weights (one per concurrent stream). Any model implementing the
+`CausalLM` trait plugs into `Generator`; see
+[docs/architecture.md](docs/architecture.md).
 
----
+### Vision
 
-## Environment variables
+```rust
+let clf = xor_net::vision::ImageClassifier::load("quicknet.safetensors")?;
+let img = image::open("cat.jpg")?.to_rgb8();           // any RGB8 source works
+let (w, h) = (img.width() as usize, img.height() as usize);
+for p in clf.predict(img.as_raw(), w, h, 5)? {
+    println!("{:>5.1}%  {}", 100.0 * p.probability, p.label);
+}
+```
 
-### Engine / runtime
+The library takes raw interleaved RGB8; it does not depend on an image
+decoder.
 
-| Variable | Default | Effect |
-|----------|---------|--------|
-| `XORNET_THREADS` | `0` (auto, cap 8) | Global rayon thread count for decode. |
-| `XORNET_WEIGHT_FMT` | `dense` | Set to `sparse` to load a prebuilt `model.sparse` (XorSparse). |
-| `XORNET_VNNI_PREFETCH` | `256` | VNNI decode prefetch distance (bytes). `0` → default. |
-| `XORNET_LMHEAD` |  | Override LM-head precision: `f32`/`f16`/`int8`/`int4`/`ternary`. |
-| `XORNET_SPEC` |  | Speculative decoding draft length `N` (experimental). |
-| `XORNET_DEBUG` |  | Print per-block MLP projection kinds. |
+## Python
 
-### Server (`xor-net-server`)
+```bash
+pip install maturin && maturin develop --release   # from a checkout; abi3 wheel, Python >= 3.10
+```
 
-| Variable | Default | Effect |
-|----------|---------|--------|
-| `XORNET_MODEL` | `models/bitnet-2b` | Model dir or hub id. |
-| `XORNET_SERVER_HOST` | `127.0.0.1` | Bind host. |
-| `XORNET_SERVER_PORT` | `8080` | Bind port. |
-| `XORNET_SLOTS` | logical/2 | Worker slots (one per physical core → max aggregate). |
-| `XORNET_THREADS_PER_SLOT` | `1` | Rayon threads per slot (`1` → ~110 tok/s aggregate). |
+```python
+import xor_net
 
-### Benchmark harness (`bench_runner` / `bench_all.sh`)
+model = xor_net.load("prism-ml/Bonsai-1.7B-gguf")         # or a .gguf/.xq1 path, or a BitNet dir
+print(model.chat([{"role": "user", "content": "Hi!"}], max_tokens=64))
 
-| Variable | Default | Effect |
-|----------|---------|--------|
-| `XORNET_MODEL` | `models/bitnet-2b` | Model dir or hub id. |
-| `XORNET_QUANT` | `bit1_58_pack4` | `none`/`bit1`/`bit1_58_pack4`/`bit1_58_pack5`. |
-| `XORNET_LMHEAD` | `int4` | LM-head precision (ignored when `quant=none`). |
-| `XORNET_WEIGHT_FMT` | `dense` | `dense`/`sparse`. |
-| `XORNET_THREADS` | `0` | Thread count for this run. |
-| `XORNET_MODE` | `single` | `single` (1 stream) or `concurrent` (multi-stream). |
-| `XORNET_STREAMS` | `4` | Concurrent streams (concurrent mode). |
-| `XORNET_POOL_THREADS` | `0` | Per-stream rayon pool size (`0` = shared global). |
-| `XORNET_TOKENS` | `128` | Tokens generated per stream. |
-| `XORNET_PROMPT` |  | Prompt text. |
-| `XORNET_TOKENIZER_REPO` | `microsoft/bitnet-b1.58-2B-4T` | Tokenizer source when model dir lacks one. |
-| `XORNET_WARMUP` | `0` | Warmup tokens before measurement. |
-| `XORNET_SEED` | `299792458` | Sampler seed. |
-| `XORNET_LOG` |  | JSONL file to append each run's record to. |
-| `XORNET_RUN_ID` / `XORNET_GIT_SHA` / `XORNET_RUSTC` / `XORNET_FEATURES` |  | Metadata stamped into the log. |
+for piece in model.generate_stream("Once upon a time", max_tokens=100, temperature=0.7):
+    print(piece, end="", flush=True)
 
----
+c = model.chat([{"role": "user", "content": "2+2?"}], enable_thinking=False, details=True)
+print(c.text, c.reasoning, c.decode_tok_per_s)
+
+clf = xor_net.ImageClassifier("quicknet.safetensors")
+clf.predict("cat.jpg", k=5)            # also numpy HxWx3 uint8 arrays, PIL images, bytes
+```
+
+Full reference: [docs/python.md](docs/python.md).
 
 ## Server
 
-```bash
-# 6 slots (one per physical core), 1 thread each → ~110 tok/s aggregate
-XORNET_SLOTS=6 XORNET_THREADS_PER_SLOT=1 cargo run --release --bin xor-net-server
-```
+`xor-net-server` exposes an OpenAI-compatible API (`/v1/chat/completions`
+with SSE streaming, `/v1/completions`, `/v1/models`) plus llama.cpp's
+`/completion` and `/health`.
 
 ```bash
-curl -N http://127.0.0.1:8080/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"bitnet-2b","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+cargo install --git https://github.com/faudil/xor-net xor-net --bin xor-net-server
+xor-net-server -m Bonsai-8B.xq1 --port 8080          # see --help for slots / threads / limits
+
+curl -N http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
----
+Any OpenAI client works (`base_url="http://127.0.0.1:8080/v1"`).
 
-## Benchmarking
+## The `.xq1` format
 
-The harness sweeps the **entire** configuration space (quant format × LM-head ×
-weight format × thread count × single/concurrent) and logs every run. A fresh
-process is spawned per combo because `init_threads` installs a global rayon pool
-that can only be set once per process.
+`.xq1` is a converted Bonsai file: the same sign bits and f16 scales as the
+GGUF (lossless, verified tensor by tensor after conversion), but pre-split,
+pre-fused, 64-byte aligned and with the tokenizer and chat template embedded.
+Loading is an `mmap` plus a JSON header parse, so start-up is near-instant
+and the weights are shared page cache between processes. Convert with
+`xor-net convert in.gguf out.xq1`. Layout and details:
+[docs/formats.md](docs/formats.md), which also covers XorSparse (a lossless,
+~18% smaller on-disk container for BitNet weights).
+
+## Hardware
+
+| CPU | Status |
+|-----|--------|
+| x86-64 with AVX-512 VNNI (Zen 4/5, Ice Lake+, Sapphire Rapids) | best: `vpdpbusd` kernels for Q1_0 and ternary |
+| x86-64 with AVX-512 BW, no VNNI | supported, `vpmaddubsw` path |
+| x86-64 with AVX2 + FMA (Haswell+, Zen 1-3) | supported, AVX2 kernels |
+| aarch64 (Apple Silicon, Graviton), other | works with portable scalar kernels; no NEON kernels yet, so much slower |
+
+Kernels are chosen at runtime, so one binary runs everywhere; there is no
+need for `-C target-cpu=native`. `XORNET_FORCE_ISA=avx2|scalar` forces a
+lower path (testing). Threads: `--threads` / `init_threads(n)`; the default
+caps at 8 because decode is memory-bound and more threads only add cache
+contention. Use physical cores, not SMT siblings.
+
+## Documentation
+
+- [docs/cli.md](docs/cli.md): command-line reference
+- [docs/python.md](docs/python.md): Python API
+- [docs/formats.md](docs/formats.md): Q1_0, `.xq1`, XorSparse, vision files
+- [docs/architecture.md](docs/architecture.md): code map and design rules
+- [OPTIMISATION.md](OPTIMISATION.md): performance investigation and measurements
+
+## Development
 
 ```bash
-# Quick validation (single mode, threads 4/8)
-bash scripts/bench_all.sh --quick
-
-# Full comprehensive sweep (1792 combos  subset for real runs)
-QUANTS="bit1_58_pack4" LMHEADS="int4" THREADS="4 8" MODES="single" \
-  TOKENS=128 bash scripts/bench_all.sh
-
-# Restrict a single axis
-bash scripts/bench_all.sh --quant bit1_58_pack5 --mode concurrent
+cargo test                                   # unit + integration tests (model tests skip without files)
+cargo test --features cli --bin xor-net      # CLI argument parsing
+BONSAI_XQ1=Bonsai-1.7B.xq1 cargo test --release --features cli --test cli_e2e -- --ignored
+cargo bench --bench kernels
 ```
-
-Outputs land in `bench_logs/<timestamp>.jsonl` (one JSON object per run, recording
-system metadata, the full config, per-phase profiler deltas, memory, and results)
-and a flattened `bench_logs/<timestamp>.jsonl.csv` summary.
-
-XorSparse must be built first to include the sparse axis:
-
-```bash
-cargo run --release --bin convert_sparse models/bitnet-2b models/bitnet-2b/model.sparse
-SPARSE=1 bash scripts/bench_all.sh
-```
-
-Other benchmarks:
-
-```bash
-cargo run --release --example bench_layer     # single-layer GEMV throughput
-cargo run --release --example bench_memory    # DRAM bandwidth probe
-cargo run --release --example batch_bench     # concurrent multi-stream serving
-```
-
----
-
-## Accuracy & verification
-
-```bash
-# Compare ternary vs F32 baseline logits on a model
-cargo run --release --example check_accuracy models/bitnet-2b
-cargo run --release --example check_8b_accuracy
-cargo run --release --example dump_logits_for_compare <model>
-```
-
----
-
-## Python bindings
-
-Build the `pyo3` extension module (requires a Python 3.10+ dev environment):
-
-```bash
-cargo build --release --features python
-```
-
----
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Model weights are subject to their own
+licenses (Bonsai: see the PrismML model cards; BitNet: MIT; QuickNet:
+Apache-2.0).

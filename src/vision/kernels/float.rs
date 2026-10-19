@@ -3,10 +3,12 @@
 //! Dense convolutions run as per-output-row im2col + [`sgemm`] (1x1
 //! stride-1 convs skip the im2col copy). Depthwise conv and pooling are NHWC
 //! loops whose innermost loop runs contiguously over channels, which LLVM
-//! vectorises. Parallelism is over output rows.
+//! vectorises; each output row runs under `with_best_simd!` so that happens
+//! for the host's best ISA. Parallelism is over output rows.
 
 use super::epilogue::Epilogue;
 use super::gemm::sgemm;
+use crate::util::with_best_simd;
 use crate::vision::tensor::{FeatureMap, Geometry, Padding};
 use rayon::prelude::*;
 
@@ -80,10 +82,7 @@ pub fn conv2d(
                 cols
             };
             sgemm(a, weight, row, g.ow, kdim, cout);
-            for ox in 0..g.ow {
-                let r = residual.map(|r| r.pixel(oy, ox));
-                epi.apply(&mut row[ox * cout..(ox + 1) * cout], r);
-            }
+            epi.apply_row(residual, oy, cout, row);
         });
     out
 }
@@ -116,23 +115,39 @@ pub fn depthwise_conv2d(
         .par_chunks_mut(g.ow * c)
         .enumerate()
         .for_each(|(oy, row)| {
-            for ox in 0..g.ow {
-                let acc = &mut row[ox * c..(ox + 1) * c];
-                for ky in 0..g.kh {
-                    let Some(iy) = g.in_y(oy, ky) else { continue };
-                    for kx in 0..g.kw {
-                        let Some(ix) = g.in_x(ox, kx) else { continue };
-                        let px = input.pixel(iy, ix);
-                        let wt = &weight[(ky * g.kw + kx) * c..][..c];
-                        for ((o, &a), &wv) in acc.iter_mut().zip(px).zip(wt) {
-                            *o += a * wv;
-                        }
-                    }
-                }
-                epi.apply(acc, residual.map(|r| r.pixel(oy, ox)));
-            }
+            with_best_simd!(depthwise_row(&g, input, weight, epi, residual, oy, row))
         });
     out
+}
+
+/// One output row of [`depthwise_conv2d`]. A function (not a closure) so the
+/// slices arrive as non-aliasing arguments and the channel loop vectorises.
+#[inline(always)]
+fn depthwise_row(
+    g: &Geometry,
+    input: &FeatureMap,
+    weight: &[f32],
+    epi: &Epilogue,
+    residual: Option<&FeatureMap>,
+    oy: usize,
+    row: &mut [f32],
+) {
+    let c = input.c;
+    for ox in 0..g.ow {
+        let acc = &mut row[ox * c..(ox + 1) * c];
+        for ky in 0..g.kh {
+            let Some(iy) = g.in_y(oy, ky) else { continue };
+            for kx in 0..g.kw {
+                let Some(ix) = g.in_x(ox, kx) else { continue };
+                let px = input.pixel(iy, ix);
+                let wt = &weight[(ky * g.kw + kx) * c..][..c];
+                for ((o, &a), &wv) in acc.iter_mut().zip(px).zip(wt) {
+                    *o += a * wv;
+                }
+            }
+        }
+        epi.apply(acc, residual.map(|r| r.pixel(oy, ox)));
+    }
 }
 
 /// Max pooling. Padded positions are ignored (TensorFlow semantics).
@@ -149,22 +164,26 @@ pub fn max_pool2d(
     out.data
         .par_chunks_mut(g.ow * c)
         .enumerate()
-        .for_each(|(oy, row)| {
-            for ox in 0..g.ow {
-                let acc = &mut row[ox * c..(ox + 1) * c];
-                acc.fill(f32::NEG_INFINITY);
-                for ky in 0..g.kh {
-                    let Some(iy) = g.in_y(oy, ky) else { continue };
-                    for kx in 0..g.kw {
-                        let Some(ix) = g.in_x(ox, kx) else { continue };
-                        for (o, &a) in acc.iter_mut().zip(input.pixel(iy, ix)) {
-                            *o = o.max(a);
-                        }
-                    }
+        .for_each(|(oy, row)| with_best_simd!(max_pool_row(&g, input, oy, row)));
+    out
+}
+
+#[inline(always)]
+fn max_pool_row(g: &Geometry, input: &FeatureMap, oy: usize, row: &mut [f32]) {
+    let c = input.c;
+    for ox in 0..g.ow {
+        let acc = &mut row[ox * c..(ox + 1) * c];
+        acc.fill(f32::NEG_INFINITY);
+        for ky in 0..g.kh {
+            let Some(iy) = g.in_y(oy, ky) else { continue };
+            for kx in 0..g.kw {
+                let Some(ix) = g.in_x(ox, kx) else { continue };
+                for (o, &a) in acc.iter_mut().zip(input.pixel(iy, ix)) {
+                    *o = o.max(a);
                 }
             }
-        });
-    out
+        }
+    }
 }
 
 /// Average pooling. Padded positions are excluded from the divisor
@@ -182,25 +201,29 @@ pub fn avg_pool2d(
     out.data
         .par_chunks_mut(g.ow * c)
         .enumerate()
-        .for_each(|(oy, row)| {
-            for ox in 0..g.ow {
-                let acc = &mut row[ox * c..(ox + 1) * c];
-                let mut n = 0usize;
-                for ky in 0..g.kh {
-                    let Some(iy) = g.in_y(oy, ky) else { continue };
-                    for kx in 0..g.kw {
-                        let Some(ix) = g.in_x(ox, kx) else { continue };
-                        n += 1;
-                        for (o, &a) in acc.iter_mut().zip(input.pixel(iy, ix)) {
-                            *o += a;
-                        }
-                    }
-                }
-                let inv = 1.0 / n.max(1) as f32;
-                acc.iter_mut().for_each(|o| *o *= inv);
-            }
-        });
+        .for_each(|(oy, row)| with_best_simd!(avg_pool_row(&g, input, oy, row)));
     out
+}
+
+#[inline(always)]
+fn avg_pool_row(g: &Geometry, input: &FeatureMap, oy: usize, row: &mut [f32]) {
+    let c = input.c;
+    for ox in 0..g.ow {
+        let acc = &mut row[ox * c..(ox + 1) * c];
+        let mut n = 0usize;
+        for ky in 0..g.kh {
+            let Some(iy) = g.in_y(oy, ky) else { continue };
+            for kx in 0..g.kw {
+                let Some(ix) = g.in_x(ox, kx) else { continue };
+                n += 1;
+                for (o, &a) in acc.iter_mut().zip(input.pixel(iy, ix)) {
+                    *o += a;
+                }
+            }
+        }
+        let inv = 1.0 / n.max(1) as f32;
+        acc.iter_mut().for_each(|o| *o *= inv);
+    }
 }
 
 /// Global average pooling: `[h, w, c] -> [1, 1, c]`.

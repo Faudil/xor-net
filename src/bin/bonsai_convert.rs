@@ -4,6 +4,9 @@
 //! the output is reloaded and verified tensor by tensor.
 //!
 //! Usage: bonsai_convert <in.gguf> <out.xq1> [--tokenizer tokenizer.json]
+//!
+//! Kept as a dependency-free alias of `xor-net convert` (feature `cli`),
+//! which also accepts Hub ids and a default output name.
 use std::path::PathBuf;
 use std::time::Instant;
 

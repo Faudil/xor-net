@@ -95,6 +95,8 @@ fn has(feats: &[&str]) -> bool {
         "avx512f" => is_x86_feature_detected!("avx512f"),
         "avx512bw" => is_x86_feature_detected!("avx512bw"),
         "avx512vnni" => is_x86_feature_detected!("avx512vnni"),
+        "avx" => is_x86_feature_detected!("avx"),
+        "f16c" => is_x86_feature_detected!("f16c"),
         other => panic!("unknown feature {other}"),
     })
 }
@@ -808,4 +810,92 @@ fn silu_all_variants_match_reference() {
 fn silu_rejects_mismatched_lengths() {
     let mut g = vec![1.0f32; 64];
     silu_inplace(&mut g, &[1.0; 32], true);
+}
+
+/// Every f16 bit pattern converts exactly like `half` (NaNs stay NaN), in
+/// every kernel variant and at every tail length.
+#[test]
+fn f16_to_f32_all_variants_match_half() {
+    use half::f16;
+    let all: Vec<f16> = (0..=u16::MAX).map(f16::from_bits).collect();
+    let check = |got: &[f32], src: &[f16], tag: &str| {
+        for (i, (&g, s)) in got.iter().zip(src).enumerate() {
+            let w = s.to_f32();
+            assert!(
+                g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan()),
+                "{tag}: {:#06x} -> {g} want {w} (i={i})",
+                s.to_bits()
+            );
+        }
+    };
+    for n in [0usize, 1, 7, 8, 15, 16, 17, 33, all.len()] {
+        let src = &all[all.len() - n..];
+        let mut got = vec![0.0f32; n];
+        fa::f16_to_f32_slice(src, &mut got);
+        check(&got, src, "dispatch");
+        #[cfg(target_arch = "x86_64")]
+        {
+            if has(&["avx512f"]) {
+                got.fill(0.0);
+                unsafe { fa::f16_to_f32_slice_avx512(src, &mut got) };
+                check(&got, src, "avx512");
+            }
+            if has(&["avx", "f16c"]) {
+                got.fill(0.0);
+                unsafe { fa::f16_to_f32_slice_f16c(src, &mut got) };
+                check(&got, src, "f16c");
+            }
+        }
+    }
+}
+
+/// f32 -> f16 rounds like `half::f16::from_f32` (nearest even), including
+/// subnormals, overflow to infinity and NaN.
+#[test]
+fn f32_to_f16_all_variants_match_half() {
+    use half::f16;
+    let mut rng = Rng(0xF16C);
+    let mut src: Vec<f32> = vec![
+        0.0,
+        -0.0,
+        1.0,
+        65504.0,
+        65520.0,
+        1e9,
+        -1e9,
+        6e-8,
+        3e-8,
+        1e-10,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        f32::MIN_POSITIVE,
+    ];
+    // Values whose 13 dropped mantissa bits sit exactly on a rounding tie.
+    src.extend((0..64).map(|i| f32::from_bits(0x3f80_1000 + (i << 13))));
+    src.extend((0..3000).map(|_| rng.f32() * 70000.0));
+    src.extend((0..3000).map(|_| rng.f32() * 1e-4));
+    let want: Vec<f16> = src.iter().map(|&x| f16::from_f32(x)).collect();
+    let check = |got: &[f16], tag: &str| {
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan()),
+                "{tag}: {} -> {:#06x} want {:#06x}",
+                src[i],
+                g.to_bits(),
+                w.to_bits()
+            );
+        }
+    };
+    for n in [0usize, 1, 7, 8, 9, src.len()] {
+        let mut got = vec![f16::ZERO; n];
+        fa::f32_to_f16_slice(&src[..n], &mut got);
+        check(&got, "dispatch");
+        #[cfg(target_arch = "x86_64")]
+        if has(&["avx", "f16c"]) {
+            got.fill(f16::ZERO);
+            unsafe { fa::f32_to_f16_slice_f16c(&src[..n], &mut got) };
+            check(&got, "f16c");
+        }
+    }
 }

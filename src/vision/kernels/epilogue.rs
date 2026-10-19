@@ -30,9 +30,22 @@ impl Epilogue {
         }
     }
 
+    /// [`Self::apply`] to every `channels`-wide pixel of output row `oy`
+    /// (`residual` is the residual map, if any), auto-vectorized for the
+    /// host's best ISA.
+    pub(crate) fn apply_row(
+        &self,
+        residual: Option<&crate::vision::tensor::FeatureMap>,
+        oy: usize,
+        channels: usize,
+        row: &mut [f32],
+    ) {
+        crate::util::with_best_simd!(apply_row_impl(self, residual, oy, channels, row))
+    }
+
     /// Apply in place to one pixel's channels. `residual` must be `Some` iff
     /// `self.residual` (checked).
-    #[inline]
+    #[inline(always)]
     pub fn apply(&self, acc: &mut [f32], residual: Option<&[f32]>) {
         assert_eq!(
             self.residual,
@@ -56,5 +69,18 @@ impl Epilogue {
         if self.post_relu {
             acc.iter_mut().for_each(|v| *v = v.max(0.0));
         }
+    }
+}
+
+#[inline(always)]
+fn apply_row_impl(
+    epi: &Epilogue,
+    residual: Option<&crate::vision::tensor::FeatureMap>,
+    oy: usize,
+    channels: usize,
+    row: &mut [f32],
+) {
+    for (ox, px) in row.chunks_exact_mut(channels).enumerate() {
+        epi.apply(px, residual.map(|r| r.pixel(oy, ox)));
     }
 }

@@ -52,8 +52,7 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             println!("Top 5 tokens:");
-            for i in 0..5.min(indices.len()) {
-                let idx = indices[i];
+            for (i, &idx) in indices.iter().take(5).enumerate() {
                 let tok_str = tokenizer.id_to_token(idx as u32).unwrap_or_default();
                 println!(
                     "  [{}] token_id={}, logit={:.4}, tok={:?}",

@@ -4,45 +4,44 @@ build-backend = "maturin"
 
 [project]
 name = "xor-net"
-version = "0.1.0"
+dynamic = ["version"]
 description = "High-performance CPU inference engine for 1-bit and 1.58-bit quantized LLMs using SIMD-accelerated bitwise operations"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
-authors = [
-    {name = "faudil", email = "faudil@example.com"}
-]
+license = { text = "MIT" }
+authors = [{ name = "Faudil Puttilli" }]
+keywords = ["llm", "quantization", "1-bit", "bitnet", "inference", "cpu"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Rust",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: POSIX :: Linux",
-    "Operating System :: MacOS :: MacOS X",
-    "Operating System :: Microsoft :: Windows",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = []
 
-[tool.maturin]
-features = ["python"]
-bindings = "pyo3"
-module-name = "xor_net"
-exclude = [
-    "/src/*",
-    "/tests/*",
-    "/examples/*",
-    "/.github/*",
-    "/*.md",
-    "!README.md",
-    "/Cargo.lock",
-]
-
-[tool.maturin.sdist]
-include = ["README.md", "LICENSE", "Cargo.toml", "src/**/*.rs"]
+[project.urls]
+Repository = "https://github.com/faudil/xor-net"
+Issues = "https://github.com/faudil/xor-net/issues"
 
 [project.optional-dependencies]
 test = ["pytest", "huggingface-hub"]
+
+[tool.maturin]
+# abi3 (CPython >= 3.10) comes from the pyo3 features in Cargo.toml, so one
+# wheel per platform covers every supported Python version. The sdist file
+# set follows Cargo.toml's `include` list.
+features = ["python"]
+bindings = "pyo3"
+module-name = "xor_net"

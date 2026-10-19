@@ -469,6 +469,11 @@ pub fn binary_conv2d_with(
                             tile_avx2(padded, pix, koff, words, wb, &mut mis);
                             false
                         },
+                        #[cfg(target_arch = "x86_64")]
+                        _ if crate::util::cpu_features().popcnt => unsafe {
+                            tile_scalar_popcnt(padded, pix, koff, words, wb, &mut mis);
+                            false
+                        },
                         _ => {
                             tile_scalar(padded, pix, koff, words, wb, &mut mis);
                             false
@@ -483,16 +488,32 @@ pub fn binary_conv2d_with(
                     ox += np;
                 }
             }
-            for ox in 0..g.ow {
-                let r = residual.map(|r| r.pixel(oy, ox));
-                epi.apply(&mut row[ox * cout..(ox + 1) * cout], r);
-            }
+            epi.apply_row(residual, oy, cout, row);
         });
     out
 }
 
+/// [`tile_scalar`] compiled with the `popcnt` instruction (not in the
+/// x86_64 baseline; without it `count_ones` is a bit-twiddling sequence).
+///
+/// # Safety
+/// The CPU must support `popcnt`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "popcnt")]
+unsafe fn tile_scalar_popcnt(
+    input: &[u64],
+    pix: usize,
+    koff: &[usize],
+    words: usize,
+    wb: &[u64],
+    mis: &mut [u64; BLOCK],
+) {
+    tile_scalar(input, pix, koff, words, wb, mis)
+}
+
 /// Portable kernel: mismatch counts of one pixel against one weight block.
 /// Panics (bounds checks) rather than reading out of range.
+#[inline(always)]
 fn tile_scalar(
     input: &[u64],
     pix: usize,

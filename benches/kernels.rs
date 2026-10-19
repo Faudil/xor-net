@@ -114,6 +114,12 @@ fn ternary_linear(rng: &mut Rng, in_dim: usize, out_dim: usize) -> TernaryLinear
 }
 
 fn main() {
+    // `cargo test --all-targets` also runs this (harness = false) binary,
+    // without `--bench`; the timings are meaningless there, so do nothing.
+    if !std::env::args().any(|a| a == "--bench") {
+        println!("kernels: run with `cargo bench --bench kernels`");
+        return;
+    }
     let filter = std::env::args()
         .skip(1)
         .find(|a| !a.starts_with('-'))
@@ -211,10 +217,16 @@ fn main() {
                 let mut acts = Q8Acts::new();
                 acts.quantize(&x, 1, cols, ab);
                 let mut out = vec![0.0f32; rows];
-                run_bw(&filter, &format!("q1_gemv {name} act{ab} (mt)"), 200, w.nbytes(), || {
-                    gemv(&w, &acts, &mut out);
-                    black_box(&out);
-                });
+                run_bw(
+                    &filter,
+                    &format!("q1_gemv {name} act{ab} (mt)"),
+                    200,
+                    w.nbytes(),
+                    || {
+                        gemv(&w, &acts, &mut out);
+                        black_box(&out);
+                    },
+                );
                 if rows <= 4096 {
                     for isa in Isa::all_supported() {
                         run_bw(
@@ -283,6 +295,10 @@ fn main() {
         );
     }
 
+    // ── End-to-end synthetic models (non-kernel code: attention, RoPE, ──
+    // ── norms, SwiGLU, Gated DeltaNet, sampling) ──────────────────────────
+    model_benches(&filter, &mut rng);
+
     // ── Element-wise kernels ─────────────────────────────────────────────
     for &n in &[2560usize, 6912] {
         let x: Vec<f32> = (0..n).map(|_| rng.f32() * 4.0).collect();
@@ -315,5 +331,240 @@ fn main() {
             buf.copy_from_slice(&g);
             silu_inplace(black_box(&mut buf), &u, true);
         });
+    }
+}
+
+/// Random Q1_0 matrix (f16 scales around 2^-7) wrapped as a model `Linear`.
+fn q1_linear(rng: &mut Rng, rows: usize, cols: usize, block: usize) -> xor_net::models::q1::Linear {
+    use xor_net::bit1::q1_0::{ByteBuf, Q1Weight};
+    let bits: Vec<u8> = (0..rows * cols / 8).map(|_| rng.byte()).collect();
+    let scales: Vec<u8> = (0..rows * cols / block)
+        .flat_map(|_| (0x2000u16 | (rng.byte() as u16)).to_le_bytes())
+        .collect();
+    xor_net::models::q1::Linear::Q1(
+        Q1Weight::new(
+            rows,
+            cols,
+            block,
+            ByteBuf::from_vec(bits),
+            ByteBuf::from_vec(scales),
+        )
+        .unwrap(),
+    )
+}
+
+fn rand_vec(rng: &mut Rng, n: usize, center: f32, spread: f32) -> Vec<f32> {
+    (0..n).map(|_| center + spread * rng.f32()).collect()
+}
+
+/// Times one decode step (1 token at position `ctx`) after a `ctx`-token
+/// prefill, plus the prefill itself. Weights are random, so the numbers are
+/// what a real model of the same shape costs without the page-cache effects.
+fn bench_decode(
+    filter: &Option<String>,
+    name: &str,
+    model: &dyn xor_net::models::traits::CausalLM,
+    ctx: usize,
+) {
+    let wanted = |n: &str| filter.as_ref().is_none_or(|f| n.contains(f.as_str()));
+    let prefill_name = format!("model {name} prefill {ctx}");
+    let decode_name = format!("model {name} decode @ctx {ctx}");
+    if !wanted(&prefill_name) && !wanted(&decode_name) {
+        return;
+    }
+    let toks: Vec<u32> = (0..ctx as u32).map(|i| (i * 37 + 11) % 1000).collect();
+    let mut st = model.new_state().unwrap();
+    run(filter, &prefill_name, 3, || {
+        st.reset().unwrap();
+        black_box(model.forward(&toks, 0, st.as_mut()).unwrap());
+    });
+    st.reset().unwrap();
+    model.forward(&toks, 0, st.as_mut()).unwrap();
+    // Re-running position `ctx` overwrites the same KV slot each time.
+    run(filter, &decode_name, 40, || {
+        black_box(model.forward(&[7], ctx, st.as_mut()).unwrap());
+    });
+}
+
+fn model_benches(filter: &Option<String>, rng: &mut Rng) {
+    use xor_net::models::q1::Embedding;
+    use xor_net::models::q1::qwen3::{Qwen3Config, Qwen3Layer, Qwen3Model};
+    use xor_net::models::q1::qwen35::{
+        AttnMixer, GdnMixer, Mixer, Qwen35Config, Qwen35Layer, Qwen35Model,
+    };
+
+    // Bonsai-1.7B (Qwen3) shape: 28 layers, 2048 hidden, 16/8 heads of 128.
+    {
+        let (h, inter, nh, nkv, hd, vocab) = (2048, 6144, 16, 8, 128, 151_669);
+        let cfg = Qwen3Config {
+            hidden: h,
+            intermediate: inter,
+            layers: 28,
+            heads: nh,
+            kv_heads: nkv,
+            head_dim: hd,
+            eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            yarn: None,
+            context_length: 4096,
+            vocab,
+            bos: None,
+            eos: vec![1],
+        };
+        let layers = (0..cfg.layers)
+            .map(|_| Qwen3Layer {
+                attn_norm: rand_vec(rng, h, 1.0, 0.2),
+                qkv: q1_linear(rng, (nh + 2 * nkv) * hd, h, 128),
+                q_norm: rand_vec(rng, hd, 1.0, 0.2),
+                k_norm: rand_vec(rng, hd, 1.0, 0.2),
+                o: q1_linear(rng, h, nh * hd, 128),
+                ffn_norm: rand_vec(rng, h, 1.0, 0.2),
+                gate_up: q1_linear(rng, 2 * inter, h, 128),
+                down: q1_linear(rng, h, inter, 128),
+            })
+            .collect();
+        let embed = Embedding(q1_linear(rng, vocab, h, 128));
+        let norm = rand_vec(rng, h, 1.0, 0.2);
+        let m = Qwen3Model::new(cfg, embed, layers, norm, None).unwrap();
+        bench_decode(filter, "qwen3-1.7B", &m, 128);
+        bench_decode(filter, "qwen3-1.7B", &m, 2048);
+    }
+
+    // Qwen3.5-style hybrid (3 Gated DeltaNet : 1 attention), 8 layers of a
+    // 4B-class shape so the recurrent path is measured without a big model.
+    {
+        let (h, inter, vocab) = (2560, 9216, 248_320);
+        let cfg = Qwen35Config {
+            hidden: h,
+            intermediate: inter,
+            layers: 8,
+            recurrent: (0..8).map(|i| i % 4 != 3).collect(),
+            heads: 16,
+            kv_heads: 4,
+            head_dim: 256,
+            rot_dim: 64,
+            eps: 1e-6,
+            rope_theta: 10_000_000.0,
+            yarn: None,
+            context_length: 4096,
+            vocab,
+            bos: None,
+            eos: vec![1],
+            conv_kernel: 4,
+            k_heads: 16,
+            v_heads: 32,
+            head_k_dim: 128,
+            head_v_dim: 128,
+        };
+        let (cd, vd, nv) = (cfg.conv_dim(), cfg.value_dim(), cfg.v_heads);
+        let qd = cfg.heads * cfg.head_dim;
+        let kvd = cfg.kv_heads * cfg.head_dim;
+        let layers = cfg
+            .recurrent
+            .clone()
+            .into_iter()
+            .map(|rec| {
+                let mixer = if rec {
+                    Mixer::Gdn(GdnMixer {
+                        qkvz: q1_linear(rng, cd + vd, h, 128),
+                        ba: q1_linear(rng, 2 * nv, h, 128),
+                        conv: rand_vec(rng, cd * 4, 0.0, 0.5),
+                        dt_bias: rand_vec(rng, nv, 0.0, 1.0),
+                        ssm_a: rand_vec(rng, nv, -1.0, 0.5),
+                        norm: rand_vec(rng, cfg.head_v_dim, 1.0, 0.2),
+                        out: q1_linear(rng, h, vd, 128),
+                    })
+                } else {
+                    Mixer::Attn(AttnMixer {
+                        qkv: q1_linear(rng, 2 * qd + 2 * kvd, h, 128),
+                        q_norm: rand_vec(rng, cfg.head_dim, 1.0, 0.2),
+                        k_norm: rand_vec(rng, cfg.head_dim, 1.0, 0.2),
+                        o: q1_linear(rng, h, qd, 128),
+                    })
+                };
+                Qwen35Layer {
+                    attn_norm: rand_vec(rng, h, 1.0, 0.2),
+                    mixer,
+                    post_norm: rand_vec(rng, h, 1.0, 0.2),
+                    gate_up: q1_linear(rng, 2 * inter, h, 128),
+                    down: q1_linear(rng, h, inter, 128),
+                }
+            })
+            .collect();
+        let embed = Embedding(q1_linear(rng, vocab, h, 128));
+        let norm = rand_vec(rng, h, 1.0, 0.2);
+        let m = Qwen35Model::new(cfg, embed, layers, norm, None).unwrap();
+        bench_decode(filter, "qwen35-hybrid-8L", &m, 128);
+    }
+
+    // Pieces of one decode step (Bonsai-1.7B shapes).
+    {
+        use xor_net::bit1::q1_0::Q8Acts;
+        use xor_net::models::q1::{KvCache, attention};
+        for &(cols, ab) in &[(2048usize, 32usize), (6144, 32), (2048, 128)] {
+            let x = rand_vec(rng, cols, 0.0, 2.0);
+            let mut acts = Q8Acts::new();
+            run(
+                filter,
+                &format!("q8acts quantize n=1x{cols} act{ab}"),
+                20000,
+                || {
+                    acts.quantize(black_box(&x), 1, cols, ab);
+                    black_box(&acts);
+                },
+            );
+        }
+        let (nh, nkv, hd) = (16usize, 8usize, 128usize);
+        for &ctx in &[128usize, 2048] {
+            let mut kv = KvCache::new(nkv, hd, 4096);
+            kv.reserve(ctx + 1, 0).unwrap();
+            for p in 0..=ctx {
+                for h in 0..nkv {
+                    let k = rand_vec(rng, hd, 0.0, 1.0);
+                    let v = rand_vec(rng, hd, 0.0, 1.0);
+                    kv.store(h, p, &k, &v);
+                }
+            }
+            let q = rand_vec(rng, nh * hd, 0.0, 1.0);
+            let mut out = vec![0.0f32; nh * hd];
+            run(
+                filter,
+                &format!("q1 attention decode ctx={ctx} (16/8 heads)"),
+                2000,
+                || {
+                    attention(black_box(&q), 1, ctx, nh, &kv, 0.088, &mut out);
+                    black_box(&out);
+                },
+            );
+        }
+    }
+
+    // Sampling over a Qwen-sized vocabulary.
+    {
+        use xor_net::sampler::{Sampler, SamplingParams};
+        let logits: Vec<f32> = (0..151_669).map(|_| rng.f32() * 8.0).collect();
+        let ctx: Vec<u32> = (0..256).collect();
+        let mut buf = logits.clone();
+        let mut s = Sampler::from_params(SamplingParams::greedy());
+        run(filter, "sampler greedy vocab 151669", 2000, || {
+            buf.copy_from_slice(&logits);
+            black_box(s.sample(&mut buf, &ctx).unwrap());
+        });
+        let p = SamplingParams::default()
+            .with_temperature(0.7)
+            .with_top_k(40)
+            .with_top_p(0.9)
+            .with_repetition_penalty(1.1)
+            .with_seed(Some(1));
+        let mut s = Sampler::from_params(p);
+        run(
+            filter,
+            "sampler top-k/top-p/penalty vocab 151669",
+            2000,
+            || {
+                buf.copy_from_slice(&logits);
+                black_box(s.sample(&mut buf, &ctx).unwrap());
+            },
+        );
     }
 }

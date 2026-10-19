@@ -145,7 +145,8 @@ pub unsafe fn dot_product_i8_avx512(a: &[i8], b: &[i8]) -> i32 {
         let a1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(a.as_ptr().add(i + 16) as *const __m128i));
         let b1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(b.as_ptr().add(i + 16) as *const __m128i));
         let s = _mm256_add_epi32(_mm256_madd_epi16(a0, b0), _mm256_madd_epi16(a1, b1));
-        acc = _mm512_add_epi32(acc, _mm512_inserti32x8(_mm512_setzero_si512(), s, 0));
+        // `_mm512_inserti32x8` would need AVX-512DQ; this is AVX-512F.
+        acc = _mm512_add_epi32(acc, _mm512_inserti64x4::<0>(_mm512_setzero_si512(), s));
         i += 32;
     }
 
@@ -312,6 +313,20 @@ fn int4_dot_row(w_packed: &[u8], q_in: &[i8], in_dim: usize) -> i32 {
         dot += q_in[in_dim - 1] as i32 * q0 as i32;
     }
     dot
+}
+
+/// Body of [`Int4Linear::gemv_rows`]; a function so `out` is a `noalias`
+/// argument under `with_best_simd!`.
+#[inline(always)]
+fn int4_rows(lin: &Int4Linear, start: usize, q_in: &[i8], inv_scale: f32, out: &mut [f32]) {
+    let in_dim = lin.in_dim;
+    let bpr = in_dim.div_ceil(2);
+    for (i, out_val) in out.iter_mut().enumerate() {
+        let o = start + i;
+        let w_packed = &lin.weight_i4[o * bpr..(o + 1) * bpr];
+        let dot = int4_dot_row(w_packed, q_in, in_dim);
+        *out_val = dot as f32 * inv_scale * lin.scales[o];
+    }
 }
 
 /// Leading (batch) element count of a tensor shape, i.e. the product of all
@@ -543,6 +558,13 @@ impl Int4Linear {
         }
     }
 
+    /// `out[i] = dot(row start + i, q_in) * inv_scale * scale` for every
+    /// `i < out.len()`. The plain-Rust nibble loop is auto-vectorized, so it
+    /// runs under `with_best_simd!`.
+    fn gemv_rows(&self, start: usize, q_in: &[i8], inv_scale: f32, out: &mut [f32]) {
+        crate::util::with_best_simd!(int4_rows(self, start, q_in, inv_scale, out))
+    }
+
     pub fn forward(&self, xs: &FastTensor) -> anyhow::Result<FastTensor> {
         let rank = xs.shape.len();
         if rank == 0 {
@@ -573,14 +595,7 @@ impl Int4Linear {
                 .par_chunks_mut(chunk_size)
                 .enumerate()
                 .for_each(|(chunk_idx, out_chunk)| {
-                    let start_o = chunk_idx * chunk_size;
-                    for (i, out_val) in out_chunk.iter_mut().enumerate() {
-                        let o = start_o + i;
-                        let bpr = in_dim.div_ceil(2);
-                        let w_packed = &self.weight_i4[o * bpr..(o + 1) * bpr];
-                        let dot = int4_dot_row(w_packed, &quantized_in, in_dim);
-                        *out_val = dot as f32 * inv_scale * self.scales[o];
-                    }
+                    self.gemv_rows(chunk_idx * chunk_size, &quantized_in, inv_scale, out_chunk);
                 });
             crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
         } else {
@@ -593,12 +608,7 @@ impl Int4Linear {
                     let inv_scale =
                         crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
 
-                    for (o, out_val) in out_row.iter_mut().enumerate() {
-                        let bpr = in_dim.div_ceil(2);
-                        let w_packed = &self.weight_i4[o * bpr..(o + 1) * bpr];
-                        let dot = int4_dot_row(w_packed, &quantized_in, in_dim);
-                        *out_val = dot as f32 * inv_scale * self.scales[o];
-                    }
+                    self.gemv_rows(0, &quantized_in, inv_scale, out_row);
                     crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
                 });
         }
@@ -629,19 +639,12 @@ impl Int4Linear {
         let mut out_data = crate::tensor::workspace::get_pooled_buffer(out_dim);
         let num_threads = crate::util::get_num_threads();
         let chunk_size = out_dim.div_ceil(num_threads).max(128);
-        let bpr = in_dim.div_ceil(2);
 
         out_data
             .par_chunks_mut(chunk_size)
             .enumerate()
             .for_each(|(chunk_idx, out_chunk)| {
-                let start_o = chunk_idx * chunk_size;
-                for (i, out_val) in out_chunk.iter_mut().enumerate() {
-                    let o = start_o + i;
-                    let w_packed = &self.weight_i4[o * bpr..(o + 1) * bpr];
-                    let dot = int4_dot_row(w_packed, quantized_in, in_dim);
-                    *out_val = dot as f32 * inv_scale * self.scales[o];
-                }
+                self.gemv_rows(chunk_idx * chunk_size, quantized_in, inv_scale, out_chunk);
             });
 
         Ok(FastTensor::new(out_data, out_shape))

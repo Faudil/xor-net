@@ -17,13 +17,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use half::f16;
-use half::slice::HalfFloatSliceExt;
 use rayon::prelude::*;
 
 use crate::bit1::q1_0::{Q1Weight, Q8Acts, gemm};
 use crate::loader::gguf::{GgufFile, dequantize_data, is_prism_dtype};
 use crate::models::traits::CausalLM;
-use crate::nn::fast_attention_simd::dot_product_f32;
+use crate::nn::fast_attention_simd::{
+    dot_product_f32, f16_to_f32_slice, f32_to_f16_slice, weighted_sum,
+};
 
 // ---------------------------------------------------------------------------
 // Linear layers
@@ -348,20 +349,24 @@ impl KvCache {
         let hd = self.head_dim;
         assert!(h < self.kv_heads && p < self.cap, "KV store out of range");
         let o = (h * self.cap + p) * hd;
-        self.k[o..o + hd].convert_from_f32_slice(k);
-        self.v[o..o + hd].convert_from_f32_slice(v);
+        f32_to_f16_slice(k, &mut self.k[o..o + hd]);
+        f32_to_f16_slice(v, &mut self.v[o..o + hd]);
     }
 
+    /// K vectors of head `h` for positions `p0..p1`, contiguous.
     #[inline]
-    fn k_row(&self, h: usize, p: usize) -> &[f16] {
-        let o = (h * self.cap + p) * self.head_dim;
-        &self.k[o..o + self.head_dim]
+    fn k_rows(&self, h: usize, p0: usize, p1: usize) -> &[f16] {
+        assert!(p0 <= p1 && p1 <= self.cap, "KV rows out of range");
+        let base = h * self.cap;
+        &self.k[(base + p0) * self.head_dim..(base + p1) * self.head_dim]
     }
 
+    /// V vectors of head `h` for positions `p0..p1`, contiguous.
     #[inline]
-    fn v_row(&self, h: usize, p: usize) -> &[f16] {
-        let o = (h * self.cap + p) * self.head_dim;
-        &self.v[o..o + self.head_dim]
+    fn v_rows(&self, h: usize, p0: usize, p1: usize) -> &[f16] {
+        assert!(p0 <= p1 && p1 <= self.cap, "KV rows out of range");
+        let base = h * self.cap;
+        &self.v[(base + p0) * self.head_dim..(base + p1) * self.head_dim]
     }
 
     pub fn bytes(&self) -> usize {
@@ -436,14 +441,9 @@ pub fn attention(
             let cl = p1 - p0;
             let mut kf = vec![0.0f32; cl * hd];
             let mut vf = vec![0.0f32; cl * hd];
-            for p in p0..p1 {
-                cache
-                    .k_row(kvh, p)
-                    .convert_to_f32_slice(&mut kf[(p - p0) * hd..(p - p0 + 1) * hd]);
-                cache
-                    .v_row(kvh, p)
-                    .convert_to_f32_slice(&mut vf[(p - p0) * hd..(p - p0 + 1) * hd]);
-            }
+            // Positions p0..p1 of one head are contiguous in the cache.
+            f16_to_f32_slice(cache.k_rows(kvh, p0, p1), &mut kf);
+            f16_to_f32_slice(cache.v_rows(kvh, p0, p1), &mut vf);
             let mut res = Vec::with_capacity(t1 - t0);
             let mut sc = vec![0.0f32; cl];
             for t in t0..t1 {
@@ -464,14 +464,20 @@ pub fn attention(
                     }
                     let m = sc[..vis].iter().copied().fold(f32::NEG_INFINITY, f32::max);
                     let mut l = 0.0f32;
-                    let acc = &mut part.acc[g * hd..(g + 1) * hd];
-                    for (j, &s) in sc[..vis].iter().enumerate() {
-                        let e = (s - m).exp();
-                        l += e;
-                        for (a, &v) in acc.iter_mut().zip(&vf[j * hd..(j + 1) * hd]) {
-                            *a += e * v;
-                        }
+                    for s in sc[..vis].iter_mut() {
+                        *s = (*s - m).exp();
+                        l += *s;
                     }
+                    // acc = sum_j e_j * V_j (SIMD-dispatched).
+                    weighted_sum(
+                        &mut part.acc[g * hd..(g + 1) * hd],
+                        &sc,
+                        &vf,
+                        0,
+                        cl,
+                        hd,
+                        vis,
+                    );
                     part.m[g] = m;
                     part.l[g] = l;
                 }
@@ -797,8 +803,8 @@ mod tests {
         c.reserve(700, 3).unwrap();
         assert!(c.cap >= 700 && c.cap <= 1000);
         for p in 0..3 {
-            assert_eq!(c.k_row(1, p)[0].to_f32(), p as f32);
-            assert_eq!(c.v_row(1, p)[3].to_f32(), -(p as f32));
+            assert_eq!(c.k_rows(1, p, p + 1)[0].to_f32(), p as f32);
+            assert_eq!(c.v_rows(1, p, p + 1)[3].to_f32(), -(p as f32));
         }
         assert!(c.reserve(1001, 700).is_err());
     }

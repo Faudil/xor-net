@@ -18,44 +18,31 @@ pub use gguf::{BonsaiConfig, GgufFile, GgufMetadata, GgufTensorInfo, dequantize_
 fn convert_to_f32_vec(bytes: &[u8], dtype: Dtype) -> anyhow::Result<Vec<f32>> {
     match dtype {
         Dtype::F32 => {
-            if bytes.len() % 4 != 0 {
+            if !bytes.len().is_multiple_of(4) {
                 anyhow::bail!("F32 bytes length not multiple of 4: {}", bytes.len());
             }
-            let count = bytes.len() / 4;
-            let mut out = vec![0.0f32; count];
-            for i in 0..count {
-                let offset = i * 4;
-                out[i] = f32::from_le_bytes([
-                    bytes[offset],
-                    bytes[offset + 1],
-                    bytes[offset + 2],
-                    bytes[offset + 3],
-                ]);
-            }
-            Ok(out)
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
         }
         Dtype::BF16 => {
-            if bytes.len() % 2 != 0 {
+            if !bytes.len().is_multiple_of(2) {
                 anyhow::bail!("BF16 bytes length not multiple of 2: {}", bytes.len());
             }
-            let count = bytes.len() / 2;
-            let mut out = vec![0.0f32; count];
-            for i in 0..count {
-                let offset = i * 2;
-                let bf16_val = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
-                out[i] = f32::from_bits((bf16_val as u32) << 16);
-            }
-            Ok(out)
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect())
         }
         Dtype::F16 => {
-            if bytes.len() % 2 != 0 {
+            if !bytes.len().is_multiple_of(2) {
                 anyhow::bail!("F16 bytes length not multiple of 2: {}", bytes.len());
             }
             let count = bytes.len() / 2;
             let mut out = vec![0.0f32; count];
-            for i in 0..count {
-                let offset = i * 2;
-                let f16_val = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+            for (o, c) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+                let f16_val = u16::from_le_bytes([c[0], c[1]]);
                 let sign = (f16_val & 0x8000) as u32;
                 let exp = (f16_val & 0x7c00) >> 10;
                 let mant = f16_val & 0x03ff;
@@ -84,7 +71,7 @@ fn convert_to_f32_vec(bytes: &[u8], dtype: Dtype) -> anyhow::Result<Vec<f32>> {
                     let new_exp = (exp as i32 - 15 + 127) as u32;
                     (sign << 16) | (new_exp << 23) | ((mant as u32) << 13)
                 };
-                out[i] = f32::from_bits(f32_bits);
+                *o = f32::from_bits(f32_bits);
             }
             Ok(out)
         }
@@ -137,7 +124,7 @@ pub fn load_packed_ternary_weight(
     // can always multiply by the scale, regardless of source.
     let w_scale = 1.0 / scale_data[0];
 
-    let packed_data: Vec<u8> = weight_bytes.iter().map(|&b| b).collect();
+    let packed_data: Vec<u8> = weight_bytes.to_vec();
     let expected_out_dim = expected_shape[0];
     let expected_in_dim = expected_shape[1];
     let expected_len = expected_out_dim * expected_in_dim;
@@ -154,14 +141,14 @@ pub fn load_packed_ternary_weight(
     let stored_in_dim = expected_in_dim;
     let stored_rows = expected_out_dim / 4;
     let mut data = vec![0.0f32; expected_len];
-    for k in 0..expected_len {
+    for (k, &t) in ternary_values.iter().enumerate().take(expected_len) {
         let byte_idx = k / 4;
         let j = k % 4;
         let row_p = byte_idx / stored_in_dim;
         let col = byte_idx % stored_in_dim;
         let o = j * stored_rows + row_p;
         let i = col;
-        data[o * expected_in_dim + i] = ternary_values[k] * w_scale;
+        data[o * expected_in_dim + i] = t * w_scale;
     }
 
     Ok(FastTensor::new(data, expected_shape.to_vec()))
@@ -397,28 +384,28 @@ impl<'a> SafeTensorLoader<'a> {
 
         // Transpose to standard row-major [out_dim, in_dim]
         let mut row_major = vec![0.0f32; expected_len];
-        for k in 0..expected_len {
+        for (k, &t) in ternary_values.iter().enumerate().take(expected_len) {
             let byte_idx = k / pack_factor;
             let j = k % pack_factor;
             let row_p = byte_idx / in_dim;
             let col = byte_idx % in_dim;
             let o = j * stored_rows + row_p;
             let i = col;
-            row_major[o * in_dim + i] = ternary_values[k];
+            row_major[o * in_dim + i] = t;
         }
 
         // Repack in input-dim order (4 consecutive input values per byte).
         // Values are already ternary {-1, 0, 1}, so use scale=1.0 to preserve them.
         let repacked = match pack_type {
             TernaryPackType::Pack4 => {
-                let mut out = Vec::with_capacity((expected_len + 3) / 4);
+                let mut out = Vec::with_capacity(expected_len.div_ceil(4));
                 for row in row_major.chunks(in_dim) {
                     out.extend_from_slice(&pack_1_58bit_4pack(row, 1.0));
                 }
                 out
             }
             TernaryPackType::Pack5 => {
-                let mut out = Vec::with_capacity((expected_len + 4) / 5);
+                let mut out = Vec::with_capacity(expected_len.div_ceil(5));
                 for row in row_major.chunks(in_dim) {
                     out.extend_from_slice(&pack_1_58bit_5pack(row, 1.0));
                 }

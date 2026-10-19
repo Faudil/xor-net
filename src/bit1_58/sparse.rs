@@ -41,7 +41,7 @@ pub const BLOCK_SIZE: usize = 64;
 /// the sparse path is currently performance-neutral versus dense; the on-disk
 /// file is still ~18% smaller. Reading the *compact* 12-byte block and expanding
 /// signs to lane order with a vectorised gather is the follow-up that turns the
-/// on-disk saving into a per-token speedup (see `SPARSE_FORMAT.md`).
+/// on-disk saving into a per-token speedup (see `docs/formats.md`).
 #[derive(Clone, Debug)]
 pub struct SparseTernary {
     pub blob: Vec<u8>,

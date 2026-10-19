@@ -56,24 +56,22 @@ pub enum LlamaEosToks {
 // Activation
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Activation {
+    #[default]
     Silu,
     Relu2,
 }
 
-impl Default for Activation {
-    fn default() -> Self {
-        Self::Silu
-    }
-}
+impl std::str::FromStr for Activation {
+    type Err = std::convert::Infallible;
 
-impl Activation {
-    pub fn from_str(s: &str) -> Self {
-        match s {
+    /// `"relu2"` -> [`Activation::Relu2`]; anything else -> [`Activation::Silu`].
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "relu2" => Activation::Relu2,
             _ => Activation::Silu,
-        }
+        })
     }
 }
 
@@ -132,7 +130,7 @@ impl LlamaConfig {
             hidden_act: self
                 .hidden_act
                 .as_deref()
-                .map(Activation::from_str)
+                .and_then(|s| s.parse().ok())
                 .unwrap_or_default(),
         }
     }

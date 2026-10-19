@@ -105,14 +105,13 @@ fn main() -> anyhow::Result<()> {
     // on a fixed core subset, keeping the optimal thread count per stream.
     let pools: Vec<Arc<rayon::ThreadPool>> = if pool_threads > 0 {
         (0..streams)
-            .map(|_| {
+            .filter_map(|_| {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(pool_threads)
                     .build()
                     .ok()
                     .map(Arc::new)
             })
-            .flatten()
             .collect()
     } else {
         Vec::new()
@@ -140,7 +139,7 @@ fn main() -> anyhow::Result<()> {
         let tok = Arc::clone(&tokenizer);
         let pool: Option<Arc<rayon::ThreadPool>> = pools.get(s).cloned();
         handles.push(std::thread::spawn(move || {
-            let run = || run_stream(&*model, &*cfg, &pids[..], &*tok, tokens, s as u64);
+            let run = || run_stream(&model, &cfg, &pids[..], &tok, tokens, s as u64);
             match pool {
                 Some(p) => p.install(run),
                 None => run(),

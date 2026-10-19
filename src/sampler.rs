@@ -14,6 +14,7 @@
 //! given vocabulary size, sampling performs no heap allocation. The greedy
 //! path is a single argmax pass over the logits.
 
+use crate::util::with_best_simd;
 use std::hash::{BuildHasher, Hasher};
 
 /// Sampling configuration. `Default` matches the OpenAI defaults
@@ -210,6 +211,13 @@ fn fast_exp_neg(x: f32) -> f32 {
 
 /// In place: `v[i] = exp(v[i] - max)`; returns the sum.
 fn exp_inplace(v: &mut [f32], max: f32) -> f32 {
+    with_best_simd!(exp_inplace_lanes(v, max))
+}
+
+/// [`exp_inplace`] without the ISA dispatch (arguments, not captures, so LLVM
+/// knows the slices do not alias).
+#[inline(always)]
+fn exp_inplace_lanes(v: &mut [f32], max: f32) -> f32 {
     let mut acc = [0.0f32; LANES];
     let mut chunks = v.chunks_exact_mut(LANES);
     for c in &mut chunks {
@@ -243,6 +251,13 @@ fn fmax(a: f32, b: f32) -> f32 {
 /// In place: scale by `inv_temp`, map NaN to -inf and +inf to `f32::MAX`;
 /// returns the maximum.
 fn scale_sanitize_max(v: &mut [f32], inv_temp: f32) -> f32 {
+    with_best_simd!(scale_sanitize_max_lanes(v, inv_temp))
+}
+
+/// [`scale_sanitize_max`] without the ISA dispatch (arguments, not captures, so LLVM
+/// knows the slices do not alias).
+#[inline(always)]
+fn scale_sanitize_max_lanes(v: &mut [f32], inv_temp: f32) -> f32 {
     let mut m = [f32::NEG_INFINITY; LANES];
     let mut chunks = v.chunks_exact_mut(LANES);
     for c in &mut chunks {
@@ -263,6 +278,13 @@ fn scale_sanitize_max(v: &mut [f32], inv_temp: f32) -> f32 {
 
 /// Maximum ignoring NaN (`-inf` if none).
 fn max_of(v: &[f32]) -> f32 {
+    with_best_simd!(max_of_lanes(v))
+}
+
+/// [`max_of`] without the ISA dispatch, for callers that already run under
+/// `with_best_simd!` (or call it on tiny slices).
+#[inline(always)]
+fn max_of_lanes(v: &[f32]) -> f32 {
     let mut m = [f32::NEG_INFINITY; LANES];
     let mut chunks = v.chunks_exact(LANES);
     for c in &mut chunks {
@@ -292,6 +314,13 @@ fn argmax(v: &[f32]) -> Option<usize> {
 /// Sum of the entries `>= thr` (NaN never counts).
 #[inline]
 fn masked_sum(w: &[f32], thr: f32) -> f32 {
+    with_best_simd!(masked_sum_lanes(w, thr))
+}
+
+/// [`masked_sum`] without the ISA dispatch (arguments, not captures, so LLVM
+/// knows the slices do not alias).
+#[inline(always)]
+fn masked_sum_lanes(w: &[f32], thr: f32) -> f32 {
     let mut acc = [0.0f32; LANES];
     let mut chunks = w.chunks_exact(LANES);
     for c in &mut chunks {
@@ -331,6 +360,13 @@ fn scan_dense(w: &[f32], thr: f32, r: f32) -> Option<usize> {
 /// Sum and count of the entries `>= thr` (NaN never counts).
 #[inline]
 fn masked_sum_count(w: &[f32], thr: f32) -> (f32, usize) {
+    with_best_simd!(masked_sum_count_lanes(w, thr))
+}
+
+/// [`masked_sum_count`] without the ISA dispatch (arguments, not captures, so LLVM
+/// knows the slices do not alias).
+#[inline(always)]
+fn masked_sum_count_lanes(w: &[f32], thr: f32) -> (f32, usize) {
     let mut acc = [0.0f32; LANES];
     let mut cnt = [0u32; LANES];
     let mut chunks = w.chunks_exact(LANES);
@@ -648,23 +684,26 @@ impl Sampler {
             // Min-sorted bounded buffer. Blocks whose SIMD max cannot beat
             // the current k-th value are skipped wholesale.
             const BLOCK: usize = 64;
-            for (bi, block) in logits.chunks(BLOCK).enumerate() {
-                if self.topk.len() == k && max_of(block) <= self.topk[0].0 {
-                    continue;
-                }
-                for (j, &v) in block.iter().enumerate() {
-                    let tok = (bi * BLOCK + j) as u32;
-                    if self.topk.len() < k {
-                        let pos = self.topk.partition_point(|&(x, _)| x < v);
-                        self.topk.insert(pos, (v, tok));
-                    } else if v > self.topk[0].0 {
-                        let pos = self.topk.partition_point(|&(x, _)| x < v);
-                        // Drop the minimum, shift the smaller entries down.
-                        self.topk.copy_within(1..pos, 0);
-                        self.topk[pos - 1] = (v, tok);
+            let topk = &mut self.topk;
+            with_best_simd!({
+                for (bi, block) in logits.chunks(BLOCK).enumerate() {
+                    if topk.len() == k && max_of_lanes(block) <= topk[0].0 {
+                        continue;
+                    }
+                    for (j, &v) in block.iter().enumerate() {
+                        let tok = (bi * BLOCK + j) as u32;
+                        if topk.len() < k {
+                            let pos = topk.partition_point(|&(x, _)| x < v);
+                            topk.insert(pos, (v, tok));
+                        } else if v > topk[0].0 {
+                            let pos = topk.partition_point(|&(x, _)| x < v);
+                            // Drop the minimum, shift the smaller entries down.
+                            topk.copy_within(1..pos, 0);
+                            topk[pos - 1] = (v, tok);
+                        }
                     }
                 }
-            }
+            })
         } else {
             self.idx.clear();
             self.idx.extend(0..logits.len() as u32);

@@ -121,6 +121,11 @@ pub fn quantize_f32_to_i8_scalar(activations: &[f32], quantized: &mut [i8]) -> f
         quantized.len() >= activations.len(),
         "quantize_f32_to_i8: output shorter than input"
     );
+    quantize_f32_to_i8_loops(activations, quantized)
+}
+
+#[inline(always)]
+fn quantize_f32_to_i8_loops(activations: &[f32], quantized: &mut [i8]) -> f32 {
     let mut max_abs: f32 = 0.0;
     for &x in activations {
         if x.abs() > max_abs {
@@ -148,11 +153,11 @@ pub unsafe fn quantize_f32_to_i8_avx512(activations: &[f32], quantized: &mut [i8
     let chunks = activations.len() / 16;
     let ptr = activations.as_ptr();
 
-    let sign_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFFFFFF));
-
     for i in 0..chunks {
         let v = _mm512_loadu_ps(ptr.add(i * 16));
-        let abs_v = _mm512_and_ps(sign_mask, v);
+        // `_mm512_abs_ps` is AVX-512F; `_mm512_and_ps` would need AVX-512DQ
+        // (not enabled here, so it would not even inline).
+        let abs_v = _mm512_abs_ps(v);
         max_vec = _mm512_max_ps(max_vec, abs_v);
     }
 
@@ -214,7 +219,8 @@ pub fn quantize_f32_to_i8(activations: &[f32], quantized: &mut [i8]) -> f32 {
             return unsafe { quantize_f32_to_i8_avx512(activations, quantized) };
         }
     }
-    quantize_f32_to_i8_scalar(activations, quantized)
+    // Plain loops; `round_ties_even` needs SSE4.1 to avoid a libm call.
+    crate::util::with_best_simd!(quantize_f32_to_i8_loops(activations, quantized))
 }
 
 #[inline(always)]

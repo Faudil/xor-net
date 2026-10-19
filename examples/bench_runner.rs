@@ -175,7 +175,6 @@ fn mem_kb() -> (u64, u64) {
         for l in s.lines() {
             if let Some(rest) = l.strip_prefix("VmRSS:") {
                 rss = rest
-                    .trim()
                     .split_whitespace()
                     .next()
                     .and_then(|x| x.parse().ok())
@@ -183,7 +182,6 @@ fn mem_kb() -> (u64, u64) {
             }
             if let Some(rest) = l.strip_prefix("VmHWM:") {
                 hwm = rest
-                    .trim()
                     .split_whitespace()
                     .next()
                     .and_then(|x| x.parse().ok())
@@ -330,6 +328,7 @@ fn run_stream(
     (ng, tps)
 }
 
+#[allow(clippy::too_many_arguments)] // benchmark driver: one knob per argument
 fn run_concurrent(
     model: Arc<Llama>,
     cfg: Arc<Config>,
@@ -585,15 +584,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     let json_line = Value::Object(obj).to_string();
-    if let Some(log) = env_str("XORNET_LOG") {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Some(log) = env_str("XORNET_LOG")
+        && let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log)
-        {
-            let _ = f.write_all(json_line.as_bytes());
-            let _ = f.write_all(b"\n");
-        }
+    {
+        let _ = f.write_all(json_line.as_bytes());
+        let _ = f.write_all(b"\n");
     }
     println!("{}", json_line);
     Ok(())

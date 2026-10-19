@@ -11,11 +11,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Issue a non-temporal prefetch for the leading cache line of a projection's
 /// packed ternary weights (no-op for non-ternary projections).
 fn prefetch_proj(lin: &DynamicLinear) {
-    if let LinearKind::Ternary(t) = &lin.inner {
-        if let Some(ptr) = t.prefetch_ptr() {
-            unsafe {
-                crate::models::llama::prefetch_weight(ptr);
-            }
+    if let LinearKind::Ternary(t) = &lin.inner
+        && let Some(ptr) = t.prefetch_ptr()
+    {
+        unsafe {
+            crate::models::llama::prefetch_weight(ptr);
         }
     }
 }
@@ -51,50 +51,48 @@ impl Mlp {
         // Fast path: all three projections are ternary and batch size is 1.
         // Quantize the input once and run gate+up+silu+down with no intermediate
         // DynamicLinear dispatch or extra allocations.
-        if b_size == 1 {
-            if let (LinearKind::Ternary(gate_lin), LinearKind::Ternary(up_lin)) =
+        if b_size == 1
+            && let (LinearKind::Ternary(gate_lin), LinearKind::Ternary(up_lin)) =
                 (&self.c_fc1.inner, &self.c_fc2.inner)
-            {
-                let in_row = &x.data[0..gate_lin.in_dim];
-                let mut quantized_in =
-                    crate::tensor::workspace::get_pooled_buffer_i8(gate_lin.in_dim);
-                let inv_scale =
-                    crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
-                let use_silu = matches!(self.hidden_act, Activation::Silu);
+        {
+            let in_row = &x.data[0..gate_lin.in_dim];
+            let mut quantized_in = crate::tensor::workspace::get_pooled_buffer_i8(gate_lin.in_dim);
+            let inv_scale =
+                crate::bit1_58::quantization::quantize_f32_to_i8(in_row, &mut quantized_in);
+            let use_silu = matches!(self.hidden_act, Activation::Silu);
 
-                if let LinearKind::Ternary(down_lin) = &self.c_proj.inner {
-                    // All-ternary: fully fused gate+up+silu+down (VNNI kernel).
-                    let result = crate::bit1_58::layers::TernaryLinear::fused_mlp_all(
-                        x,
-                        &quantized_in,
-                        inv_scale,
-                        gate_lin,
-                        up_lin,
-                        down_lin,
-                        self.ffn_layernorm.as_ref(),
-                        use_silu,
-                    );
-                    crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
-                    return result;
-                }
+            if let LinearKind::Ternary(down_lin) = &self.c_proj.inner {
+                // All-ternary: fully fused gate+up+silu+down (VNNI kernel).
+                let result = crate::bit1_58::layers::TernaryLinear::fused_mlp_all(
+                    x,
+                    &quantized_in,
+                    inv_scale,
+                    gate_lin,
+                    up_lin,
+                    down_lin,
+                    self.ffn_layernorm.as_ref(),
+                    use_silu,
+                );
+                crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
+                return result;
+            }
 
-                if let LinearKind::Int8(_) = &self.c_proj.inner {
-                    // Non-ternary down (e.g. Int8): still fuse gate+up+silu and
-                    // feed the single quantized activation to down_proj, avoiding
-                    // the separate c_proj.forward re-quantization fallback.
-                    let result = crate::bit1_58::layers::TernaryLinear::fused_mlp_gate_up_down(
-                        x,
-                        &quantized_in,
-                        inv_scale,
-                        gate_lin,
-                        up_lin,
-                        &self.c_proj,
-                        self.ffn_layernorm.as_ref(),
-                        use_silu,
-                    );
-                    crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
-                    return result;
-                }
+            if let LinearKind::Int8(_) = &self.c_proj.inner {
+                // Non-ternary down (e.g. Int8): still fuse gate+up+silu and
+                // feed the single quantized activation to down_proj, avoiding
+                // the separate c_proj.forward re-quantization fallback.
+                let result = crate::bit1_58::layers::TernaryLinear::fused_mlp_gate_up_down(
+                    x,
+                    &quantized_in,
+                    inv_scale,
+                    gate_lin,
+                    up_lin,
+                    &self.c_proj,
+                    self.ffn_layernorm.as_ref(),
+                    use_silu,
+                );
+                crate::tensor::workspace::return_pooled_buffer_i8(quantized_in);
+                return result;
             }
         }
 

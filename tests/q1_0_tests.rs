@@ -109,7 +109,10 @@ fn every_isa_matches_scalar() {
         }
         for &(rows, cols) in &shapes {
             let w = random_weight(&mut rng, dtype, rows, cols);
-            for ab in [32, 128].into_iter().filter(|ab| w.block().is_multiple_of(*ab)) {
+            for ab in [32, 128]
+                .into_iter()
+                .filter(|ab| w.block().is_multiple_of(*ab))
+            {
                 let (_, acts) = random_acts(&mut rng, 1, cols, ab);
                 let a: ActRow = acts.row(0);
                 let mut want = vec![0.0; rows];

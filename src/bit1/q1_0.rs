@@ -270,7 +270,9 @@ impl Q1Weight {
     }
 
     /// Scale of block `b` of row `r`.
-    #[inline]
+    // `always`: otherwise it stays out of line in the `#[target_feature]`
+    // kernels (one call per weight block) unless built with target-cpu=native.
+    #[inline(always)]
     pub fn scale(&self, r: usize, b: usize) -> f32 {
         let i = (r * (self.cols / self.block) + b) * 2;
         let s = self.scales.as_slice();
@@ -329,7 +331,9 @@ pub struct ActRow<'a> {
 /// Quantize one block: returns `d` with `x ≈ q * d`, `|q| ≤ 127`
 /// (round half to even). NaN elements map to 0; an infinite element makes
 /// `d` NaN so the non-finite input stays visible in the output.
-#[inline]
+// `always`, and callers run it under `with_best_simd!`: on the x86_64
+// baseline (no SSE4.1) `round_ties_even` is a libm call per element.
+#[inline(always)]
 fn quantize_block(x: &[f32], q: &mut [i8]) -> f32 {
     let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     if amax == 0.0 || !amax.is_finite() {
@@ -371,19 +375,26 @@ impl Q8Acts {
         let nblk = n * cols / block;
         self.q.resize(n * cols, 0);
         self.d.resize(nblk, 0.0);
+        let quantize_rows = |x: &[f32], q: &mut [i8], d: &mut [f32]| {
+            crate::util::with_best_simd!({
+                for ((xb, qb), d) in x
+                    .chunks_exact(block)
+                    .zip(q.chunks_exact_mut(block))
+                    .zip(d.iter_mut())
+                {
+                    *d = quantize_block(xb, qb);
+                }
+            })
+        };
         if nblk * block >= 1 << 17 {
-            x.par_chunks_exact(block)
-                .zip(self.q.par_chunks_exact_mut(block))
-                .zip(self.d.par_iter_mut())
-                .for_each(|((xb, qb), d)| *d = quantize_block(xb, qb));
+            // Parallel over groups of whole blocks (one dispatch per group).
+            let per = 64;
+            x.par_chunks(per * block)
+                .zip(self.q.par_chunks_mut(per * block))
+                .zip(self.d.par_chunks_mut(per))
+                .for_each(|((xb, qb), d)| quantize_rows(xb, qb, d));
         } else {
-            for ((xb, qb), d) in x
-                .chunks_exact(block)
-                .zip(self.q.chunks_exact_mut(block))
-                .zip(self.d.iter_mut())
-            {
-                *d = quantize_block(xb, qb);
-            }
+            quantize_rows(x, &mut self.q, &mut self.d);
         }
         if block == SUB {
             self.lane_d.resize(n * cols / 4, 0.0);
@@ -579,11 +590,7 @@ pub unsafe fn dot_rows_avx2(w: &Q1Weight, r0: usize, a: ActRow<'_>, out: &mut [f
                     _mm256_madd_epi16(_mm256_maddubs_epi16(one8, xs), one16),
                 );
             }
-            acc = _mm256_fmadd_ps(
-                _mm256_cvtepi32_ps(iacc),
-                _mm256_set1_ps(a.d[b] * ws),
-                acc,
-            );
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), _mm256_set1_ps(a.d[b] * ws), acc);
         }
         let s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
         let s = _mm_add_ps(s, _mm_movehl_ps(s, s));

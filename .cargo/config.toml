@@ -1,2 +1,12 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# Builds target the baseline ISA of each platform, so binaries and wheels run
+# on any x86_64 / aarch64 CPU. The SIMD kernels (AVX2, AVX-512, VNNI) and the
+# hot plain-Rust loops are selected at run time (`xor_net::util::cpu_features`,
+# `with_best_simd!` in src/util.rs), so this costs little; see the `kernels`
+# bench for the measured difference.
+#
+# For a local build tuned to (and only runnable on) this machine, opt in with
+#   RUSTFLAGS="-C target-cpu=native" cargo build --release
+# Never ship artifacts built that way.
+#
+# Set `XORNET_FORCE_ISA=scalar|avx2|avx512bw` to cap the runtime dispatch level
+# (e.g. to test the AVX2 / scalar paths on an AVX-512 machine).

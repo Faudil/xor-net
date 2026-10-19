@@ -301,7 +301,7 @@ impl GgufTensorInfo {
             Self::block_size(dtype).ok_or_else(|| anyhow::anyhow!("unknown GGUF dtype {dtype}"))?;
         let ts =
             Self::type_size(dtype).ok_or_else(|| anyhow::anyhow!("unknown GGUF dtype {dtype}"))?;
-        if elem_count % bs != 0 {
+        if !elem_count.is_multiple_of(bs) {
             anyhow::bail!("dtype {dtype} block size {bs} does not divide elem_count {elem_count}");
         }
         Ok((elem_count / bs) as u64 * ts as u64)
@@ -317,6 +317,7 @@ const Q1_0_BLOCK_BYTES: usize = 6;
 const Q1_0_G128_BLOCK_ELEMS: usize = 128;
 const Q1_0_G128_BLOCK_BYTES: usize = 18;
 
+#[inline]
 pub fn fp16_to_f32(half: u16) -> f32 {
     let sign = (half & 0x8000) as u32;
     let exp = (half & 0x7c00) >> 10;
@@ -659,7 +660,7 @@ pub fn is_prism_dtype(dtype: u32) -> bool {
 pub fn dequantize_data(data: &[u8], dtype: u32, elem_count: usize) -> anyhow::Result<Vec<f32>> {
     match dtype {
         0 => {
-            if data.len() % 4 != 0 {
+            if !data.len().is_multiple_of(4) {
                 anyhow::bail!("F32 data length {} not multiple of 4", data.len());
             }
             let count = data.len() / 4;
@@ -676,7 +677,7 @@ pub fn dequantize_data(data: &[u8], dtype: u32, elem_count: usize) -> anyhow::Re
             Ok(out)
         }
         1 => {
-            if data.len() % 2 != 0 {
+            if !data.len().is_multiple_of(2) {
                 anyhow::bail!("F16 data length {} not multiple of 2", data.len());
             }
             let count = data.len() / 2;
@@ -689,7 +690,7 @@ pub fn dequantize_data(data: &[u8], dtype: u32, elem_count: usize) -> anyhow::Re
             Ok(out)
         }
         30 => {
-            if data.len() % 2 != 0 {
+            if !data.len().is_multiple_of(2) {
                 anyhow::bail!("BF16 data length {} not multiple of 2", data.len());
             }
             let count = data.len() / 2;
@@ -1030,16 +1031,12 @@ mod tests {
         data[2] = 0xAA; // 10101010 -> - + - + - + - +
 
         let out = dequantize_q1_0_g128(&data, 128);
-        for i in 0..128 {
-            let byte_idx = i >> 3;
-            let bit_idx = i & 7;
-            let bit = (data[byte_idx] >> bit_idx) & 1;
+        for (i, &got) in out.iter().enumerate().take(128) {
+            let bit = (data[i >> 3] >> (i & 7)) & 1;
             let expected = if bit == 0 { -1.0 } else { 1.0 };
             assert!(
-                (out[i] - expected).abs() < 1e-6,
-                "mismatch at {i}: {} vs {}",
-                out[i],
-                expected
+                (got - expected).abs() < 1e-6,
+                "mismatch at {i}: {got} vs {expected}"
             );
         }
     }
@@ -1066,8 +1063,8 @@ mod tests {
         bytes[0] = 0xFF; // first 8 bits all +1
         let out = dequantize_data(&bytes, PRISM_Q1_0_G128, 128).unwrap();
         assert_eq!(out.len(), 128);
-        for i in 0..8 {
-            assert!((out[i] - 1.0).abs() < 1e-6);
+        for &v in &out[..8] {
+            assert!((v - 1.0).abs() < 1e-6);
         }
     }
 }

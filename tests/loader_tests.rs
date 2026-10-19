@@ -16,7 +16,7 @@ fn test_loader_and_conversion() -> anyhow::Result<()> {
     let header_bytes = header_json.as_bytes();
     let header_len = header_bytes.len() as u64;
 
-    let mut file = File::create(&file_path)?;
+    let mut file = File::create(file_path)?;
     file.write_all(&header_len.to_le_bytes())?;
     file.write_all(header_bytes)?;
 

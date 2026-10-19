@@ -5,7 +5,8 @@
 //!
 //! * AVX-512F + FMA: register-blocked micro-kernel, 6 rows x 32 columns
 //!   (12 zmm accumulators), masked loads/stores for the column tail.
-//! * Fallback: `axpy`-style loops that LLVM vectorises for the build target.
+//! * Fallback: `axpy`-style loops that LLVM vectorises for the best ISA the
+//!   CPU has (AVX2 / AVX-512 via `with_best_simd!`).
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
@@ -34,7 +35,7 @@ pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) 
         unsafe { sgemm_avx512(a, b, c, m, k, n) };
         return;
     }
-    sgemm_portable(a, b, c, m, k, n);
+    crate::util::with_best_simd!(sgemm_loops(a, b, c, m, k, n));
 }
 
 /// Portable reference/fallback. Same contract as [`sgemm`].
@@ -43,6 +44,11 @@ pub fn sgemm_portable(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n
         a.len() == m * k && b.len() == k * n && c.len() == m * n,
         "sgemm: bad lengths"
     );
+    sgemm_loops(a, b, c, m, k, n);
+}
+
+#[inline(always)]
+fn sgemm_loops(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     for i in 0..m {
         let crow = &mut c[i * n..(i + 1) * n];
         crow.fill(0.0);

@@ -5,59 +5,183 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # No test may touch the network or model weights; make accidental
+  # downloads fail fast instead of hanging.
+  HF_HUB_OFFLINE: 1
+
 jobs:
-  rust-test:
-    name: Rust Tests
+  fmt:
+    name: rustfmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-      
-      - name: Check fmt
-        run: cargo fmt --check
-      
-      - name: Check clippy
-        run: cargo clippy --all-features -- -D warnings
-      
-      - name: Build library
-        run: cargo build --lib --features python
-      
-      - name: Build examples
-        run: cargo build --examples
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
-  python-test:
-    name: Python Tests
+  test-x86:
+    # GitHub's x86 runners may or may not have AVX-512; XORNET_FORCE_ISA
+    # caps runtime dispatch so the AVX2 and scalar paths are exercised by the
+    # whole suite on every run, whatever the host CPU.
+    name: test (x86_64, isa=${{ matrix.isa }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        isa: [native, avx2, scalar]
+    env:
+      XORNET_FORCE_ISA: ${{ matrix.isa == 'native' && '' || matrix.isa }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: CPU features
+        run: grep -m1 -o -w 'avx2\|avx512f\|avx512bw\|avx512_vnni' /proc/cpuinfo | sort -u || true
+      - name: Tests (debug)
+        run: cargo test --all-targets
+      - name: Doc tests
+        if: matrix.isa == 'native'
+        run: cargo test --doc
+      - name: Kernel tests (release)
+        run: cargo test --release --test simd_equivalence_tests --test q1_0_tests --test vision_kernels
+      - name: Every SIMD intrinsic is inlined into its kernel
+        # An out-of-line `core::arch` intrinsic means a kernel uses an
+        # instruction its #[target_feature] list does not enable (e.g. an
+        # AVX-512DQ op in an F/BW kernel): slow, and a SIGILL risk on CPUs
+        # without that extension. Builds with target-cpu=native hide this.
+        if: matrix.isa == 'native'
+        run: |
+          bad=$(for t in simd_equivalence_tests q1_0_tests vision_kernels; do
+                  f=$(ls -t target/release/deps/$t-* | grep -v '\.d$' | head -1)
+                  nm -C "$f" | grep -E ' [tT] core::core_arch::' | grep -v '_xgetbv'
+                done | sort -u)
+          if [ -n "$bad" ]; then echo "$bad"; exit 1; fi
+
+  test-other:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+          - name: macos-arm64
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+      - run: cargo test
+
+  windows:
+    name: build (windows-msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-targets
+      - run: cargo test --test q1_0_tests --test simd_equivalence_tests
+
+  msrv:
+    name: msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --lib --bins
+
+  python:
+    name: python (build + import smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      
-      - name: Install maturin
-        run: pip install maturin
-      
-      - name: Build Python package
-        run: maturin develop --features python
-      
-      - name: Test Python import
-        run: python -c "import xor_net; print('Import OK'); m = xor_net.QuantizationConfigPy('pack4', 'int4'); print('QuantizationConfigPy OK'); xor_net.init_threads_py(4); print('init_threads OK')"
+      - name: cargo check --features python
+        run: cargo check --lib --features python
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          manylinux: off
+      - name: Install wheel and import
+        run: |
+          python -m pip install --no-index --find-links dist xor-net
+          cd "$RUNNER_TEMP"
+          python -c "import xor_net; print('xor_net', xor_net.__file__); print(sorted(n for n in dir(xor_net) if not n.startswith('_')))"
+      - name: Python smoke tests (model-dependent ones skip without weights)
+        run: |
+          python -m pip install pytest
+          python -m pytest python/tests -q -rs
+
+  deny:
+    name: cargo deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks: [licenses bans sources, advisories]
+    # New RustSec advisories should be looked at, not block unrelated PRs.
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
+
+  package:
+    name: cargo package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package list
+        run: cargo package --list --allow-dirty
+      - name: Package builds from the published file set
+        run: cargo package --allow-dirty
+      - name: Library docs build without warnings
+        run: cargo doc --no-deps --lib
+        env:
+          RUSTDOCFLAGS: -D warnings

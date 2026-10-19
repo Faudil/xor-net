@@ -6,9 +6,9 @@
 //! head *before* RoPE (as in HF `Qwen3Attention`).
 
 use crate::bit1::q1_0::Q8Acts;
-use rayon::prelude::*;
 use crate::loader::gguf::GgufFile;
 use crate::models::traits::{CausalLM, Logits, ModelState, downcast_state};
+use rayon::prelude::*;
 
 use super::{
     Embedding, KvCache, Linear, Rope, Yarn, attention, gguf_vec, meta_f32, meta_u32, rms_norm_rows,
@@ -341,7 +341,10 @@ impl Qwen3Model {
             let w = qd + 2 * kvd;
             let (cos, sin) = (&s.cos, &s.sin);
             let prep = |(t, (row, qo)): (usize, (&mut [f32], &mut [f32]))| {
-                let (cs, sn) = (&cos[t * half..(t + 1) * half], &sin[t * half..(t + 1) * half]);
+                let (cs, sn) = (
+                    &cos[t * half..(t + 1) * half],
+                    &sin[t * half..(t + 1) * half],
+                );
                 let (qr, kvr) = row.split_at_mut(qd);
                 for hq in qr.chunks_exact_mut(hd) {
                     crate::nn::fast_attention_simd::rms_norm(hq, &l.q_norm, c.eps);
