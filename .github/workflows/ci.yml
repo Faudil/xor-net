@@ -38,7 +38,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned so a new stable release can't add lints that break unrelated
+      # PRs; bump deliberately (and fix the new lints) when upgrading.
+      - uses: dtolnay/rust-toolchain@1.93
         with:
           components: clippy
       - uses: actions/setup-python@v5

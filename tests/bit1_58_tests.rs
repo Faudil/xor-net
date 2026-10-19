@@ -3,9 +3,7 @@ use xor_net::bit1_58::quantization::{
     TernaryPackType, pack_1_58bit_4pack, pack_1_58bit_5pack, quantize_f32_to_i8,
     unpack_1_58bit_4pack, unpack_1_58bit_5pack,
 };
-use xor_net::bit1_58::simd::{
-    ternary_dot_product_pack4, ternary_dot_product_pack4_avx2, ternary_dot_product_pack5_scalar,
-};
+use xor_net::bit1_58::simd::{ternary_dot_product_pack4, ternary_dot_product_pack5_scalar};
 use xor_net::tensor::FastTensor;
 
 #[test]
@@ -54,9 +52,10 @@ fn test_ternary_simd_parity() {
 
         let scalar_res = ternary_dot_product_pack4(&acts, &w_packed, len);
 
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
+                use xor_net::bit1_58::simd::ternary_dot_product_pack4_avx2;
                 let avx2_res = unsafe { ternary_dot_product_pack4_avx2(&acts, &w_packed, len) };
                 assert_eq!(scalar_res, avx2_res, "Mismatch at len {}", len);
             }
