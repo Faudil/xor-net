@@ -8,7 +8,7 @@ fn main() -> anyhow::Result<()> {
     let in_dim = 4096;
     let out_dim = 4096;
     let weights = vec![0.0f32; in_dim * out_dim];
-    let layer = TernaryLinear::new(in_dim, out_dim, &weights, TernaryPackType::Pack4)?;
+    let layer = TernaryLinear::new(in_dim, out_dim, &weights, TernaryPackType::Pack4, None)?;
     
     let x = FastTensor::zeros(vec![1, in_dim]);
     

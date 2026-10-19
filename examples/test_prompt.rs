@@ -6,7 +6,8 @@ use xor_net::nn::LmHeadConfig;
 use xor_net::Sampler;
 
 fn main() -> anyhow::Result<()> {
-    let model_path = "/home/faudil/RustroverProjects/XorNet/models/bitnet-2b";
+    let model_path = std::env::var("XORNET_MODEL").unwrap_or_else(|_| "models/bitnet-2b".to_string());
+    let model_path = model_path.as_str();
     let (model, config) = AutoModelForCausalLM::from_local(
         Path::new(model_path), 
         QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, false)

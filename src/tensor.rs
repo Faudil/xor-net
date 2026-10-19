@@ -21,7 +21,7 @@ impl Debug for FastTensor {
 impl FastTensor {
     pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Self {
         let expected_size: usize = shape.iter().product();
-        debug_assert_eq!(
+        assert_eq!(
             data.len(),
             expected_size,
             "FastTensor::new shape mismatch: data len is {}, expected {}",

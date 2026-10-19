@@ -73,8 +73,8 @@ fn ternary_linear_pack4_vs_pack5_parity() {
     let input_data: Vec<f32> = (0..in_dim).map(|i| (i as f32 - 10.0) * 0.1).collect();
     let input = FastTensor::new(input_data, vec![1, in_dim]);
 
-    let l4 = TernaryLinear::new(in_dim, out_dim, &weights, TernaryPackType::Pack4).unwrap();
-    let l5 = TernaryLinear::new(in_dim, out_dim, &weights, TernaryPackType::Pack5).unwrap();
+    let l4 = TernaryLinear::new(in_dim, out_dim, &weights, TernaryPackType::Pack4, None).unwrap();
+    let l5 = TernaryLinear::new(in_dim, out_dim, &weights, TernaryPackType::Pack5, None).unwrap();
     let o4 = l4.forward(&input).unwrap();
     let o5 = l5.forward(&input).unwrap();
 
@@ -86,7 +86,7 @@ fn ternary_linear_pack4_vs_pack5_parity() {
 #[test]
 fn ternary_linear_zero_input() {
     let weights = vec![1.0, -1.0, 0.0, 1.0];
-    let layer = TernaryLinear::new(2, 2, &weights, TernaryPackType::Pack4).unwrap();
+    let layer = TernaryLinear::new(2, 2, &weights, TernaryPackType::Pack4, None).unwrap();
     let input = FastTensor::new(vec![0.0, 0.0], vec![1, 2]);
     let out = layer.forward(&input).unwrap();
     for &v in &out.data {

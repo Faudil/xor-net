@@ -81,7 +81,8 @@ fn pack5_roundtrip_non_aligned_length() {
 #[test]
 fn quantize_i8_all_zeros_returns_scale_one() {
     let acts = vec![0.0f32; 16];
-    let (quantized, inv_scale) = quantize_f32_to_i8(&acts);
+    let mut quantized = vec![0i8; acts.len()];
+    let inv_scale = quantize_f32_to_i8(&acts, &mut quantized);
     assert_eq!(inv_scale, 1.0, "inv_scale must be 1.0 when all activations are zero");
     assert!(quantized.iter().all(|&x| x == 0), "All-zero input must quantize to all-zero i8");
 }
@@ -89,7 +90,8 @@ fn quantize_i8_all_zeros_returns_scale_one() {
 #[test]
 fn quantize_i8_max_abs_maps_to_127() {
     let acts = vec![0.0, -3.0, 3.0, 1.5];
-    let (quantized, inv_scale) = quantize_f32_to_i8(&acts);
+    let mut quantized = vec![0i8; acts.len()];
+    let inv_scale = quantize_f32_to_i8(&acts, &mut quantized);
 
     // max_abs = 3.0, so scale = 127/3, inv_scale = 3/127
     let expected_inv_scale = 3.0 / 127.0;
@@ -106,7 +108,8 @@ fn quantize_i8_max_abs_maps_to_127() {
 fn quantize_i8_reconstruction_error_bounded() {
     // Verify that round-tripping through quantize then dequantize keeps error small.
     let acts: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.01).collect();
-    let (quantized, inv_scale) = quantize_f32_to_i8(&acts);
+    let mut quantized = vec![0i8; acts.len()];
+    let inv_scale = quantize_f32_to_i8(&acts, &mut quantized);
 
     for (i, (&orig, &q)) in acts.iter().zip(quantized.iter()).enumerate() {
         let reconstructed = q as f32 * inv_scale;

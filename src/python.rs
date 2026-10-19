@@ -76,7 +76,7 @@ pub struct XorNetModel {
     config: Config,
     cache: Cache,
     tokenizer: Arc<tokenizers::Tokenizer>,
-    logits_processor: candle_transformers::generation::LogitsProcessor,
+    sampler: crate::Sampler,
 }
 
 #[pymethods]
@@ -108,14 +108,14 @@ impl XorNetModel {
 
         let cache = Cache::new(true, &config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        let logits_processor = candle_transformers::generation::LogitsProcessor::new(299792458, Some(0.7_f64), None);
+        let sampler = crate::Sampler::new(299792458, Some(0.7), None, 1.0);
 
         Ok(Self {
             model,
             config,
             cache,
             tokenizer,
-            logits_processor,
+            sampler,
         })
     }
 
@@ -144,14 +144,14 @@ impl XorNetModel {
 
         let cache = Cache::new(true, &config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        let logits_processor = candle_transformers::generation::LogitsProcessor::new(299792458, Some(0.7_f64), None);
+        let sampler = crate::Sampler::new(299792458, Some(0.7), None, 1.0);
 
         Ok(Self {
             model,
             config,
             cache,
             tokenizer,
-            logits_processor,
+            sampler,
         })
 }
  
@@ -166,12 +166,13 @@ impl XorNetModel {
         seed: Option<u64>,
     ) -> PyResult<String> {
         let max_tokens = max_tokens.unwrap_or(512);
-        let temperature = temperature.unwrap_or(0.7) as f64;
-        let top_p = top_p.unwrap_or(0.9) as f64;
+        let temperature = temperature.unwrap_or(0.7);
+        let top_p = top_p.unwrap_or(0.9);
         let _top_k = top_k.unwrap_or(50);
         let seed = seed.unwrap_or(299792458);
 
-        self.logits_processor = candle_transformers::generation::LogitsProcessor::new(seed, Some(temperature), Some(top_p));
+        self.sampler = crate::Sampler::new(seed, Some(temperature), Some(top_p), 1.0);
+        self.cache = Cache::new(true, &self.config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let encoding = self.tokenizer.encode(prompt, true)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -194,11 +195,8 @@ impl XorNetModel {
             let logits = self.model.forward(&tokens[start_pos..], index_pos, &mut self.cache)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
  
-            let logits_shape = logits.shape[2];
-            let logits_tensor = candle_core::Tensor::from_vec(logits.into_data(), (logits_shape,), &candle_core::Device::Cpu)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
- 
-            let next_token = self.logits_processor.sample(&logits_tensor)
+            let mut logits = logits.into_data();
+            let next_token = self.sampler.sample(&mut logits, &tokens)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
  
 tokens.push(next_token);
@@ -227,12 +225,13 @@ tokens.push(next_token);
         seed: Option<u64>,
     ) -> PyResult<Vec<String>> {
         let max_tokens = max_tokens.unwrap_or(512);
-        let temperature = temperature.unwrap_or(0.7) as f64;
-        let top_p = top_p.unwrap_or(0.9) as f64;
+        let temperature = temperature.unwrap_or(0.7);
+        let top_p = top_p.unwrap_or(0.9);
         let _top_k = top_k.unwrap_or(50);
         let seed = seed.unwrap_or(299792458);
 
-        self.logits_processor = candle_transformers::generation::LogitsProcessor::new(seed, Some(temperature), Some(top_p));
+        self.sampler = crate::Sampler::new(seed, Some(temperature), Some(top_p), 1.0);
+        self.cache = Cache::new(true, &self.config).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let encoding = self.tokenizer.encode(prompt, true)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -256,11 +255,8 @@ tokens.push(next_token);
             let logits = self.model.forward(&tokens[start_pos..], index_pos, &mut self.cache)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            let logits_shape = logits.shape[2];
-            let logits_tensor = candle_core::Tensor::from_vec(logits.into_data(), (logits_shape,), &candle_core::Device::Cpu)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let next_token = self.logits_processor.sample(&logits_tensor)
+            let mut logits = logits.into_data();
+            let next_token = self.sampler.sample(&mut logits, &tokens)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             tokens.push(next_token);

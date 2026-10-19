@@ -1,3 +1,10 @@
 /target
 /bench_logs
 *.sparse
+.attic/
+.idea/
+.venv/
+/BitNet/
+/models/
+*.gguf
+__pycache__/

@@ -23,13 +23,15 @@ fn test_ternary_pack_unpack_roundtrip() {
 #[test]
 fn test_absmax_quantization() {
     let acts = vec![0.0, -2.5, 5.0, 1.25];
-    let (quantized, scale) = quantize_f32_to_i8(&acts);
+    let mut quantized = vec![0i8; acts.len()];
+    let scale = quantize_f32_to_i8(&acts, &mut quantized);
     
     assert!((scale - (5.0 / 127.0)).abs() < 1e-5);
     assert_eq!(quantized, vec![0, -64, 127, 32]);
     
     let zero_acts = vec![0.0, 0.0, 0.0];
-    let (quantized_zeros, scale_zeros) = quantize_f32_to_i8(&zero_acts);
+    let mut quantized_zeros = vec![0i8; zero_acts.len()];
+    let scale_zeros = quantize_f32_to_i8(&zero_acts, &mut quantized_zeros);
     assert_eq!(quantized_zeros, vec![0, 0, 0]);
     assert_eq!(scale_zeros, 1.0);
 }
@@ -74,8 +76,8 @@ fn test_ternary_linear_layer() {
          0.0, -1.0,  1.0,  0.0,
     ];
     
-    let layer_pack4 = TernaryLinear::new(in_dim, out_dim, &weights, TernaryPackType::Pack4).unwrap();
-    let layer_pack5 = TernaryLinear::new(in_dim, out_dim, &weights, TernaryPackType::Pack5).unwrap();
+    let layer_pack4 = TernaryLinear::new(in_dim, out_dim, &weights, TernaryPackType::Pack4, None).unwrap();
+    let layer_pack5 = TernaryLinear::new(in_dim, out_dim, &weights, TernaryPackType::Pack5, None).unwrap();
     
     let input = FastTensor::new(vec![0.5f32, 1.0, -0.5, 2.0], vec![1, in_dim]);
     
@@ -87,8 +89,9 @@ fn test_ternary_linear_layer() {
 
     assert_eq!(out4_vec, out5_vec);
     
-    assert!((out4_vec[0] - 1.879921).abs() < 1e-4);
-    assert!((out4_vec[1] - (-0.944882)).abs() < 1e-4);
+    // Already-ternary weights get scale 1: x quantizes to [32, 64, -32, 127] * (2/127).
+    assert!((out4_vec[0] - 191.0 * 2.0 / 127.0).abs() < 1e-4, "{:?}", out4_vec);
+    assert!((out4_vec[1] - (-96.0 * 2.0 / 127.0)).abs() < 1e-4, "{:?}", out4_vec);
 }
 
 #[test]

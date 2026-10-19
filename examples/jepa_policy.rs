@@ -37,7 +37,8 @@ impl JepaPolicyBlock {
             embed_dim, 
             hidden_dim, 
             &proj_in_weights, 
-            TernaryPackType::Pack4
+            TernaryPackType::Pack4,
+            None,
         )?;
 
         // 1-bit Layer
@@ -52,7 +53,8 @@ impl JepaPolicyBlock {
             hidden_dim, 
             embed_dim, 
             &proj_out_weights, 
-            TernaryPackType::Pack4
+            TernaryPackType::Pack4,
+            None,
         )?;
 
         Ok(Self {

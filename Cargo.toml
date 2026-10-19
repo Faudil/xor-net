@@ -82,6 +82,14 @@ path = "examples/batch_bench.rs"
 name = "bench_runner"
 path = "examples/bench_runner.rs"
 
+[[example]]
+name = "test_prompt"
+path = "examples/test_prompt.rs"
+
+[[bench]]
+name = "bench_simd"
+harness = false
+
 [[bin]]
 name = "convert_sparse"
 path = "src/bin/convert_sparse.rs"
@@ -117,8 +125,6 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-
-
 
 [[example]]
 name = "bench_bonsai27b"
