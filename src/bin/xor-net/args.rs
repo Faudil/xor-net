@@ -38,6 +38,12 @@ pub struct GenOpts {
     /// template default.
     pub think: Option<bool>,
     pub show_thinking: bool,
+    /// Speculative decoding drafter: `lookup` or a DSpark `.gguf` path.
+    pub draft: Option<String>,
+    /// Draft tokens per round (default: the drafter's).
+    pub draft_k: Option<usize>,
+    /// DSpark output head: `shared` (the target's) or `own` (the GGUF's).
+    pub draft_head: Option<String>,
 }
 
 impl Default for GenOpts {
@@ -54,6 +60,9 @@ impl Default for GenOpts {
             stop: Vec::new(),
             think: None,
             show_thinking: false,
+            draft: None,
+            draft_k: None,
+            draft_head: None,
         }
     }
 }
@@ -271,6 +280,21 @@ fn gen_flag(a: &mut Args, f: &str, g: &mut GenOpts) -> Result<bool, String> {
         "--show-thinking" => {
             a.no_value(f)?;
             g.show_thinking = true;
+        }
+        "--draft" => g.draft = Some(a.value(f)?),
+        "--draft-k" => {
+            let k: usize = a.parse(f)?;
+            if k == 0 {
+                return Err(format!("{f} must be >= 1"));
+            }
+            g.draft_k = Some(k);
+        }
+        "--draft-head" => {
+            let h = a.value(f)?;
+            if !matches!(h.as_str(), "own" | "shared") {
+                return Err(format!("{f} must be `own` or `shared`"));
+            }
+            g.draft_head = Some(h);
         }
         _ => return Ok(false),
     }
@@ -567,6 +591,29 @@ mod tests {
         assert_eq!(r.sampling.think, Some(false));
         assert_eq!(r.sampling.stop, vec!["\n\n".to_string(), "END".to_string()]);
         assert!(r.chat && r.quiet);
+    }
+
+    #[test]
+    fn draft_flags() {
+        let r = run(&["run", "m.gguf", "--draft", "lookup", "--draft-k", "5", "hi"]);
+        assert_eq!(r.sampling.draft.as_deref(), Some("lookup"));
+        assert_eq!(r.sampling.draft_k, Some(5));
+        let r = run(&[
+            "run",
+            "m.gguf",
+            "--draft=d.gguf",
+            "--draft-head",
+            "own",
+            "hi",
+        ]);
+        assert_eq!(r.sampling.draft.as_deref(), Some("d.gguf"));
+        assert_eq!(r.sampling.draft_head.as_deref(), Some("own"));
+        assert!(p(&["run", "m.gguf", "--draft-k", "0"]).is_err());
+        assert!(p(&["run", "m.gguf", "--draft-head", "x"]).is_err());
+        match p(&["chat", "m.gguf", "--draft", "lookup"]).unwrap() {
+            Command::Chat(c) => assert_eq!(c.sampling.draft.as_deref(), Some("lookup")),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

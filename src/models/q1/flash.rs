@@ -593,6 +593,141 @@ fn chunk_item<const FMA: bool>(
     );
 }
 
+/// One sequence of [`attention_batch`]: `n` query rows (`q`, `out`:
+/// `[n][heads * head_dim]`) at positions `pos .. pos + n` over the keys
+/// `0 .. pos + n` of `cache` (the contract of [`attention`]).
+pub struct BatchCall<'a> {
+    pub q: &'a [f32],
+    pub n: usize,
+    pub pos: usize,
+    pub cache: &'a KvCache,
+    pub out: &'a mut [f32],
+}
+
+/// [`attention`] for several independent sequences at once (continuous
+/// batching): the decode-shaped calls (`n <= QB`) of all sequences share one
+/// parallel pass over (sequence, KV head, super-chunk) items and one merge
+/// pass, instead of a few small parallel regions per sequence. Every call
+/// gives exactly what [`attention`] gives for it alone (same items, same
+/// merge); calls with more rows go through [`attention`] one by one.
+pub fn attention_batch(calls: &mut [BatchCall<'_>], heads: usize, scale: f32) {
+    let mut few = Vec::with_capacity(calls.len());
+    for c in calls.iter_mut() {
+        if c.n > QB {
+            attention(c.q, c.n, c.pos, heads, c.cache, scale, c.out);
+        } else if c.n > 0 {
+            few.push(c);
+        }
+    }
+    if few.is_empty() {
+        return;
+    }
+    let fma = cpu_features().avx2_tier();
+    // Per call: rows padded to rp, nsc super-chunks, offset of its partials.
+    struct Meta {
+        group: usize,
+        nkv: usize,
+        rp: usize,
+        nsc: usize,
+        base: usize,
+    }
+    let mut metas = Vec::with_capacity(few.len());
+    let mut total = 0;
+    for c in &few {
+        let (hd, nkv) = (c.cache.head_dim, c.cache.kv_heads);
+        assert!(supported(hd), "flash attention: head_dim {hd}");
+        assert!(
+            nkv > 0 && heads.is_multiple_of(nkv),
+            "attention: heads not a multiple of kv heads"
+        );
+        assert_eq!(c.q.len(), c.n * heads * hd);
+        assert_eq!(c.out.len(), c.n * heads * hd);
+        assert!(
+            c.pos + c.n <= c.cache.cap,
+            "attention: positions beyond cache"
+        );
+        let group = heads / nkv;
+        let rp = (c.n * group).next_multiple_of(4);
+        let nsc = (c.pos + c.n).div_ceil(SC);
+        metas.push(Meta {
+            group,
+            nkv,
+            rp,
+            nsc,
+            base: total,
+        });
+        total += nkv * nsc * rp;
+    }
+    let hd = few[0].cache.head_dim;
+    assert!(few.iter().all(|c| c.cache.head_dim == hd));
+    // Read-only views for the items, the outputs for the merge.
+    let mut outs = Vec::with_capacity(few.len());
+    let mut views = Vec::with_capacity(few.len());
+    for c in few {
+        views.push((c.q, c.n, c.pos, c.cache));
+        outs.push(&mut *c.out);
+    }
+    CALL.with_borrow_mut(|call| {
+        call.m.resize(total, 0.0);
+        call.l.resize(total, 0.0);
+        call.o.resize(total * hd, 0.0);
+        // Items (call, kv head, super-chunk) with their partial buffers.
+        let mut items = Vec::new();
+        let (mut m, mut l, mut o) = (&mut call.m[..], &mut call.l[..], &mut call.o[..]);
+        for (ci, me) in metas.iter().enumerate() {
+            for i in 0..me.nkv * me.nsc {
+                let (mi, mr) = m.split_at_mut(me.rp);
+                let (li, lr) = l.split_at_mut(me.rp);
+                let (oi, or) = o.split_at_mut(me.rp * hd);
+                (m, l, o) = (mr, lr, or);
+                items.push((ci, i / me.nsc, i % me.nsc, mi, li, oi));
+            }
+        }
+        let views = &views;
+        items.into_par_iter().for_each(|(ci, kvh, c, m, l, o)| {
+            let (cl, me) = (views[ci], &metas[ci]);
+            SCRATCH.with_borrow_mut(|sc| {
+                PARTS.with_borrow_mut(|pt| {
+                    with_best_simd!(if fma {
+                        chunk_item::<true>(
+                            sc, pt, cl.0, cl.1, kvh, c, cl.2, heads, me.group, cl.3, scale, m, l, o,
+                        )
+                    } else {
+                        chunk_item::<false>(
+                            sc, pt, cl.0, cl.1, kvh, c, cl.2, heads, me.group, cl.3, scale, m, l, o,
+                        )
+                    })
+                })
+            });
+        });
+        let (m, l, o) = (&call.m, &call.l, &call.o);
+        let mut rows = Vec::new();
+        for (ci, out) in outs.into_iter().enumerate() {
+            for (t, orow) in out.chunks_mut(heads * hd).enumerate() {
+                rows.push((ci, t, orow));
+            }
+        }
+        rows.into_par_iter().for_each(|(ci, t, orow)| {
+            let me = &metas[ci];
+            for kvh in 0..me.nkv {
+                for g in 0..me.group {
+                    let r = t * me.group + g;
+                    let part = |c: usize| {
+                        let i = me.base + (kvh * me.nsc + c) * me.rp + r;
+                        (m[i], l[i], &o[i * hd..(i + 1) * hd])
+                    };
+                    let dst = &mut orow[(kvh * me.group + g) * hd..(kvh * me.group + g + 1) * hd];
+                    with_best_simd!(if fma {
+                        merge_row::<true>(me.nsc, part, dst)
+                    } else {
+                        merge_row::<false>(me.nsc, part, dst)
+                    });
+                }
+            }
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

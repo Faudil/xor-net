@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use xor_net::models::q1::dspark::{DsparkHead, DsparkModel};
 use xor_net::models::source::{self, LoadOptions};
+use xor_net::speculative::{DraftModel, PromptLookup, SpecConfig};
 use xor_net::{
     ChatMessage, FinishReason, Generation, GenerationError, GenerationParams, Generator,
     ReasoningFormat, SamplingParams, StreamEvent,
@@ -97,6 +99,47 @@ pub fn params(g: &Generator, o: &GenOpts, warn: bool) -> GenerationParams {
     p
 }
 
+/// Default draft tokens per round for prompt lookup.
+pub const LOOKUP_K: usize = 4;
+
+/// The speculative decoding config for `--draft` (loads a DSpark drafter).
+pub fn speculative(g: &Generator, o: &GenOpts, quiet: bool) -> anyhow::Result<Option<SpecConfig>> {
+    let Some(d) = &o.draft else {
+        return Ok(None);
+    };
+    let (drafter, k): (std::sync::Arc<dyn DraftModel>, usize) = if d == "lookup" {
+        (
+            std::sync::Arc::new(PromptLookup::new(3, 5, o.draft_k.unwrap_or(LOOKUP_K))),
+            LOOKUP_K,
+        )
+    } else {
+        let head = match o.draft_head.as_deref() {
+            Some("own") => DsparkHead::Own,
+            _ => DsparkHead::SharedTarget,
+        };
+        let t0 = Instant::now();
+        let m = DsparkModel::load_for(d, &**g.model(), head)
+            .with_context(|| format!("loading DSpark drafter {d}"))?;
+        if !quiet {
+            eprintln!(
+                "{}loaded DSpark drafter {d} in {:.2}s (block {}, {head:?} head){}",
+                dim_if(std::io::stderr().is_terminal()),
+                t0.elapsed().as_secs_f64(),
+                m.config().block_size,
+                reset_if(std::io::stderr().is_terminal()),
+            );
+        }
+        let k = m.config().block_size;
+        (std::sync::Arc::new(m), k)
+    };
+    if !g.model().batched_verify() && !quiet {
+        eprintln!(
+            "note: this model verifies drafts one token at a time; --draft will not speed it up"
+        );
+    }
+    Ok(Some(SpecConfig::new(drafter, o.draft_k.unwrap_or(k))))
+}
+
 pub fn stats_line(out: &Generation, load_s: Option<f64>) -> String {
     let mut s = format!(
         "{} prompt ({} cached) + {} completion tokens | prefill {:.1} tok/s | decode {:.1} tok/s | finish {}",
@@ -112,6 +155,13 @@ pub fn stats_line(out: &Generation, load_s: Option<f64>) -> String {
             FinishReason::Aborted => "interrupted",
         }
     );
+    if let Some(sp) = &out.speculative {
+        s += &format!(
+            " | draft: {:.0}% accepted, {:.2} tok/round",
+            100.0 * sp.acceptance_rate(),
+            sp.mean_accepted_len()
+        );
+    }
     if let Some(l) = load_s {
         s += &format!(" | load {l:.2}s");
     }
@@ -227,7 +277,10 @@ pub fn run(a: RunArgs) -> anyhow::Result<()> {
         }
     };
     let (mut g, load_s) = load(&a.m, a.quiet)?;
-    let p = params(&g, &a.sampling, !a.quiet).with_ignore_eos(a.ignore_eos);
+    let mut p = params(&g, &a.sampling, !a.quiet).with_ignore_eos(a.ignore_eos);
+    if let Some(spec) = speculative(&g, &a.sampling, a.quiet)? {
+        p = p.with_speculative(spec);
+    }
     let mut printer = Printer::new(a.sampling.show_thinking, true);
     let out = if a.chat {
         let mut msgs = Vec::new();
@@ -372,6 +425,7 @@ pub fn chat(a: ChatArgs) -> anyhow::Result<()> {
     }
     // Validate --think once (prints a note if unsupported).
     let _ = params(&g, &sampling, true);
+    let spec = speculative(&g, &sampling, false)?;
     install_ctrlc();
     let tty_in = std::io::stdin().is_terminal();
     let color = std::io::stdout().is_terminal();
@@ -404,7 +458,10 @@ pub fn chat(a: ChatArgs) -> anyhow::Result<()> {
             }
         }
         msgs.push(ChatMessage::user(input));
-        let p = params(&g, &sampling, false);
+        let mut p = params(&g, &sampling, false);
+        if let Some(spec) = &spec {
+            p = p.with_speculative(spec.clone());
+        }
         let mut printer = Printer::new(sampling.show_thinking, false);
         CANCEL.store(false, Ordering::SeqCst);
         GENERATING.store(true, Ordering::SeqCst);

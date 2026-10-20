@@ -7,12 +7,14 @@
 
 use crate::bit1::q1_0::Q8Acts;
 use crate::loader::gguf::GgufFile;
-use crate::models::traits::{CausalLM, Logits, ModelState, StateSnapshot, downcast_state};
+use crate::models::traits::{
+    CausalLM, ForwardOpts, Logits, ModelState, StateSnapshot, downcast_state,
+};
 use rayon::prelude::*;
 
 use super::{
-    Embedding, KvCache, Linear, Rope, Yarn, attention, gguf_vec, meta_f32, meta_u32, rms_norm_rows,
-    special_tokens_from_gguf, swiglu_rows, yarn_from_gguf,
+    Embedding, KvCache, Linear, Rope, Yarn, attention, copy_taps, gguf_vec, meta_f32, meta_u32,
+    rms_norm_rows, special_tokens_from_gguf, swiglu_rows, yarn_from_gguf,
 };
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -165,6 +167,11 @@ impl Qwen3State {
     /// Bytes currently held by the KV caches.
     pub fn kv_bytes(&self) -> usize {
         self.kv.iter().map(|c| c.bytes()).sum()
+    }
+
+    /// Per-layer KV caches (hook for the batched forward in `super::batch`).
+    pub(crate) fn kv_caches_mut(&mut self) -> &mut [KvCache] {
+        &mut self.kv
     }
 }
 
@@ -340,6 +347,19 @@ impl Qwen3Model {
         pos: usize,
         state: &mut Qwen3State,
     ) -> anyhow::Result<Vec<f32>> {
+        self.forward_tokens_with(tokens, pos, state, &mut ForwardOpts::default())
+    }
+
+    /// [`forward_tokens`](Self::forward_tokens) with [`ForwardOpts`]:
+    /// logits of every position, hidden taps. `provisional` needs nothing
+    /// special here (the KV cache truncates anywhere).
+    pub fn forward_tokens_with(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut Qwen3State,
+        opts: &mut ForwardOpts<'_>,
+    ) -> anyhow::Result<Vec<f32>> {
         let c = &self.cfg;
         let n = tokens.len();
         anyhow::ensure!(n > 0, "forward: no tokens");
@@ -363,7 +383,16 @@ impl Qwen3Model {
         let half = hd / 2;
         let scale = 1.0 / (hd as f32).sqrt();
 
-        for (l, kv) in self.layers.iter().zip(state.kv.iter_mut()) {
+        let mut taps = opts.taps.as_deref_mut();
+        if let Some(t) = taps.as_deref_mut() {
+            anyhow::ensure!(
+                t.layers.iter().all(|&i| i < c.layers),
+                "hidden taps: layer out of range"
+            );
+            t.data.clear();
+            t.data.resize(n * t.layers.len() * h, 0.0);
+        }
+        for (li, (l, kv)) in self.layers.iter().zip(state.kv.iter_mut()).enumerate() {
             // --- attention ---
             let hbuf = resize(&mut s.h, n * h);
             hbuf.copy_from_slice(x);
@@ -428,16 +457,19 @@ impl Qwen3Model {
             for (a, b) in x.iter_mut().zip(proj.iter()) {
                 *a += b;
             }
+            if let Some(t) = taps.as_deref_mut() {
+                copy_taps(t, li, x, n, h);
+            }
         }
 
-        let last = resize(&mut s.h, h);
-        last.copy_from_slice(&x[(n - 1) * h..]);
+        let rows = if opts.all_logits { n } else { 1 };
+        let last = resize(&mut s.h, rows * h);
+        last.copy_from_slice(&x[(n - rows) * h..]);
         rms_norm_rows(last, &self.output_norm, c.eps);
         let head = self.lm_head();
-        let mut logits = vec![0.0f32; head.rows()];
-        head.forward(last, 1, &mut s.acts, &mut logits);
-        logits.truncate(c.vocab);
-        Ok(logits)
+        let mut logits = vec![0.0f32; rows * head.rows()];
+        head.forward(last, rows, &mut s.acts, &mut logits);
+        Ok(super::trim_logit_rows(logits, head.rows(), c.vocab))
     }
 }
 
@@ -454,6 +486,25 @@ impl CausalLM for Qwen3Model {
     ) -> anyhow::Result<Logits> {
         let st = downcast_state::<Qwen3State>(state)?;
         self.forward_tokens(tokens, pos, st)
+    }
+
+    fn forward_with(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut dyn ModelState,
+        opts: &mut ForwardOpts<'_>,
+    ) -> anyhow::Result<Logits> {
+        let st = downcast_state::<Qwen3State>(state)?;
+        self.forward_tokens_with(tokens, pos, st, opts)
+    }
+
+    fn batched_verify(&self) -> bool {
+        true
+    }
+
+    fn hidden_shape(&self) -> Option<(usize, usize)> {
+        Some((self.cfg.hidden, self.cfg.layers))
     }
 
     fn vocab_size(&self) -> usize {

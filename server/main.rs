@@ -5,10 +5,15 @@
 //!   * OpenAI surface: `GET /v1/models`, `POST /v1/completions`,
 //!     `POST /v1/chat/completions` (streaming + non-streaming), llama.cpp
 //!     `POST /completion` and `GET /health`.
-//!   * `--slots` worker threads each run one decode inside their own rayon
-//!     pool of `--threads-per-slot` threads, sharing one `Arc` model; each
-//!     slot owns a `Generator` fork (state / KV cache, sampler). Defaults
-//!     split the physical cores over 2 slots (see `config::default_parallelism`).
+//!   * Two schedulers (`--scheduler`). `batch` (default for Bonsai models):
+//!     continuous batching, one engine thread steps every active request
+//!     together (`--max-batch` of them) through the model's batched forward
+//!     on all physical cores, so each weight block is read once per step for
+//!     all requests (`batcher`). `slots`: `--slots` worker threads each run
+//!     one decode inside their own rayon pool of `--threads-per-slot`
+//!     threads, sharing one `Arc` model; each slot owns a `Generator` fork
+//!     (state / KV cache, sampler); defaults split the physical cores over 2
+//!     slots (see `config::default_parallelism`).
 //!   * One `PromptCache` shared by all slots (`--prompt-cache-mb`): state
 //!     snapshots at the end of the system prompt and of the chat history, so
 //!     a shared prefix is prefilled once across requests and slots. The job
@@ -27,6 +32,7 @@
 //! Run `xor-net-server --help` for options.
 
 mod api;
+mod batcher;
 mod config;
 mod engine;
 mod http;
@@ -39,13 +45,15 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use tokenizers::Tokenizer;
-use xor_net::generation::Generator;
+use xor_net::generation::{GenerationParams, Generator};
+use xor_net::models::batched::BatchedCausalLM;
 use xor_net::models::traits::CausalLM;
 use xor_net::nn::LmHeadConfig;
 use xor_net::prompt_cache::PromptCache;
-use xor_net::{AutoModelForCausalLM, LlamaCausalLM, QuantizationConfig, TernaryPackType};
+use xor_net::{LlamaCausalLM, QuantizationConfig, TernaryPackType};
 
-use crate::config::{Parsed, ServerConfig};
+use crate::batcher::BatchOptions;
+use crate::config::{Parsed, Scheduler, ServerConfig};
 use crate::engine::{Engine, GeneratorEngine};
 use crate::serve::App;
 
@@ -82,21 +90,25 @@ fn source(model: &str) -> Source<'_> {
     }
 }
 
-/// Load the model and wrap it in a `Generator` (tokenizer, chat template,
-/// EOS ids). Returns the generator and the default model id.
-fn load(cfg: &ServerConfig) -> anyhow::Result<(Generator, String)> {
+/// A loaded model: its `Generator` (tokenizer, chat template, EOS ids), the
+/// default model id and, for Bonsai models, the batched forward of the same
+/// model (continuous batching).
+type Loaded = (Generator, String, Option<Arc<dyn BatchedCausalLM>>);
+
+/// Load the model and wrap it in a `Generator`.
+fn load(cfg: &ServerConfig) -> anyhow::Result<Loaded> {
     let explicit_tok = cfg.tokenizer.as_deref().map(Path::new);
     let quant = || QuantizationConfig::Bit1_58(TernaryPackType::Pack4, LmHeadConfig::Int4, true);
     match source(&cfg.model) {
         Source::File(path) => {
             println!("Loading Bonsai model file: {}", path.display());
-            let g = AutoModelForCausalLM::generator_from_file(path, explicit_tok)?;
+            let (batched, g) = xor_net::models::q1::batch::load_batched(path, explicit_tok)?;
             let id = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or(&cfg.model)
                 .to_string();
-            Ok((g, id))
+            Ok((g, id, Some(batched)))
         }
         Source::Dir(dir) => {
             println!("Loading from local directory: {}", dir.display());
@@ -120,7 +132,7 @@ fn load(cfg: &ServerConfig) -> anyhow::Result<(Generator, String)> {
                 .and_then(|s| s.to_str())
                 .unwrap_or(&cfg.model)
                 .to_string();
-            Ok((g, id))
+            Ok((g, id, None))
         }
         Source::Hub(repo) => {
             println!("Loading from HuggingFace: {repo}");
@@ -144,9 +156,50 @@ fn load(cfg: &ServerConfig) -> anyhow::Result<(Generator, String)> {
             let tok = read_tokenizer(explicit_tok.unwrap_or(&tok_path))?;
             let snapshot = tok_path.parent().unwrap_or(Path::new("."));
             let g = Generator::from_dir_with_tokenizer(model, snapshot, tok)?;
-            Ok((g, repo.to_string()))
+            Ok((g, repo.to_string(), None))
         }
     }
+}
+
+/// Physical cores, assuming SMT-2 as `config::default_parallelism` does.
+fn physical_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .div_ceil(2)
+        .max(1)
+}
+
+/// `--draft`: prompt lookup or a DSpark drafter for speculative decoding.
+fn speculative(
+    cfg: &ServerConfig,
+    g: &xor_net::Generator,
+) -> anyhow::Result<Option<xor_net::speculative::SpecConfig>> {
+    use xor_net::models::q1::dspark::{DsparkHead, DsparkModel};
+    use xor_net::speculative::{DraftModel, PromptLookup, SpecConfig};
+    let Some(d) = &cfg.draft else {
+        return Ok(None);
+    };
+    let (m, k): (Arc<dyn DraftModel>, usize) = if d == "lookup" {
+        (
+            Arc::new(PromptLookup::new(3, 5, cfg.draft_k.unwrap_or(4))),
+            4,
+        )
+    } else {
+        let head = match cfg.draft_head.as_deref() {
+            Some("own") => DsparkHead::Own,
+            _ => DsparkHead::SharedTarget,
+        };
+        let m = DsparkModel::load_for(d, &**g.model(), head)?;
+        let k = m.config().block_size;
+        (Arc::new(m), k)
+    };
+    println!(
+        "Speculative decoding: {} drafter, k = {}",
+        m.name(),
+        cfg.draft_k.unwrap_or(k)
+    );
+    Ok(Some(SpecConfig::new(m, cfg.draft_k.unwrap_or(k))))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -162,10 +215,27 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // The global pool only serves loading; decoding runs in per-slot pools.
-    xor_net::init_threads(cfg.slots * cfg.threads_per_slot).map_err(|e| anyhow!(e.to_string()))?;
+    let mut cfg = cfg;
+    // Auto: continuous batching for Bonsai models (they have a batched
+    // forward), independent slots otherwise.
+    let scheduler = cfg.scheduler.unwrap_or(match source(&cfg.model) {
+        // Speculative decoding runs in the slot scheduler.
+        _ if cfg.draft.is_some() => Scheduler::Slots,
+        Source::File(_) => Scheduler::Batch,
+        _ => Scheduler::Slots,
+    });
+    cfg.scheduler = Some(scheduler);
+    let threads = match scheduler {
+        // Slots: the global pool only serves loading; decoding runs in
+        // per-slot pools.
+        Scheduler::Slots => cfg.slots * cfg.threads_per_slot,
+        // Batch: every batched forward uses the global pool, one thread per
+        // physical core (SMT siblings only add contention).
+        Scheduler::Batch => physical_cores(),
+    };
+    xor_net::init_threads(threads).map_err(|e| anyhow!(e.to_string()))?;
 
-    let (mut generator, default_id) = load(&cfg)?;
+    let (mut generator, default_id, batched) = load(&cfg)?;
     println!("Model loaded.");
     let cache_bytes = match cfg.prompt_cache_mb {
         Some(mb) => mb.saturating_mul(1 << 20),
@@ -186,7 +256,33 @@ fn main() -> anyhow::Result<()> {
         println!("Prompt cache: disabled");
     }
     let id = cfg.model_id.clone().unwrap_or(default_id);
-    let engine = GeneratorEngine::new(generator, cfg.slots, id);
+    let spec = speculative(&cfg, &generator)?;
+    if spec.is_some() && scheduler == Scheduler::Batch {
+        eprintln!("warning: --draft is ignored by the batch scheduler (use --scheduler slots)");
+    }
+    let engine = match scheduler {
+        Scheduler::Slots => GeneratorEngine::new(generator, cfg.slots, id).with_speculative(spec),
+        Scheduler::Batch => {
+            if batched.is_none() {
+                eprintln!(
+                    "warning: this model has no batched forward; the batch scheduler \
+                     forwards requests one by one (--scheduler slots is faster)"
+                );
+            }
+            // One slot per concurrent sequence.
+            cfg.slots = cfg.max_batch;
+            GeneratorEngine::new_batched(
+                generator,
+                batched,
+                BatchOptions {
+                    max_batch: cfg.max_batch,
+                    prefill_chunk: GenerationParams::default().prefill_chunk_size,
+                    prefill_budget: cfg.batch_prefill,
+                },
+                id,
+            )?
+        }
+    };
     println!(
         "Model id: {}, context: {}, EOS ids: {:?}, chat template: {}",
         engine.model_id(),
@@ -208,14 +304,24 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {}:{}", cfg.host, cfg.port))?;
     let app = Arc::new(App::new(Arc::new(engine), cfg));
     let workers = serve::spawn_workers(&app)?;
-    println!(
-        "Server: {} worker slots, {} thread(s)/slot, reasoning separation {}, listening on {}:{}",
-        app.cfg.slots,
-        app.cfg.threads_per_slot,
-        if app.reasoning { "on" } else { "off" },
-        app.cfg.host,
-        app.cfg.port
-    );
+    match scheduler {
+        Scheduler::Slots => println!(
+            "Server: slot scheduler, {} worker slots, {} thread(s)/slot, reasoning separation {}, listening on {}:{}",
+            app.cfg.slots,
+            app.cfg.threads_per_slot,
+            if app.reasoning { "on" } else { "off" },
+            app.cfg.host,
+            app.cfg.port
+        ),
+        Scheduler::Batch => println!(
+            "Server: batch scheduler, up to {} concurrent requests, {} threads, reasoning separation {}, listening on {}:{}",
+            app.cfg.max_batch,
+            rayon::current_num_threads(),
+            if app.reasoning { "on" } else { "off" },
+            app.cfg.host,
+            app.cfg.port
+        ),
+    }
 
     serve::serve(listener, Arc::clone(&app));
 

@@ -74,6 +74,7 @@ xor-net chat Bonsai-8B.xq1
 | command | |
 |---------|-|
 | `xor-net run <model> -p "..." [-n N] [--temp T] [--top-k K] [--top-p P] [--seed S] [--stop STR] [--chat] [--no-think] [-t N]` | stream a completion to stdout, stats to stderr (`-q` to silence) |
+| `xor-net run/chat <model> ... --draft lookup\|<dspark.gguf> [--draft-k N]` | lossless speculative decoding (identical greedy output, same sampling distribution) |
 | `xor-net chat <model> [--system "..."] [--no-think] [--show-thinking]` | interactive multi-turn chat; Ctrl-C stops a reply; `/reset`, `/system`, `/think on\|off`, `/exit` |
 | `xor-net convert <in.gguf> [out.xq1]` | lossless GGUF -> `.xq1` conversion |
 | `xor-net bench <model> [-p 128] [-n 64] [-t N]` | prefill / decode tok/s and peak RSS |
@@ -201,7 +202,9 @@ curl -N http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/
   -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-Any OpenAI client works (`base_url="http://127.0.0.1:8080/v1"`).
+Any OpenAI client works (`base_url="http://127.0.0.1:8080/v1"`). `--draft
+lookup` (any model) or `--draft Bonsai-27B-dspark-Q4_1.gguf` (Bonsai 27B)
+turns on lossless speculative decoding in the slot scheduler.
 
 ## The `.xq1` format
 

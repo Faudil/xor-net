@@ -30,9 +30,13 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 
-use crate::models::traits::{CausalLM, ModelState};
+use crate::models::traits::{CausalLM, ForwardOpts, HiddenTaps, ModelState};
 use crate::prompt_cache::{self, PromptCache};
 use crate::sampler::{Sampler, SamplingParams};
+use crate::speculative::{
+    AdaptiveK, DraftModel, DraftSampler, DraftToken, Drafter, SpecConfig, SpecStats,
+    accept_or_resample,
+};
 
 // ---------------------------------------------------------------------------
 // Parameters & results
@@ -63,6 +67,9 @@ pub struct GenerationParams {
     pub chat_template_kwargs: serde_json::Map<String, serde_json::Value>,
     /// How `<think>…</think>` blocks in the output are reported.
     pub reasoning_format: ReasoningFormat,
+    /// Lossless speculative decoding (see [`crate::speculative`]); `None`
+    /// decodes one token per forward.
+    pub speculative: Option<SpecConfig>,
 }
 
 /// How reasoning (`<think>…</think>`) in the model output is handled.
@@ -111,6 +118,7 @@ impl Default for GenerationParams {
             prefill_chunk_size: 512,
             chat_template_kwargs: serde_json::Map::new(),
             reasoning_format: ReasoningFormat::None,
+            speculative: None,
         }
     }
 }
@@ -163,6 +171,12 @@ impl GenerationParams {
     }
     pub fn with_reasoning_format(mut self, f: ReasoningFormat) -> Self {
         self.reasoning_format = f;
+        self
+    }
+    /// Decode speculatively with `spec` (output distribution unchanged;
+    /// greedy output token-identical).
+    pub fn with_speculative(mut self, spec: SpecConfig) -> Self {
+        self.speculative = Some(spec);
         self
     }
 }
@@ -248,6 +262,8 @@ pub struct Generation {
     pub finish_reason: FinishReason,
     pub usage: Usage,
     pub timings: Timings,
+    /// Speculative decoding counters (`None` without speculation).
+    pub speculative: Option<SpecStats>,
 }
 
 /// Typed request errors (returned inside `anyhow::Error`; use
@@ -848,6 +864,9 @@ pub struct Generator {
     prefix_caching: bool,
     /// Shared cross-request prefix cache (see [`Self::with_prompt_cache`]).
     prompt_cache: Option<Arc<PromptCache>>,
+    /// Per-sequence speculative drafter, kept in sync with `state` and
+    /// reused while requests use the same [`DraftModel`].
+    drafter: Option<(Arc<dyn DraftModel>, Box<dyn Drafter>)>,
 }
 
 impl Generator {
@@ -863,6 +882,7 @@ impl Generator {
             fed: Vec::new(),
             prefix_caching: true,
             prompt_cache: None,
+            drafter: None,
         }
     }
 
@@ -946,6 +966,7 @@ impl Generator {
             fed: Vec::new(),
             prefix_caching: self.prefix_caching,
             prompt_cache: self.prompt_cache.clone(),
+            drafter: None,
         }
     }
 
@@ -1003,6 +1024,7 @@ impl Generator {
     pub fn release_state(&mut self) {
         self.state = None;
         self.fed.clear();
+        self.drafter = None;
     }
 
     pub fn model(&self) -> &Arc<dyn CausalLM> {
@@ -1314,8 +1336,21 @@ impl Generator {
                     ..usage
                 },
                 timings,
+                speculative: None,
             });
         }
+
+        // --- speculative drafter (per sequence, reused across requests) ---
+        let mut drafter = match &params.speculative {
+            Some(spec) => match self.drafter.take() {
+                Some((m, d)) if Arc::ptr_eq(&m, &spec.drafter) => Some((m, d)),
+                _ => {
+                    spec.drafter.check_target(&*self.model)?;
+                    Some((spec.drafter.clone(), spec.drafter.new_drafter()?))
+                }
+            },
+            None => None,
+        };
 
         // --- state: reuse the processed prefix when possible ---------------
         let mut fed = std::mem::take(&mut self.fed); // empty on any early exit
@@ -1374,6 +1409,11 @@ impl Generator {
         }
         usage.cached_prompt_tokens = keep;
 
+        // The speculative drafter follows the reused prefix.
+        if let Some((_, d)) = &mut drafter {
+            d.rewind(&fed);
+        }
+
         let mut sink = OutputSink {
             splitter: (params.reasoning_format == ReasoningFormat::Separate)
                 .then(|| ReasoningSplitter::new(starts_in_reasoning)),
@@ -1382,6 +1422,7 @@ impl Generator {
             buf: Vec::new(),
             on_event: &mut on_event,
         };
+        let mut spec_stats = params.speculative.as_ref().map(|_| SpecStats::default());
         let result = self.run(
             prompt,
             params,
@@ -1392,9 +1433,14 @@ impl Generator {
             &mut timings,
             vocab,
             &mut sink,
+            drafter.as_mut().map(|d| -> &mut dyn Drafter { &mut *d.1 }),
+            spec_stats.as_mut(),
         );
         // The state is valid for `fed` only if every forward succeeded.
         self.state = Some(state);
+        if result.is_ok() {
+            self.drafter = drafter;
+        }
         match result {
             Ok((tokens, finish_reason, stop_string)) => {
                 self.fed = fed;
@@ -1407,6 +1453,7 @@ impl Generator {
                     finish_reason,
                     usage,
                     timings,
+                    speculative: spec_stats,
                 })
             }
             Err(e) => Err(e),
@@ -1425,8 +1472,15 @@ impl Generator {
         timings: &mut Timings,
         vocab: usize,
         sink: &mut OutputSink<'_>,
+        mut drafter: Option<&mut dyn Drafter>,
+        spec_stats: Option<&mut SpecStats>,
     ) -> anyhow::Result<(Vec<u32>, FinishReason, Option<String>)> {
         let model = self.model.clone();
+        // Hidden taps the drafter needs from every committed forward.
+        let mut taps = drafter.as_ref().and_then(|d| d.taps()).map(|l| HiddenTaps {
+            layers: l.to_vec(),
+            data: Vec::new(),
+        });
         let check = |l: &Vec<f32>| -> anyhow::Result<()> {
             anyhow::ensure!(
                 l.len() == vocab,
@@ -1489,7 +1543,23 @@ impl Generator {
         let mut logits = Vec::new();
         for end in stops {
             for piece in prompt[fed.len()..end].chunks(chunk) {
-                logits = model.forward(piece, fed.len(), state)?;
+                let pos = fed.len();
+                logits = match drafter.as_deref_mut() {
+                    Some(d) => {
+                        let l = model.forward_with(
+                            piece,
+                            pos,
+                            state,
+                            &mut ForwardOpts {
+                                taps: taps.as_mut(),
+                                ..ForwardOpts::default()
+                            },
+                        )?;
+                        d.observe(piece, pos, taps.as_ref().map(|t| &t.data[..]))?;
+                        l
+                    }
+                    None => model.forward(piece, pos, state)?,
+                };
                 fed.extend_from_slice(piece);
             }
             if checkpoint_at == Some(end) {
@@ -1511,36 +1581,53 @@ impl Generator {
         // --- decode ----------------------------------------------------------
         let t1 = Instant::now();
         self.sampler.set_params(params.sampling.clone());
-        let mut detok = StreamDecoder::new(prompt, true);
-        let mut stops = StopMatcher::new(&params.stop);
-        let mut out: Vec<u32> = Vec::with_capacity(params.max_tokens);
-        let is_stop_id = |t: u32| {
-            params.stop_token_ids.contains(&t) || (!params.ignore_eos && self.eos_ids.contains(&t))
+        let mut em = Emitter {
+            detok: StreamDecoder::new(prompt, true),
+            stops: StopMatcher::new(&params.stop),
+            out: Vec::with_capacity(params.max_tokens),
+            params,
+            eos_ids: &self.eos_ids,
         };
 
-        let finish = loop {
-            let tok = self.sampler.sample_split(&mut logits, prompt, &out)?;
-            usage.completion_tokens += 1;
-            if is_stop_id(tok) {
-                break FinishReason::Stop;
+        let finish = match (drafter, &params.speculative, spec_stats) {
+            (Some(d), Some(spec), Some(stats)) => {
+                let mut sd = SpecDecode {
+                    model: &*model,
+                    sampler: &mut self.sampler,
+                    drafter: d,
+                    stats,
+                    adapt: AdaptiveK::new(spec.effective_k(), spec.adaptive),
+                    taps: taps.as_mut(),
+                    prompt,
+                    vocab,
+                };
+                sd.decode(
+                    &mut logits,
+                    state,
+                    fed,
+                    &mut em,
+                    usage,
+                    &self.tokenizer,
+                    sink,
+                    check,
+                )?
             }
-            out.push(tok);
-            if let Some(delta) = detok.push(&self.tokenizer, tok)? {
-                let (safe, hit) = stops.push(&delta);
-                if sink.push(&safe).is_break() {
-                    break FinishReason::Aborted;
+            _ => loop {
+                let tok = self.sampler.sample_split(&mut logits, prompt, &em.out)?;
+                if let Some(f) = em.token(tok, &self.tokenizer, usage, sink)? {
+                    break f;
                 }
-                if hit {
-                    break FinishReason::StopString;
-                }
-            }
-            if usage.completion_tokens >= params.max_tokens {
-                break FinishReason::Length;
-            }
-            logits = model.forward(&[tok], fed.len(), state)?;
-            fed.push(tok);
-            check(&logits)?;
+                logits = model.forward(&[tok], fed.len(), state)?;
+                fed.push(tok);
+                check(&logits)?;
+            },
         };
+        let Emitter {
+            mut detok,
+            mut stops,
+            out,
+            ..
+        } = em;
 
         if matches!(finish, FinishReason::Stop | FinishReason::Length) {
             // Release text held back by the detokenizer / stop matcher.
@@ -1564,6 +1651,261 @@ impl Generator {
         timings.decode = t1.elapsed();
         timings.decode_tokens = usage.completion_tokens;
         Ok((out, finish, stops.matched().map(str::to_owned)))
+    }
+}
+
+/// Per-request output bookkeeping shared by the plain and speculative
+/// decode loops: stop ids, detokenisation, stop strings, streaming, the
+/// token budget.
+struct Emitter<'p> {
+    detok: StreamDecoder,
+    stops: StopMatcher,
+    /// Completion tokens (no terminating EOS / stop id).
+    out: Vec<u32>,
+    params: &'p GenerationParams,
+    eos_ids: &'p [u32],
+}
+
+impl Emitter<'_> {
+    /// Account for one sampled token. `Some(reason)` ends generation; the
+    /// token is then never fed to the model (as in plain decoding).
+    fn token(
+        &mut self,
+        tok: u32,
+        tokenizer: &Tokenizer,
+        usage: &mut Usage,
+        sink: &mut OutputSink<'_>,
+    ) -> anyhow::Result<Option<FinishReason>> {
+        let p = self.params;
+        usage.completion_tokens += 1;
+        if p.stop_token_ids.contains(&tok) || (!p.ignore_eos && self.eos_ids.contains(&tok)) {
+            return Ok(Some(FinishReason::Stop));
+        }
+        self.out.push(tok);
+        if let Some(delta) = self.detok.push(tokenizer, tok)? {
+            let (safe, hit) = self.stops.push(&delta);
+            if sink.push(&safe).is_break() {
+                return Ok(Some(FinishReason::Aborted));
+            }
+            if hit {
+                return Ok(Some(FinishReason::StopString));
+            }
+        }
+        if usage.completion_tokens >= p.max_tokens {
+            return Ok(Some(FinishReason::Length));
+        }
+        Ok(None)
+    }
+}
+
+/// [`DraftSampler`] over the request's sampler: draft tokens go through the
+/// same penalties / temperature / truncation as target tokens.
+struct RequestDraftSampler<'a> {
+    sampler: &'a mut Sampler,
+    prompt: &'a [u32],
+    output: &'a [u32],
+    scratch: Vec<u32>,
+}
+
+impl DraftSampler for RequestDraftSampler<'_> {
+    fn pick(
+        &mut self,
+        logits: &mut [f32],
+        drafted: &[u32],
+    ) -> anyhow::Result<(u32, Option<Vec<f32>>)> {
+        self.scratch.clear();
+        self.scratch.extend_from_slice(self.output);
+        self.scratch.extend_from_slice(drafted);
+        if self.sampler.params().is_greedy() {
+            let t = self
+                .sampler
+                .sample_split(logits, self.prompt, &self.scratch)?;
+            return Ok((t, None));
+        }
+        let mut q = Vec::new();
+        self.sampler
+            .distribution(logits, self.prompt, &self.scratch, &mut q)?;
+        let t = self.sampler.sample_weights(&q)?;
+        Ok((t, Some(q)))
+    }
+}
+
+/// The speculative decode loop (see [`crate::speculative`]).
+struct SpecDecode<'a> {
+    model: &'a dyn CausalLM,
+    sampler: &'a mut Sampler,
+    drafter: &'a mut dyn Drafter,
+    stats: &'a mut SpecStats,
+    adapt: AdaptiveK,
+    taps: Option<&'a mut HiddenTaps>,
+    prompt: &'a [u32],
+    vocab: usize,
+}
+
+impl SpecDecode<'_> {
+    /// Decode from the prompt's last `logits` until a finish reason. `fed`
+    /// tracks exactly what `state` holds, as in the plain loop.
+    #[allow(clippy::too_many_arguments)]
+    fn decode(
+        &mut self,
+        logits: &mut Vec<f32>,
+        state: &mut dyn ModelState,
+        fed: &mut Vec<u32>,
+        em: &mut Emitter<'_>,
+        usage: &mut Usage,
+        tokenizer: &Tokenizer,
+        sink: &mut OutputSink<'_>,
+        check: impl Fn(&Vec<f32>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<FinishReason> {
+        let vocab = self.vocab;
+        let max_seq = self.model.max_seq_len();
+        let greedy = self.sampler.params().is_greedy();
+        let mut tok = self.sampler.sample_split(logits, self.prompt, &em.out)?;
+        loop {
+            if let Some(f) = em.token(tok, tokenizer, usage, sink)? {
+                return Ok(f);
+            }
+            // `tok` continues: feed it, verifying drafts along with it.
+            let pos = fed.len();
+            let budget = em.params.max_tokens - usage.completion_tokens;
+            let kmax = self
+                .adapt
+                .get()
+                .min(budget.saturating_sub(1))
+                .min(max_seq.saturating_sub(pos + 1));
+            let mut draft_ms = None;
+            let drafts: Vec<DraftToken> = if kmax > 0 {
+                let t0 = Instant::now();
+                fed.push(tok);
+                let mut ds = RequestDraftSampler {
+                    sampler: self.sampler,
+                    prompt: self.prompt,
+                    output: &em.out,
+                    scratch: Vec::new(),
+                };
+                let r = self.drafter.draft(fed, kmax, &mut ds);
+                fed.pop();
+                self.stats.draft_time += t0.elapsed();
+                draft_ms = Some(t0.elapsed().as_secs_f64() * 1e3);
+                let mut d = r?;
+                d.truncate(kmax);
+                // Defensive: a drafter must stay in the vocabulary and give
+                // full-vocabulary distributions.
+                let bad = d.iter().position(|t| {
+                    t.token as usize >= vocab || t.probs.as_ref().is_some_and(|q| q.len() != vocab)
+                });
+                d.truncate(bad.unwrap_or(d.len()));
+                d
+            } else {
+                Vec::new()
+            };
+
+            let t0 = Instant::now();
+            let mut batch = Vec::with_capacity(drafts.len() + 1);
+            batch.push(tok);
+            batch.extend(drafts.iter().map(|d| d.token));
+            let all = self.model.forward_with(
+                &batch,
+                pos,
+                state,
+                &mut ForwardOpts {
+                    all_logits: !drafts.is_empty(),
+                    provisional: !drafts.is_empty(),
+                    taps: self.taps.as_deref_mut(),
+                },
+            )?;
+            anyhow::ensure!(
+                all.len()
+                    == if drafts.is_empty() {
+                        vocab
+                    } else {
+                        batch.len() * vocab
+                    },
+                "model returned {} logits for {} positions (vocab {vocab})",
+                all.len(),
+                batch.len()
+            );
+            if drafts.is_empty() {
+                *logits = all;
+                check(logits)?;
+                fed.push(tok);
+                self.stats.verify_time += t0.elapsed();
+                self.stats.plain_steps += 1;
+                self.adapt
+                    .update(0, 0, draft_ms, t0.elapsed().as_secs_f64() * 1e3);
+                self.drafter
+                    .observe(&batch, pos, self.taps.as_ref().map(|t| &t.data[..]))?;
+                tok = self.sampler.sample_split(logits, self.prompt, &em.out)?;
+                continue;
+            }
+
+            // Accept the longest prefix the target agrees with.
+            let n = drafts.len();
+            let mut ext = em.out.clone();
+            let mut accepted = 0;
+            let mut next = None;
+            let mut row = vec![0.0f32; vocab];
+            let mut p = Vec::new();
+            for (i, d) in drafts.iter().enumerate() {
+                row.copy_from_slice(&all[i * vocab..(i + 1) * vocab]);
+                if greedy {
+                    let t = self.sampler.sample_split(&mut row, self.prompt, &ext)?;
+                    if t != d.token {
+                        next = Some(t);
+                        break;
+                    }
+                } else {
+                    self.sampler
+                        .distribution(&mut row, self.prompt, &ext, &mut p)?;
+                    let u = self.sampler.uniform();
+                    let sampler = &mut *self.sampler;
+                    let r = accept_or_resample(&p, d.token, d.probs.as_deref(), u, &mut |w| {
+                        sampler.sample_weights(w)
+                    })?;
+                    if let Some(t) = r {
+                        next = Some(t);
+                        break;
+                    }
+                }
+                accepted += 1;
+                ext.push(d.token);
+            }
+            let next = match next {
+                Some(t) => t,
+                None => {
+                    row.copy_from_slice(&all[n * vocab..(n + 1) * vocab]);
+                    self.sampler.sample_split(&mut row, self.prompt, &ext)?
+                }
+            };
+            self.stats.rounds += 1;
+            self.stats.drafted += n;
+            self.stats.accepted += accepted;
+            let fwd_ms = t0.elapsed().as_secs_f64() * 1e3;
+            self.adapt.update(n, accepted, draft_ms, fwd_ms);
+
+            // Emit the accepted drafts; only those that continue are kept.
+            let mut keep = 1;
+            let mut finish = None;
+            for d in &drafts[..accepted] {
+                if let Some(f) = em.token(d.token, tokenizer, usage, sink)? {
+                    finish = Some(f);
+                    break;
+                }
+                keep += 1;
+            }
+            state.commit(pos + keep)?;
+            fed.extend_from_slice(&batch[..keep]);
+            self.stats.verify_time += t0.elapsed();
+            let tap_rows = self.taps.as_ref().map(|t| {
+                let w = t.data.len() / batch.len();
+                &t.data[..keep * w]
+            });
+            self.drafter.observe(&batch[..keep], pos, tap_rows)?;
+            if let Some(f) = finish {
+                return Ok(f);
+            }
+            tok = next;
+        }
     }
 }
 

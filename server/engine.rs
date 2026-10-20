@@ -6,16 +6,20 @@
 //! delegates all of it to `xor_net::generation::Generator`.
 
 use std::ops::ControlFlow;
-use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use anyhow::anyhow;
 use serde::Serialize;
 use serde_json::{Map, Value};
+use xor_net::batch_session::SessionShared;
 use xor_net::generation::{
     FinishReason as GenFinish, GenerationParams, Generator, ReasoningFormat, StreamEvent, Timings,
     common_prefix,
 };
+use xor_net::models::batched::BatchedCausalLM;
 use xor_net::prompt_cache::PromptCacheStats;
+
+use crate::batcher::{BatchOptions, BatchRunner};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChatMessage {
@@ -189,36 +193,78 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 // Generator-backed engine
 // ---------------------------------------------------------------------------
 
-/// One shared model; one [`Generator`] fork (own state, KV cache, sampler)
-/// per worker slot. Slot `i` is only ever used by worker `i`, so the slot
-/// mutexes are uncontended; they exist to make the engine `Sync`.
+/// One shared model, served by one of two schedulers:
+/// - slots: one [`Generator`] fork (own state, KV cache, sampler) per worker
+///   slot, each decoding independently. Slot `i` is only ever used by worker
+///   `i`, so the slot mutexes are uncontended; they exist to make the engine
+///   `Sync`.
+/// - batch: a [`BatchRunner`] engine thread decodes every active request
+///   together (continuous batching); worker `i` relays request `i`.
 pub struct GeneratorEngine {
     /// Used for tokenization / templating only (never generates).
     base: Mutex<Generator>,
-    slots: Vec<Mutex<Generator>>,
+    backend: Backend,
     model_id: String,
     ctx: usize,
     vocab: usize,
     has_thinking: bool,
+    /// Speculative decoding for the slot scheduler (`--draft`).
+    spec: Option<xor_net::speculative::SpecConfig>,
+}
+
+enum Backend {
+    Slots(Vec<Mutex<Generator>>),
+    Batch(BatchRunner),
 }
 
 impl GeneratorEngine {
+    /// Slot scheduler with `slots` independent generators.
     pub fn new(generator: Generator, slots: usize, model_id: String) -> Self {
+        let slots = (0..slots.max(1))
+            .map(|_| Mutex::new(generator.fork()))
+            .collect();
+        Self::with_backend(generator, Backend::Slots(slots), model_id)
+    }
+
+    /// Continuous-batching scheduler over `opts.max_batch` slots. `batched`
+    /// is the model's batched forward (the same model as `generator`'s);
+    /// `None` falls back to one forward per sequence and step.
+    pub fn new_batched(
+        generator: Generator,
+        batched: Option<Arc<dyn BatchedCausalLM>>,
+        opts: BatchOptions,
+        model_id: String,
+    ) -> anyhow::Result<Self> {
+        let shared = SessionShared::from_generator(&generator);
+        let runner = BatchRunner::spawn(shared, batched, opts)?;
+        Ok(Self::with_backend(
+            generator,
+            Backend::Batch(runner),
+            model_id,
+        ))
+    }
+
+    fn with_backend(generator: Generator, backend: Backend, model_id: String) -> Self {
         let model = generator.model();
         let ctx = model.max_seq_len();
         let vocab = model.vocab_size();
         let has_thinking = generator.chat_template().is_some_and(|t| t.has_thinking());
-        let slots = (0..slots.max(1))
-            .map(|_| Mutex::new(generator.fork()))
-            .collect();
         Self {
             base: Mutex::new(generator),
-            slots,
+            backend,
             model_id,
             ctx,
             vocab,
             has_thinking,
+            spec: None,
         }
+    }
+
+    /// Decode speculatively (slot scheduler only; the batch scheduler
+    /// ignores it).
+    pub fn with_speculative(mut self, spec: Option<xor_net::speculative::SpecConfig>) -> Self {
+        self.spec = spec;
+        self
     }
 
     pub fn eos_ids(&self) -> Vec<u32> {
@@ -289,7 +335,11 @@ impl Engine for GeneratorEngine {
     }
 
     fn slot_affinity(&self, slot: usize, ids: &[u32]) -> usize {
-        match self.slots.get(slot).map(Mutex::try_lock) {
+        let slots = match &self.backend {
+            Backend::Slots(s) => s,
+            Backend::Batch(r) => return r.affinity(slot, ids),
+        };
+        match slots.get(slot).map(Mutex::try_lock) {
             Some(Ok(g)) => common_prefix(g.processed_tokens(), ids),
             Some(Err(TryLockError::Poisoned(p))) => {
                 common_prefix(p.into_inner().processed_tokens(), ids)
@@ -326,8 +376,30 @@ impl Engine for GeneratorEngine {
             } else {
                 ReasoningFormat::None
             });
-        let slot = self
-            .slots
+        let finish = |f| match f {
+            GenFinish::Stop => FinishReason::Eos,
+            GenFinish::StopString => FinishReason::StopString,
+            GenFinish::Length => FinishReason::Length,
+            GenFinish::Aborted => FinishReason::Cancelled,
+        };
+        let slots = match &self.backend {
+            Backend::Slots(s) => s,
+            Backend::Batch(r) => {
+                let out = r.generate(slot, &req.prompt_ids, &params, &req.boundaries, on_event)?;
+                return Ok(GenResult {
+                    finish: finish(out.finish),
+                    completion_tokens: out.usage.completion_tokens,
+                    stop_word: out.stop_string,
+                    timings: Some(out.timings),
+                    cached_tokens: out.usage.cached_prompt_tokens,
+                });
+            }
+        };
+        let params = match &self.spec {
+            Some(spec) => params.with_speculative(spec.clone()),
+            None => params,
+        };
+        let slot = slots
             .get(slot)
             .ok_or_else(|| anyhow!("no generator for slot {slot}"))?;
         let mut g = lock(slot);
@@ -337,14 +409,8 @@ impl Engine for GeneratorEngine {
             &req.boundaries,
             on_event,
         )?;
-        let finish = match out.finish_reason {
-            GenFinish::Stop => FinishReason::Eos,
-            GenFinish::StopString => FinishReason::StopString,
-            GenFinish::Length => FinishReason::Length,
-            GenFinish::Aborted => FinishReason::Cancelled,
-        };
         Ok(GenResult {
-            finish,
+            finish: finish(out.finish_reason),
             completion_tokens: out.usage.completion_tokens,
             stop_word: out.stop_string,
             timings: Some(out.timings),

@@ -79,6 +79,18 @@ pub trait ModelState: Any + Send {
         false
     }
 
+    /// Finish a [`ForwardOpts::provisional`] forward (speculative
+    /// verification): keep the first `len` positions of the sequence, where
+    /// `len` lies between the length before that forward and the length
+    /// after it. Afterwards the state is exactly as if only those positions
+    /// had been fed. Also valid (and a no-op) without a provisional forward
+    /// when `len` is the current length. The default truncates, which is
+    /// right for position-indexed KV caches.
+    fn commit(&mut self, len: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(self.truncate(len), "state cannot roll back to {len}");
+        Ok(())
+    }
+
     /// Downcasting hook for the owning model implementation.
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
@@ -133,6 +145,34 @@ impl std::fmt::Debug for StateSnapshot {
     }
 }
 
+/// Hidden states copied out of a forward pass (for drafters such as DSpark
+/// that condition on the target's intermediate layers).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HiddenTaps {
+    /// Layer indices whose *output* (the residual stream after the layer's
+    /// MLP) is captured, in output order.
+    pub layers: Vec<usize>,
+    /// Filled by the forward: `[n][layers.len() * hidden]`, row `t` being
+    /// fed position `pos + t`, layers concatenated in `layers` order.
+    pub data: Vec<f32>,
+}
+
+/// Extra outputs / modes of [`CausalLM::forward_with`]. `Default` is a plain
+/// [`CausalLM::forward`].
+#[derive(Debug, Default)]
+pub struct ForwardOpts<'a> {
+    /// Return the logits of *every* fed position (`[n][vocab]` row-major)
+    /// instead of only the last one.
+    pub all_logits: bool,
+    /// Speculative verification: the fed positions are kept only
+    /// provisionally; the caller must then call [`ModelState::commit`] with
+    /// the number of positions to keep before anything else touches the
+    /// state.
+    pub provisional: bool,
+    /// Capture hidden states (see [`HiddenTaps`]).
+    pub taps: Option<&'a mut HiddenTaps>,
+}
+
 /// A decoder-only language model.
 ///
 /// Contract for [`forward`](Self::forward):
@@ -156,6 +196,54 @@ pub trait CausalLM: Send + Sync {
         pos: usize,
         state: &mut dyn ModelState,
     ) -> anyhow::Result<Logits>;
+
+    /// [`forward`](Self::forward) with the extras of [`ForwardOpts`] (all
+    /// positions' logits, provisional verification, hidden taps), under the
+    /// same feeding contract. Logits must be bit-identical to feeding the
+    /// tokens one at a time, so speculative decoding stays exact.
+    ///
+    /// The default supports `all_logits` / `provisional` by feeding one
+    /// token at a time (correct, but no faster than plain decoding; see
+    /// [`batched_verify`](Self::batched_verify)) and rejects taps.
+    fn forward_with(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut dyn ModelState,
+        opts: &mut ForwardOpts<'_>,
+    ) -> anyhow::Result<Logits> {
+        anyhow::ensure!(
+            opts.taps.is_none(),
+            "this model does not support hidden-state taps"
+        );
+        if !opts.all_logits {
+            return self.forward(tokens, pos, state);
+        }
+        let mut out = Vec::with_capacity(tokens.len() * self.vocab_size());
+        for (i, &t) in tokens.iter().enumerate() {
+            out.extend(self.forward(&[t], pos + i, state)?);
+        }
+        Ok(out)
+    }
+
+    /// `true` if [`forward_with`](Self::forward_with) verifies several
+    /// tokens in one pass over the weights (what makes speculative decoding
+    /// pay off).
+    fn batched_verify(&self) -> bool {
+        false
+    }
+
+    /// Model width and depth, for validating [`HiddenTaps`] requests
+    /// (`None` if taps are unsupported).
+    fn hidden_shape(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// The concrete model, for components that need more than this trait
+    /// (e.g. a drafter sharing the target's embedding / output head).
+    fn as_any(&self) -> Option<&dyn Any> {
+        None
+    }
 
     fn vocab_size(&self) -> usize;
 

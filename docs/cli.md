@@ -68,6 +68,9 @@ dominated by first-call warm-up. Use `bench` for throughput numbers.)
 | `-q, --quiet` | off | no load / stats lines |
 | `-t, --threads N` | auto (max 8) | |
 | `--tokenizer FILE` | embedded | override `tokenizer.json` |
+| `--draft D` | off | lossless speculative decoding: `lookup` (n-gram prompt lookup, any model) or a DSpark drafter `.gguf` (Bonsai 27B, `Bonsai-27B-dspark-Q4_1.gguf`) |
+| `--draft-k N` | dspark 4, lookup 4 | draft tokens per round |
+| `--draft-head H` | `shared` | DSpark output head: `shared` (the target's 1-bit head) or `own` (the drafter's Q4_1 head) |
 
 The sampling defaults are the Qwen3 "non-thinking" recommendation (Bonsai is
 Qwen3-based).
@@ -78,6 +81,16 @@ into stdout. `--think` / `--no-think` only take effect for templates that read
 `enable_thinking` (Bonsai 27B / Qwen3.5); the Bonsai 1.7B / 4B / 8B templates
 always emit an empty think block, so they never think. `xor-net info <MODEL>`
 shows which kind a model has.
+
+**Speculative decoding.** `--draft` never changes the output (greedy output
+is token-identical, sampled output has the same distribution); it only
+changes speed. The stats line then reports the draft acceptance rate and
+tokens committed per verification round. It pays off when the output can be
+predicted. On a 6-core Zen 5 (greedy, 128-256 tokens): DSpark on Bonsai 27B
+gives about 1.7-1.8x on code and code edits, 1.4x on summaries and 1.0-1.15x
+on free prose; `lookup` gives 1.3-1.5x when the answer copies from the
+prompt (summaries, code edits) on Bonsai 1.7B / 8B / 27B and nothing on
+prose. See `docs/architecture.md`.
 
 ## `chat`
 

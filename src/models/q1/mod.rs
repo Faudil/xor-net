@@ -9,6 +9,8 @@
 //! RoPE tables (incl. YaRN), the growable [`KvCache`] and causal [`attention`].
 //! All activations are plain row-major `f32` (`[tokens, features]`).
 
+pub mod batch;
+pub mod dspark;
 pub mod flash;
 pub mod format;
 pub mod qwen3;
@@ -605,6 +607,39 @@ pub fn swiglu_rows(gu: &mut [f32], act: &mut [f32], inter: usize) {
             .zip(act.chunks_exact_mut(inter))
             .for_each(f);
     }
+}
+
+/// Copy the residual stream `x` (`[n][h]`) after layer `layer` into every
+/// slot of `taps` that requests that layer (see
+/// [`crate::models::traits::HiddenTaps`]; `taps.data` is pre-sized).
+pub(crate) fn copy_taps(
+    taps: &mut crate::models::traits::HiddenTaps,
+    layer: usize,
+    x: &[f32],
+    n: usize,
+    h: usize,
+) {
+    let nt = taps.layers.len();
+    for c in (0..nt).filter(|&c| taps.layers[c] == layer) {
+        for t in 0..n {
+            taps.data[(t * nt + c) * h..(t * nt + c + 1) * h]
+                .copy_from_slice(&x[t * h..(t + 1) * h]);
+        }
+    }
+}
+
+/// `[rows][head_rows]` lm-head output -> `[rows][vocab]` (drops padding rows
+/// of the head beyond the vocabulary).
+pub(crate) fn trim_logit_rows(mut logits: Vec<f32>, head_rows: usize, vocab: usize) -> Vec<f32> {
+    if head_rows == vocab {
+        return logits;
+    }
+    let rows = logits.len() / head_rows;
+    for r in 0..rows {
+        logits.copy_within(r * head_rows..r * head_rows + vocab, r * vocab);
+    }
+    logits.truncate(rows * vocab);
+    logits
 }
 
 // ---------------------------------------------------------------------------

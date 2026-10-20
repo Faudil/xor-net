@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::json;
 
 use crate::api::{self, Api, ApiError, RespMeta};
-use crate::config::ServerConfig;
+use crate::config::{Scheduler, ServerConfig};
 use crate::engine::{Engine, GenRequest, GenResult};
 use crate::http::{self, Limits, Request, Response, TimedReader};
 use xor_net::generation::{ReasoningFormat, StreamEvent};
@@ -250,24 +250,34 @@ impl App {
     }
 }
 
-/// Spawn `cfg.slots` workers, each with its own rayon pool.
+/// Spawn `cfg.slots` workers. With the slot scheduler each runs its
+/// decodes in its own rayon pool of `cfg.threads_per_slot` threads; with the
+/// batch scheduler workers only relay requests to the engine thread, whose
+/// batched forwards use the global pool.
 pub fn spawn_workers(app: &Arc<App>) -> anyhow::Result<Vec<thread::JoinHandle<()>>> {
+    let batch = app.cfg.scheduler == Some(Scheduler::Batch);
     let mut handles = Vec::new();
     for slot in 0..app.cfg.slots {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(app.cfg.threads_per_slot.max(1))
-            .thread_name(move |i| format!("slot{slot}-rayon{i}"))
-            .build()?;
+        let pool = if batch {
+            None
+        } else {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(app.cfg.threads_per_slot.max(1))
+                    .thread_name(move |i| format!("slot{slot}-rayon{i}"))
+                    .build()?,
+            )
+        };
         let app = Arc::clone(app);
         let h = thread::Builder::new()
             .name(format!("slot{slot}"))
-            .spawn(move || worker(&app, slot, &pool))?;
+            .spawn(move || worker(&app, slot, pool.as_ref()))?;
         handles.push(h);
     }
     Ok(handles)
 }
 
-fn worker(app: &App, slot: usize, pool: &rayon::ThreadPool) {
+fn worker(app: &App, slot: usize, pool: Option<&rayon::ThreadPool>) {
     while let Some(job) = app.queue.pop(slot) {
         if !job.cancel.load(Ordering::Relaxed) {
             run_job(app.engine.as_ref(), slot, &job, pool);
@@ -276,10 +286,10 @@ fn worker(app: &App, slot: usize, pool: &rayon::ThreadPool) {
     }
 }
 
-fn run_job(engine: &dyn Engine, slot: usize, job: &Job, pool: &rayon::ThreadPool) {
+fn run_job(engine: &dyn Engine, slot: usize, job: &Job, pool: Option<&rayon::ThreadPool>) {
     let tx = &job.tx;
     let cancel = &job.cancel;
-    let res = pool.install(|| {
+    let run = || {
         engine.generate(slot, &job.req, &mut |ev: StreamEvent<'_>| {
             if cancel.load(Ordering::Relaxed) {
                 return ControlFlow::Break(());
@@ -294,7 +304,11 @@ fn run_job(engine: &dyn Engine, slot: usize, job: &Job, pool: &rayon::ThreadPool
             }
             ControlFlow::Continue(())
         })
-    });
+    };
+    let res = match pool {
+        Some(p) => p.install(run),
+        None => run(),
+    };
     let _ = match res {
         Ok(r) => tx.send(Event::Done(r)),
         Err(e) => tx.send(Event::Error(e.to_string())),

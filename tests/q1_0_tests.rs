@@ -6,8 +6,8 @@
 //! (independent of ISA, row grouping and the number of tokens per call).
 
 use xor_net::bit1::q1_0::{
-    ActRow, GemmKernel, Isa, Q1Weight, Q8Acts, TileIsa, dot_rows_isa, dot_rows_scalar, gemm,
-    gemm_with, gemv, perm32,
+    ActRow, GEMM_TILED_MIN_TOKENS, GemmKernel, Isa, MULTI_MAX_TOKENS, Q1Weight, Q8Acts, TileIsa,
+    dot_rows_isa, dot_rows_scalar, gemm, gemm_with, gemv, perm32,
 };
 use xor_net::loader::gguf::{PRISM_Q1_0, PRISM_Q1_0_G128, PRISM_Q1_0_UPSTREAM};
 
@@ -231,6 +231,107 @@ fn tiled_gemm_parallel_split_matches_scalar() {
         gemm_with(GemmKernel::Tiled(t), &w, &acts, &mut got);
         assert_same(&got, &want, &format!("{t:?} split"));
     }
+}
+
+/// The small-batch kernel (speculative verification, batched decode) of
+/// every ISA for 1 ..= 2·MULTI_MAX_TOKENS + 1 tokens (one, two and three
+/// passes): several row groups and row chunks, a partial last group, and
+/// sub-block counts that leave a tail in the 8- and 16-word transposes.
+#[test]
+fn small_batch_kernel_matches_scalar() {
+    let mut rng = Rng(23);
+    let shapes: &[(u32, usize, usize)] = &[
+        (PRISM_Q1_0_UPSTREAM, 203, 1152),
+        (PRISM_Q1_0_G128, 37, 640),
+        (PRISM_Q1_0, 70, 544),
+    ];
+    let multis: Vec<GemmKernel> = GemmKernel::all_supported()
+        .into_iter()
+        .filter(|k| matches!(k, GemmKernel::Multi(_)))
+        .collect();
+    eprintln!("testing Q1 small-batch kernels: {multis:?}");
+    for &(dtype, rows, cols) in shapes {
+        let w = random_weight(&mut rng, dtype, rows, cols);
+        for ab in [32, 128]
+            .into_iter()
+            .filter(|ab| w.block().is_multiple_of(*ab))
+        {
+            for n in 1..=2 * MULTI_MAX_TOKENS + 1 {
+                let (_, acts) = random_acts(&mut rng, n, cols, ab);
+                let mut want = vec![0.0; n * rows];
+                for t in 0..n {
+                    dot_rows_scalar(&w, 0, acts.row(t), &mut want[t * rows..(t + 1) * rows]);
+                }
+                for &k in &multis {
+                    let mut got = vec![f32::NAN; n * rows];
+                    gemm_with(k, &w, &acts, &mut got);
+                    assert_same(
+                        &got,
+                        &want,
+                        &format!("{k:?} dtype {dtype} {rows}x{cols} n={n}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// What KV reuse, the prompt cache and speculative decoding rely on: a
+/// prompt pushed through `gemm` in one call gives exactly the numbers of
+/// feeding it token by token (`gemv`), for every token count across the
+/// GEMV / small-batch / tiled dispatch, with several token tiles, column
+/// chunks of the tiled kernel and a partial last slab.
+#[test]
+fn gemm_equals_token_by_token_gemv() {
+    let mut rng = Rng(31);
+    let (rows, cols) = (149, 2560);
+    let w = random_weight(&mut rng, PRISM_Q1_0_UPSTREAM, rows, cols);
+    for n in (1..=GEMM_TILED_MIN_TOKENS + 4).chain([40, 67]) {
+        let (x, acts) = random_acts(&mut rng, n, cols, 32);
+        let mut got = vec![f32::NAN; n * rows];
+        gemm(&w, &acts, &mut got);
+        for t in 0..n {
+            // Quantization is per block, so one row alone quantizes the same.
+            let mut one = Q8Acts::new();
+            one.quantize(&x[t * cols..(t + 1) * cols], 1, cols, 32);
+            let mut g = vec![0.0; rows];
+            gemv(&w, &one, &mut g);
+            assert_same(
+                &got[t * rows..(t + 1) * rows],
+                &g,
+                &format!("n={n} token {t}"),
+            );
+        }
+    }
+}
+
+/// Callers (batched decode, speculative verification) may issue GEMMs from
+/// their own rayon tasks; work stealing then nests one `gemm` inside
+/// another on the same thread. Results must stay exact (and nothing may
+/// panic on the per-thread scratch buffers).
+#[test]
+fn gemm_from_rayon_tasks_matches_scalar() {
+    use rayon::prelude::*;
+    let mut rng = Rng(77);
+    let (rows, cols) = (300, 1024);
+    let w = random_weight(&mut rng, PRISM_Q1_0_UPSTREAM, rows, cols);
+    let cases: Vec<(usize, Q8Acts, Vec<f32>)> = [2usize, 5, 16, 40]
+        .iter()
+        .map(|&n| {
+            let (_, acts) = random_acts(&mut rng, n, cols, 32);
+            let mut want = vec![0.0; n * rows];
+            for t in 0..n {
+                dot_rows_scalar(&w, 0, acts.row(t), &mut want[t * rows..(t + 1) * rows]);
+            }
+            (n, acts, want)
+        })
+        .collect();
+    (0..64).into_par_iter().for_each(|i| {
+        let (n, acts, want) = &cases[i % cases.len()];
+        let mut got = vec![f32::NAN; n * rows];
+        gemm(&w, acts, &mut got);
+        assert_same(&got, want, &format!("nested gemm n={n}"));
+    });
 }
 
 #[test]

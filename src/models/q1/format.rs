@@ -223,34 +223,56 @@ impl XqWriter {
 
 /// A mapped `.xq1` file; hands out zero-copy tensors.
 pub struct XqReader {
-    map: Arc<Mmap>,
+    map: Arc<dyn AsRef<[u8]> + Send + Sync>,
     header: Header,
 }
 
 impl XqReader {
+    /// Map `path`. With `XORNET_HUGEPAGES=1` (Linux) the whole file is
+    /// instead read into an anonymous buffer backed by transparent huge
+    /// pages ([`crate::util::HugeBuf`]): file-backed THP is not available
+    /// for regular files on common kernels / filesystems, and 2 MiB pages
+    /// cut the TLB misses of streaming the weights. It costs a full read of
+    /// the file at load and the weights become private (unshared,
+    /// unevictable short of swap) memory.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        if crate::util::hugepages_requested() {
+            return Self::open_huge(path);
+        }
         let file = std::fs::File::open(path)?;
         // SAFETY: the file is opened read-only and mapped privately; as for
         // any mmap, modifying it underneath a running process is not
         // supported (the same contract as GgufFile).
         let map = unsafe { Mmap::map(&file)? };
+        Self::from_bytes(Arc::new(map))
+    }
+
+    /// [`Self::open`] into a THP-backed copy of the file.
+    fn open_huge(path: &Path) -> anyhow::Result<Self> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let len = usize::try_from(file.metadata()?.len())?;
+        let mut buf = crate::util::HugeBuf::new(len)?;
+        file.read_exact(buf.as_mut_slice())?;
+        Self::from_bytes(Arc::new(buf))
+    }
+
+    fn from_bytes(map: Arc<dyn AsRef<[u8]> + Send + Sync>) -> anyhow::Result<Self> {
+        let bytes = (*map).as_ref();
         anyhow::ensure!(
-            map.len() >= DATA_START && &map[..4] == MAGIC,
+            bytes.len() >= DATA_START && &bytes[..4] == MAGIC,
             "not an .xq1 file"
         );
-        let version = u32::from_le_bytes(map[4..8].try_into()?);
+        let version = u32::from_le_bytes(bytes[4..8].try_into()?);
         anyhow::ensure!(version == VERSION, "unsupported .xq1 version {version}");
-        let hoff = u64::from_le_bytes(map[8..16].try_into()?) as usize;
-        let hlen = u64::from_le_bytes(map[16..24].try_into()?) as usize;
+        let hoff = u64::from_le_bytes(bytes[8..16].try_into()?) as usize;
+        let hlen = u64::from_le_bytes(bytes[16..24].try_into()?) as usize;
         let hend = hoff
             .checked_add(hlen)
-            .filter(|&e| e <= map.len() && hoff >= DATA_START)
+            .filter(|&e| e <= bytes.len() && hoff >= DATA_START)
             .ok_or_else(|| anyhow::anyhow!(".xq1 header out of bounds (truncated file?)"))?;
-        let header: Header = serde_json::from_slice(&map[hoff..hend])?;
-        Ok(Self {
-            map: Arc::new(map),
-            header,
-        })
+        let header: Header = serde_json::from_slice(&bytes[hoff..hend])?;
+        Ok(Self { map, header })
     }
 
     pub fn arch(&self) -> &str {
@@ -309,8 +331,7 @@ impl XqReader {
     }
 
     fn buf(&self, (off, len): (usize, usize)) -> anyhow::Result<ByteBuf> {
-        let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = self.map.clone();
-        ByteBuf::from_shared(owner, off, len)
+        ByteBuf::from_shared(self.map.clone(), off, len)
     }
 
     fn f32s(&self, r: (usize, usize)) -> anyhow::Result<Vec<f32>> {

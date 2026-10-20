@@ -774,3 +774,358 @@ fn bonsai_e2e() {
     let r = post(addr, "/v1/completions", r#"{"prompt":[999999999]}"#);
     assert_eq!(r.status, 400);
 }
+
+// ---------------------------------------------------------------------------
+// Batch scheduler (continuous batching) over a scripted model
+// ---------------------------------------------------------------------------
+
+mod batch {
+    use super::*;
+    use crate::config::Scheduler;
+    use crate::engine::{Engine, GeneratorEngine};
+    use std::sync::atomic::AtomicUsize;
+    use xor_net::models::batched::{BatchItem, BatchedCausalLM};
+    use xor_net::models::traits::{CausalLM, Logits, ModelState, downcast_state};
+
+    /// Vocabulary: 0 `<eos>`, 1 `<unk>`, then these characters.
+    const CHARS: &str = "abcdefghijklmnopqrstuvwxyz. ";
+
+    fn id(c: char) -> u32 {
+        2 + CHARS.find(c).unwrap() as u32
+    }
+
+    /// Word-level tokenizer over [`CHARS`] whose decoder concatenates.
+    fn tokenizer() -> tokenizers::Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        vocab.insert("<eos>".into(), 0.into());
+        vocab.insert("<unk>".into(), 1.into());
+        for c in CHARS.chars() {
+            vocab.insert(c.to_string(), id(c).into());
+        }
+        let j = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [{
+                "id": 0, "content": "<eos>", "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true
+            }],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"},
+            "post_processor": null,
+            "decoder": {"type": "Fuse"}
+        });
+        j.to_string().parse().unwrap()
+    }
+
+    /// Next token = the letter after the last fed one (`z` -> `.`,
+    /// `.` -> EOS, space -> `a`). Each forward call (one batched step)
+    /// sleeps `delay`; counts calls, items and the largest batch.
+    struct ScriptModel {
+        delay: Duration,
+        steps: AtomicUsize,
+        tokens: AtomicUsize,
+        max_items: AtomicUsize,
+    }
+
+    struct St {
+        len: usize,
+        last: u32,
+    }
+
+    impl ModelState for St {
+        fn reset(&mut self) -> anyhow::Result<()> {
+            self.len = 0;
+            Ok(())
+        }
+        fn truncate(&mut self, len: usize) -> bool {
+            // Logits depend on the last fed token only, and every forward
+            // feeds at least one.
+            len <= self.len && {
+                self.len = len;
+                true
+            }
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    impl ScriptModel {
+        fn new(delay_ms: u64) -> Self {
+            Self {
+                delay: Duration::from_millis(delay_ms),
+                steps: AtomicUsize::new(0),
+                tokens: AtomicUsize::new(0),
+                max_items: AtomicUsize::new(0),
+            }
+        }
+
+        fn feed(&self, tokens: &[u32], pos: usize, state: &mut dyn ModelState) -> Logits {
+            let st = downcast_state::<St>(state).unwrap();
+            assert_eq!(pos, st.len, "fed out of order");
+            st.len += tokens.len();
+            st.last = *tokens.last().unwrap();
+            self.tokens.fetch_add(tokens.len(), Ordering::SeqCst);
+            let next = match st.last {
+                t if t == id('z') => id('.'),
+                t if t == id('.') => 0,
+                t if t == id(' ') => id('a'),
+                t if (id('a')..id('z')).contains(&t) => t + 1,
+                _ => 0,
+            };
+            let mut l = vec![0.0; self.vocab_size()];
+            l[next as usize] = 10.0;
+            l
+        }
+    }
+
+    impl CausalLM for ScriptModel {
+        fn new_state(&self) -> anyhow::Result<Box<dyn ModelState>> {
+            Ok(Box::new(St { len: 0, last: 0 }))
+        }
+        fn forward(
+            &self,
+            tokens: &[u32],
+            pos: usize,
+            state: &mut dyn ModelState,
+        ) -> anyhow::Result<Logits> {
+            std::thread::sleep(self.delay);
+            self.steps.fetch_add(1, Ordering::SeqCst);
+            self.max_items.fetch_max(1, Ordering::SeqCst);
+            Ok(self.feed(tokens, pos, state))
+        }
+        fn vocab_size(&self) -> usize {
+            2 + CHARS.len()
+        }
+        fn max_seq_len(&self) -> usize {
+            256
+        }
+        fn eos_token_ids(&self) -> &[u32] {
+            &[0]
+        }
+        fn bos_token_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    impl BatchedCausalLM for ScriptModel {
+        fn forward_batch(&self, items: &mut [BatchItem<'_>]) -> anyhow::Result<Vec<Logits>> {
+            std::thread::sleep(self.delay);
+            self.steps.fetch_add(1, Ordering::SeqCst);
+            self.max_items.fetch_max(items.len(), Ordering::SeqCst);
+            Ok(items
+                .iter_mut()
+                .map(|it| self.feed(it.tokens, it.pos, &mut *it.state))
+                .collect())
+        }
+    }
+
+    fn start_batch(
+        model: Arc<ScriptModel>,
+        max_batch: usize,
+        prefill_chunk: usize,
+    ) -> (SocketAddr, Arc<App>) {
+        let base: Arc<dyn CausalLM> = model.clone();
+        let g = xor_net::Generator::new(base, tokenizer());
+        let engine = GeneratorEngine::new_batched(
+            g,
+            Some(model),
+            crate::batcher::BatchOptions {
+                max_batch,
+                prefill_chunk,
+                prefill_budget: prefill_chunk,
+            },
+            "script".into(),
+        )
+        .unwrap();
+        let mut cfg = test_cfg();
+        cfg.scheduler = Some(Scheduler::Batch);
+        cfg.slots = max_batch;
+        let engine: Arc<dyn Engine> = Arc::new(engine);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Arc::new(App::new(engine, cfg));
+        serve::spawn_workers(&app).unwrap();
+        let app2 = Arc::clone(&app);
+        std::thread::spawn(move || serve::serve(listener, app2));
+        (addr, app)
+    }
+
+    fn ids(s: &str) -> String {
+        let v: Vec<u32> = s.chars().map(id).collect();
+        serde_json::to_string(&v).unwrap()
+    }
+
+    fn complete(addr: SocketAddr, prompt: &str, extra: &str) -> Value {
+        let r = post(
+            addr,
+            "/v1/completions",
+            &format!(r#"{{"prompt":{}{extra}}}"#, ids(prompt)),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.json()
+    }
+
+    #[test]
+    fn concurrent_requests_are_batched_and_exact() {
+        let model = Arc::new(ScriptModel::new(5));
+        let (addr, _) = start_batch(Arc::clone(&model), 4, 512);
+        let prompts = ["the quick brown fox ", "hello u", "a long prompt k", "w"];
+        let want = [
+            "abcdefghijklmnopqrstuvwxyz.",
+            "vwxyz.",
+            "lmnopqrstuvwxyz.",
+            "xyz.",
+        ];
+        let handles: Vec<_> = prompts
+            .iter()
+            .map(|p| {
+                let p = p.to_string();
+                std::thread::spawn(move || complete(addr, &p, r#","max_tokens":100"#))
+            })
+            .collect();
+        for (h, (p, w)) in handles.into_iter().zip(prompts.iter().zip(want)) {
+            let v = h.join().unwrap();
+            assert_eq!(v["choices"][0]["text"], w, "prompt {p:?}");
+            assert_eq!(v["choices"][0]["finish_reason"], "stop");
+            assert_eq!(v["usage"]["prompt_tokens"], p.len());
+            assert_eq!(v["usage"]["completion_tokens"], w.len() + 1); // + EOS
+        }
+        assert!(
+            model.max_items.load(Ordering::SeqCst) >= 2,
+            "requests were never batched together"
+        );
+        // Fewer steps than tokens: sequences shared forwards.
+        let tokens = model.tokens.load(Ordering::SeqCst);
+        let steps = model.steps.load(Ordering::SeqCst);
+        assert!(steps < tokens, "steps {steps}, tokens {tokens}");
+        wait_idle(addr);
+    }
+
+    #[test]
+    fn stop_strings_max_tokens_and_streaming() {
+        let model = Arc::new(ScriptModel::new(0));
+        let (addr, _) = start_batch(model, 3, 4);
+        // Prefill split in chunks of 4 (prompt of 11 tokens).
+        let v = complete(addr, "abcdefghij ", r#","max_tokens":100,"stop":["fg"]"#);
+        assert_eq!(v["choices"][0]["text"], "abcde");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        let v = complete(addr, "p", r#","max_tokens":3"#);
+        assert_eq!(v["choices"][0]["text"], "qrs");
+        assert_eq!(v["choices"][0]["finish_reason"], "length");
+        assert_eq!(v["usage"]["completion_tokens"], 3);
+        // Same prompt again on an idle slot: its state is reused.
+        let v = complete(addr, "p", r#","max_tokens":3"#);
+        assert_eq!(v["choices"][0]["text"], "qrs");
+        let r = post(
+            addr,
+            "/v1/completions",
+            &format!(r#"{{"prompt":{},"stream":true}}"#, ids("x")),
+        );
+        let ev = sse_events(&r.body);
+        assert_eq!(ev.last().unwrap(), "[DONE]");
+        let text: String = ev[..ev.len() - 1]
+            .iter()
+            .map(|e| {
+                let v: Value = serde_json::from_str(e).unwrap();
+                v["choices"][0]["text"].as_str().unwrap_or("").to_string()
+            })
+            .collect();
+        assert_eq!(text, "yz.");
+        wait_idle(addr);
+    }
+
+    #[test]
+    fn disconnect_cancels_only_that_request() {
+        let model = Arc::new(ScriptModel::new(20));
+        let (addr, _) = start_batch(Arc::clone(&model), 2, 512);
+        // A long-running request (space -> a..z, 27 tokens at 20 ms) that
+        // the client abandons, next to one that completes.
+        let mut s = connect(addr);
+        let body = format!(r#"{{"prompt":{},"stream":true}}"#, ids(" "));
+        write!(
+            s,
+            "POST /v1/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut buf = [0u8; 64];
+        let _ = s.read(&mut buf).unwrap();
+        let other = std::thread::spawn(move || complete(addr, "t", r#","max_tokens":100"#));
+        drop(s);
+        let v = other.join().unwrap();
+        assert_eq!(v["choices"][0]["text"], "uvwxyz.");
+        wait_idle(addr);
+        let tokens = model.tokens.load(Ordering::SeqCst);
+        // Abandoned: far fewer than its 1 + 27 tokens were fed (the other
+        // request feeds 1 + 7).
+        assert!(
+            tokens < 1 + 27 + 8,
+            "kept generating after disconnect: {tokens}"
+        );
+    }
+}
+
+/// Real-model continuous batching: 4 concurrent greedy requests through the
+/// batch scheduler give exactly the text of each request run alone.
+/// `BONSAI_XQ1=models/bonsai/Bonsai-1.7B.xq1 cargo test --release --bin xor-net-server -- --ignored bonsai_batch`
+#[test]
+#[ignore]
+fn bonsai_batch_e2e() {
+    use crate::batcher::BatchOptions;
+    use crate::config::Scheduler;
+    use crate::engine::GeneratorEngine;
+    use xor_net::generation::GenerationParams;
+
+    let Ok(path) = std::env::var("BONSAI_XQ1") else {
+        eprintln!("BONSAI_XQ1 not set; skipping");
+        return;
+    };
+    let (batched, g) = xor_net::models::q1::batch::load_batched(&path, None).unwrap();
+    let prompts = [
+        "The capital of France is",
+        "Write a haiku about the sea:\n",
+        "def fibonacci(n):\n",
+        "Explain why the sky is blue.",
+    ];
+    let params = GenerationParams::default()
+        .with_max_tokens(64)
+        .with_sampling(xor_net::SamplingParams::greedy());
+    let want: Vec<String> = prompts
+        .iter()
+        .map(|p| g.fork().generate(p, &params).unwrap().text)
+        .collect();
+    let engine = GeneratorEngine::new_batched(
+        g,
+        Some(batched),
+        BatchOptions {
+            max_batch: 4,
+            prefill_chunk: 512,
+            prefill_budget: 256,
+        },
+        "bonsai".into(),
+    )
+    .unwrap();
+    let mut cfg = test_cfg();
+    cfg.scheduler = Some(Scheduler::Batch);
+    cfg.slots = 4;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Arc::new(App::new(Arc::new(engine), cfg));
+    serve::spawn_workers(&app).unwrap();
+    let app2 = Arc::clone(&app);
+    std::thread::spawn(move || serve::serve(listener, app2));
+    let handles: Vec<_> = prompts
+        .iter()
+        .map(|p| {
+            let body = serde_json::json!({"prompt": p, "max_tokens": 64, "temperature": 0});
+            std::thread::spawn(move || post(addr, "/v1/completions", &body.to_string()).json())
+        })
+        .collect();
+    for (h, w) in handles.into_iter().zip(&want) {
+        let v = h.join().unwrap();
+        assert_eq!(v["choices"][0]["text"].as_str().unwrap(), w);
+    }
+}

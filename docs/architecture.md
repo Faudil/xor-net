@@ -30,11 +30,12 @@ number of layers. Everything above the kernels is model-family agnostic.
 | Path | What it is |
 |------|------------|
 | `src/generation.rs` | `Generator`: owns `Arc<dyn CausalLM>`, tokenizer, chat template (minijinja, HF-compatible), EOS ids and one reusable state. Chunked prefill, prefix caching across turns (the state is rolled back to the longest common prefix with the new prompt; recurrent states restore a single checkpoint taken at the end of the conversation history), UTF-8-safe streaming detokenisation, stop strings, `<think>` reasoning separation (`StreamEvent::{Text, Reasoning}`), chat-template kwargs such as `enable_thinking`. |
+| `src/speculative/` | Lossless speculative decoding (see [Speculative decoding](#speculative-decoding)): `Drafter` / `DraftModel` traits, `SpecConfig`, the cost-aware `AdaptiveK`, rejection sampling; `lookup.rs`: prompt-lookup (n-gram) drafter. The decode loop itself is `SpecDecode` in `generation.rs`. |
 | `src/prompt_cache.rs` | `PromptCache`: thread-safe LRU of model-state snapshots keyed by token prefix, shared by generators / server slots (see [Prompt cache](#prompt-cache)). |
 | `src/sampler.rs` | Penalties, temperature, top-k / top-p / min-p (HF / vLLM order), seeded xoshiro RNG, partial selection (no full-vocab sort). |
 | `src/models/traits.rs` | `CausalLM` + opaque `ModelState` (KV cache and/or recurrent state, with `truncate` / `checkpoint` for prefix reuse and `snapshot` / `restore` for the prompt cache). The only interface the generator sees. |
 | `src/models/source.rs` | Resolves a user model reference (file, directory, `owner/repo[:file]` on the Hub) and loads a `Generator`. Used by the CLI and Python. |
-| `src/models/q1/` | Bonsai on the 1-bit fast path. `qwen3.rs`: dense Qwen3 (1.7B/4B/8B). `qwen35.rs`: hybrid Qwen3.5 (27B) with gated full attention every N-th layer and Gated DeltaNet linear attention otherwise. `mod.rs`: shared `Linear`, `Embedding` (dequantizes looked-up rows only), RoPE incl. YaRN, growable `KvCache`, attention. `format.rs`: `.xq1`. |
+| `src/models/q1/` | Bonsai on the 1-bit fast path. `qwen3.rs`: dense Qwen3 (1.7B/4B/8B). `qwen35.rs`: hybrid Qwen3.5 (27B) with gated full attention every N-th layer and Gated DeltaNet linear attention otherwise. `mod.rs`: shared `Linear`, `Embedding` (dequantizes looked-up rows only), RoPE incl. YaRN, growable `KvCache`, attention. `format.rs`: `.xq1`. `dspark.rs`: PrismML's DSpark drafter for Bonsai 27B, with its Q4_1 kernels in `dspark/q4_1.rs`. |
 | `src/bit1/q1_0.rs` | `Q1Weight` (split sign bits + f16 scales, owned or borrowed from an mmap) and the Q1_0 x int8 kernels: AVX-512 VNNI, AVX-512 BW, AVX2, scalar. Four weight rows share every activation load. |
 | `src/models/llama/` | Llama-architecture runtime used for BitNet b1.58 and Llama3-8B-1.58 safetensors. |
 | `src/bit1_58/` | Ternary packing (`pack4`: 2 bits/weight, `pack5`: base-3), AVX-512 VNNI `vpdpbusd` and AVX2 kernels, XorSparse. |
@@ -129,6 +130,56 @@ assert!(out.usage.cached_prompt_tokens > 0); // B restored the system prompt
   idle slot whose state holds the longest prefix of its prompt, and a slot
   that frees up picks the best match among the first 4 queued jobs (FIFO
   beyond; a head job passed over 4 times runs next).
+
+## Speculative decoding
+
+`GenerationParams::with_speculative(SpecConfig::new(drafter, k))` (CLI:
+`--draft lookup|<dspark.gguf> [--draft-k N]`, server: `--draft`) decodes
+several tokens per target forward without changing the output:
+
+- **Round.** The drafter proposes up to `k` tokens after the last sampled
+  token `t`; the target runs `[t, d1..dk]` in one forward
+  (`CausalLM::forward_with` with `all_logits` + `provisional`) whose logits
+  are bit-identical to decoding them one by one. Greedy accepts `d_i` iff it
+  is the target's argmax (after penalties), so the output is
+  token-identical to plain greedy decoding. Sampling uses standard
+  speculative rejection sampling (accept `d ~ q` with `min(1, p(d)/q(d))`,
+  else draw from `norm(max(p - q, 0))`), with `p` and `q` both passed
+  through the request's penalties / temperature / top-k / top-p / min-p
+  (`Sampler::distribution`), so tokens follow exactly the plain sampling
+  distribution (checked by a chi-square test in `tests/speculative_tests.rs`).
+  After a fully accepted draft a bonus token comes from the last position.
+- **Rollback.** `ModelState::commit(len)` keeps the accepted prefix. KV
+  caches just truncate. Qwen3.5's Gated DeltaNet layers do not update their
+  recurrent state during the provisional forward: each layer runs the delta
+  rule on a scratch copy and saves its per-token inputs (raw conv rows,
+  conv outputs, beta, decay: ~80 KB per token and layer). `commit` replays
+  the accepted tokens' updates with the very same code (`gdn_heads`), so
+  the state is bit-identical to having fed only those tokens, at the cost
+  of one extra pass over the 144 MiB recurrent state per round (6 ms on
+  27B), instead of storing `k + 1` state copies (720 MiB).
+- **Stops.** Accepted drafts go through the same per-token accounting as
+  plain decoding (EOS / stop ids, detokenizer, stop strings, streaming,
+  abort, `max_tokens`); only tokens that continue are committed, so the
+  state always matches `processed_tokens()`.
+- **Drafters.** `PromptLookup` matches the last 3..5 tokens against the
+  context (any model). `DsparkModel` (Bonsai 27B) is PrismML's six-layer
+  block drafter: it reads the target's layer outputs at layers
+  1/16/31/46/61 (`HiddenTaps`, copied out of the target forward only when
+  a drafter asks), projects them into per-layer context K/V, and drafts a
+  block of 4 tokens in one non-causal forward plus a sequential low-rank
+  Markov correction; semantics follow PrismML's llama.cpp fork (see the
+  module docs). By default it uses the target's 1-bit output head (same
+  acceptance as the GGUF's Q4_1 head, 3.3x fewer bytes per round).
+- **Adaptive k.** `SpecConfig::with_adaptive(true)` picks each round's
+  draft length (0 = no draft) maximising expected tokens per second from
+  the measured acceptance per depth and the measured draft and verify
+  times.
+- **Cost.** Verification is only worthwhile when a `k + 1`-token forward
+  costs little more than a 1-token one (`CausalLM::batched_verify`; true
+  for the Bonsai models, whose small-batch Q1_0 kernel reads the weights
+  once; the generic fallback used by BitNet/Llama feeds tokens one by one
+  and gains nothing).
 
 ## Adding a model family
 

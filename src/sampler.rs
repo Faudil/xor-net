@@ -674,6 +674,120 @@ impl Sampler {
             .ok_or_else(|| anyhow::anyhow!("sampler: no candidate survived truncation"))
     }
 
+    /// The exact distribution [`sample_split`](Self::sample_split) draws
+    /// from, as dense probabilities over the vocabulary in `probs` (zero
+    /// outside the kept set): penalties, temperature, top-k, top-p, min-p,
+    /// renormalised. Greedy parameters give a one-hot vector at the argmax.
+    /// `logits` is consumed as scratch. Consumes no randomness. Used by
+    /// speculative sampling, which needs target and draft probabilities.
+    pub fn distribution(
+        &mut self,
+        logits: &mut [f32],
+        prompt: &[u32],
+        output: &[u32],
+        probs: &mut Vec<f32>,
+    ) -> anyhow::Result<()> {
+        if logits.is_empty() {
+            anyhow::bail!("sampler: empty logits");
+        }
+        let vocab = logits.len();
+        probs.clear();
+        probs.resize(vocab, 0.0);
+        if self.params.has_penalties() {
+            self.apply_penalties(logits, prompt, output);
+        }
+        if self.params.is_greedy() {
+            let i = argmax(logits)
+                .ok_or_else(|| anyhow::anyhow!("sampler: all logits are NaN or -inf"))?;
+            probs[i] = 1.0;
+            return Ok(());
+        }
+        let p = &self.params;
+        let inv_temp = 1.0 / p.temperature;
+        let top_k = if p.top_k >= vocab { 0 } else { p.top_k };
+        let top_p = if p.top_p.is_nan() { 1.0 } else { p.top_p };
+        let min_p = if p.min_p.is_nan() {
+            0.0
+        } else {
+            p.min_p.min(1.0)
+        };
+        let max = scale_sanitize_max(logits, inv_temp);
+        if max == f32::NEG_INFINITY {
+            anyhow::bail!("sampler: all logits are NaN or -inf");
+        }
+        if top_k > 0 {
+            // Same candidate list and cut-offs as `sample_stochastic`.
+            self.select_top_k(logits, top_k);
+            self.topk.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            let mut z = 0.0f32;
+            for e in self.topk.iter_mut() {
+                e.0 = fast_exp_neg(e.0 - max);
+                z += e.0;
+            }
+            let mut n = self.topk.len();
+            if top_p < 1.0 {
+                let target = (top_p.max(0.0) * z).max(f32::MIN_POSITIVE);
+                let mut acc = 0.0f32;
+                for (i, e) in self.topk.iter().enumerate() {
+                    acc += e.0;
+                    if acc >= target {
+                        n = i + 1;
+                        break;
+                    }
+                }
+            }
+            if min_p > 0.0 {
+                while n > 1 && self.topk[n - 1].0 < min_p {
+                    n -= 1;
+                }
+            }
+            let kept = &self.topk[..n];
+            let mass: f32 = kept.iter().map(|e| e.0).sum();
+            for e in kept {
+                probs[e.1 as usize] = e.0 / mass;
+            }
+            return Ok(());
+        }
+        let z = exp_inplace(logits, max);
+        let mut thr = 0.0f32;
+        if top_p < 1.0 {
+            let target = (top_p.max(0.0) * z).max(f32::MIN_POSITIVE);
+            let eps = (1.0 - top_p) * z / vocab as f32;
+            thr = top_p_threshold(logits, target, eps, &mut self.band);
+        }
+        if min_p > 0.0 {
+            thr = thr.max(min_p);
+        }
+        let mass = if thr > 0.0 {
+            masked_sum(logits, thr)
+        } else {
+            z
+        };
+        if mass.is_nan() || mass <= 0.0 {
+            anyhow::bail!("sampler: no candidate survived truncation");
+        }
+        let inv = 1.0 / mass;
+        for (p, &w) in probs.iter_mut().zip(logits.iter()) {
+            *p = if w >= thr { w * inv } else { 0.0 };
+        }
+        Ok(())
+    }
+
+    /// One draw from non-negative `weights` (need not be normalised).
+    pub fn sample_weights(&mut self, weights: &[f32]) -> anyhow::Result<u32> {
+        let mass = masked_sum(weights, 0.0);
+        anyhow::ensure!(mass > 0.0, "sampler: all weights are zero");
+        let r = self.rng.next_f32() * mass;
+        scan_dense(weights, 0.0, r)
+            .map(|i| i as u32)
+            .ok_or_else(|| anyhow::anyhow!("sampler: all weights are zero"))
+    }
+
+    /// A uniform draw in `[0, 1)` from the sampler's PRNG.
+    pub fn uniform(&mut self) -> f32 {
+        self.rng.next_f32()
+    }
+
     /// Fill `self.topk` with the `k` largest `(logit, token)` pairs.
     fn select_top_k(&mut self, logits: &[f32], k: usize) {
         self.topk.clear();

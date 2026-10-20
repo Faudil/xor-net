@@ -132,6 +132,11 @@ pyo3 ={ version = "0.23", features = ["extension-module", "abi3-py310", "generat
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 ctrlc = { version = "3.4", optional = true }
 
+# Thread pinning (`XORNET_PIN`, sched_setaffinity); already in the tree via
+# other crates.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
@@ -181,3 +186,19 @@ path = "examples/prompt_cache_check.rs"
 [[example]]
 name = "dump_logits_q1"
 path = "examples/dump_logits_q1.rs"
+
+[[example]]
+name = "q1_small_batch"
+path = "examples/q1_small_batch.rs"
+
+[[example]]
+name = "batch_decode"
+path = "examples/batch_decode.rs"
+
+[[example]]
+name = "spec_bench"
+path = "examples/spec_bench.rs"
+
+[[example]]
+name = "spec_micro"
+path = "examples/spec_micro.rs"

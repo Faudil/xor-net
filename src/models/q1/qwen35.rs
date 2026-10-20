@@ -22,13 +22,15 @@ use rayon::prelude::*;
 
 use crate::bit1::q1_0::Q8Acts;
 use crate::loader::gguf::GgufFile;
-use crate::models::traits::{CausalLM, Logits, ModelState, StateSnapshot, downcast_state};
+use crate::models::traits::{
+    CausalLM, ForwardOpts, Logits, ModelState, StateSnapshot, downcast_state,
+};
 use crate::nn::fast_attention_simd::{dot_product_f32, rms_norm};
 use crate::util::with_best_simd;
 
 use super::{
-    Embedding, KvCache, Linear, Rope, Yarn, attention, gguf_vec, meta_f32, meta_u32, rms_norm_rows,
-    special_tokens_from_gguf, swiglu_rows, yarn_from_gguf,
+    Embedding, KvCache, Linear, Rope, Yarn, attention, copy_taps, gguf_vec, meta_f32, meta_u32,
+    rms_norm_rows, special_tokens_from_gguf, swiglu_rows, yarn_from_gguf,
 };
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -185,7 +187,37 @@ pub struct Qwen35State {
     len: usize,
     /// Saved recurrent state (see [`ModelState::checkpoint`]).
     ckpt: RecurrentCheckpoint,
+    /// Inputs of the last provisional (speculative verification) forward
+    /// whose recurrent update is not applied yet (see [`ModelState::commit`]).
+    pending: Option<Pending>,
     s: Scratch,
+}
+
+/// A provisional forward of `n` tokens from length `base`: the attention
+/// KV rows are written, but `conv` / `ssm` still hold the state at `base`.
+/// [`ModelState::commit`] replays the first `m` tokens' recurrent updates
+/// from the saved per-token inputs, with the very code the forward used,
+/// so the result is bit-identical to having fed only those tokens. This
+/// costs one extra pass over the recurrent state per verification instead
+/// of copying it per drafted position.
+struct Pending {
+    base: usize,
+    n: usize,
+    dims: GdnDims,
+    /// Per layer (empty for attention layers).
+    gdn: Vec<PendingGdn>,
+}
+
+/// Per-token inputs of one Gated DeltaNet layer's recurrent update.
+#[derive(Default)]
+struct PendingGdn {
+    /// Raw conv inputs `[n][conv_dim]` (the history is their last K-1 rows).
+    conv_in: Vec<f32>,
+    /// Conv + SiLU + q/k-normalized rows `[n][conv_dim]`.
+    conv_out: Vec<f32>,
+    /// `[n][v_heads]` each.
+    beta: Vec<f32>,
+    decay: Vec<f32>,
 }
 
 /// Copy of every recurrent layer's conv history and DeltaNet state at
@@ -207,9 +239,43 @@ fn copy_layers(dst: &mut Vec<Vec<f32>>, src: &[Vec<f32>]) {
 }
 
 impl Qwen35State {
+    /// Positions fed so far.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Per-layer conv histories and DeltaNet states (empty vectors for
+    /// attention layers), e.g. to check rollback exactness.
+    pub fn recurrent_state(&self) -> (&[Vec<f32>], &[Vec<f32>]) {
+        (&self.conv, &self.ssm)
+    }
+
     /// Bytes held by one checkpoint (recurrent conv + DeltaNet state).
     pub fn checkpoint_bytes(&self) -> usize {
         self.conv.iter().chain(&self.ssm).map(|v| v.len() * 4).sum()
+    }
+
+    /// Hook for the batched forward (`super::batch`): per-layer KV caches,
+    /// conv histories and DeltaNet states, plus the length counter. Fails
+    /// while a provisional forward is pending.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn batch_parts(
+        &mut self,
+    ) -> anyhow::Result<(
+        &mut [Option<KvCache>],
+        &mut [Vec<f32>],
+        &mut [Vec<f32>],
+        &mut usize,
+    )> {
+        anyhow::ensure!(
+            self.pending.is_none(),
+            "forward: a provisional forward is pending (commit it first)"
+        );
+        Ok((&mut self.kv, &mut self.conv, &mut self.ssm, &mut self.len))
     }
 }
 
@@ -224,10 +290,23 @@ struct Scratch {
     cos: Vec<f32>,
     sin: Vec<f32>,
     acts: Q8Acts,
+    /// Working copy of one layer's DeltaNet state in provisional forwards.
+    ssm_tmp: Vec<f32>,
+}
+
+impl Qwen35State {
+    /// Drop a provisional forward without applying it: the state goes back
+    /// to its length before that forward.
+    fn discard_pending(&mut self) {
+        if let Some(p) = self.pending.take() {
+            self.len = p.base;
+        }
+    }
 }
 
 impl ModelState for Qwen35State {
     fn reset(&mut self) -> anyhow::Result<()> {
+        self.pending = None;
         // Recurrent state must restart from zero; KV positions are
         // overwritten before they are read.
         for v in self.conv.iter_mut().chain(self.ssm.iter_mut()) {
@@ -241,6 +320,10 @@ impl ModelState for Qwen35State {
     /// KV caches roll back to any length; the recurrent state only to the
     /// current length, 0 or the checkpoint.
     fn truncate(&mut self, len: usize) -> bool {
+        if self.pending.as_ref().is_some_and(|p| len > p.base) {
+            return self.commit(len).is_ok();
+        }
+        self.discard_pending();
         if len == self.len {
             true
         } else if len == 0 {
@@ -260,6 +343,12 @@ impl ModelState for Qwen35State {
     }
 
     fn checkpoint(&mut self) {
+        if self.pending.is_some() {
+            let len = self.len;
+            if self.commit(len).is_err() {
+                return;
+            }
+        }
         copy_layers(&mut self.ckpt.conv, &self.conv);
         copy_layers(&mut self.ckpt.ssm, &self.ssm);
         self.ckpt.len = Some(self.len);
@@ -276,6 +365,9 @@ impl ModelState for Qwen35State {
     /// KV prefixes plus the recurrent state at `len`, which must be the
     /// current length or the checkpoint.
     fn snapshot(&self, len: usize) -> Option<StateSnapshot> {
+        if self.pending.is_some() {
+            return None;
+        }
         let (conv, ssm) = if len == self.len {
             (&self.conv, &self.ssm)
         } else if self.ckpt.len == Some(len) {
@@ -337,7 +429,38 @@ impl ModelState for Qwen35State {
         }
         self.len = snap.len();
         self.ckpt.len = None;
+        self.pending = None;
         true
+    }
+
+    fn commit(&mut self, len: usize) -> anyhow::Result<()> {
+        let Some(p) = self.pending.take() else {
+            anyhow::ensure!(
+                len == self.len || self.truncate(len),
+                "commit({len}): no provisional forward and cannot roll back from {}",
+                self.len
+            );
+            return Ok(());
+        };
+        if len < p.base || len > p.base + p.n {
+            self.len = p.base;
+            anyhow::bail!(
+                "commit({len}) outside the provisional range {}..={}",
+                p.base,
+                p.base + p.n
+            );
+        }
+        let m = len - p.base;
+        let conv = &mut self.conv;
+        let ssm = &mut self.ssm;
+        let d = p.dims;
+        p.gdn
+            .par_iter()
+            .zip(conv.par_iter_mut().zip(ssm.par_iter_mut()))
+            .filter(|(g, _)| !g.conv_in.is_empty())
+            .for_each(|(g, (cs, st))| replay_gdn(&d, g, m, cs, st));
+        self.len = len;
+        Ok(())
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -359,12 +482,12 @@ fn resize(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
 }
 
 #[inline]
-fn sigmoid(x: f32) -> f32 {
+pub(super) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
 #[inline]
-fn softplus(x: f32) -> f32 {
+pub(super) fn softplus(x: f32) -> f32 {
     if x > 20.0 { x } else { x.exp().ln_1p() }
 }
 
@@ -385,11 +508,11 @@ fn delta_row(sj: &mut [f32], k: &[f32], q: &[f32], vj: f32, beta: f32, decay: f3
 /// From this many tokens on, the element-wise GDN / gate loops run in
 /// parallel over tokens (same per-element arithmetic as the sequential
 /// loops).
-const PAR_TOKENS: usize = 4;
+pub(super) const PAR_TOKENS: usize = 4;
 
 /// `o[ch] += w[ch] * x[ch]` (one depthwise-conv tap over all channels).
 #[inline]
-fn conv_tap(o: &mut [f32], w: &[f32], x: &[f32]) {
+pub(super) fn conv_tap(o: &mut [f32], w: &[f32], x: &[f32]) {
     #[inline(always)]
     fn tap(o: &mut [f32], w: &[f32], x: &[f32]) {
         for ((o, &w), &x) in o.iter_mut().zip(w).zip(x) {
@@ -400,10 +523,119 @@ fn conv_tap(o: &mut [f32], w: &[f32], x: &[f32]) {
 }
 
 /// `x / sqrt(Σx² + eps)` (llama.cpp `build_gdn_l2_norm`).
-fn l2_norm(x: &mut [f32], eps: f32) {
+pub(super) fn l2_norm(x: &mut [f32], eps: f32) {
     let ss: f32 = x.iter().map(|v| v * v).sum();
     let inv = 1.0 / (ss + eps).sqrt();
     x.iter_mut().for_each(|v| *v *= inv);
+}
+
+/// Gated DeltaNet geometry (copied into [`Pending`] for the replay).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GdnDims {
+    cd: usize,
+    kd: usize,
+    nv: usize,
+    nk: usize,
+    hk: usize,
+    hv: usize,
+}
+
+impl GdnDims {
+    pub(super) fn new(c: &Qwen35Config) -> Self {
+        Self {
+            cd: c.conv_dim(),
+            kd: c.key_dim(),
+            nv: c.v_heads,
+            nk: c.k_heads,
+            hk: c.head_k_dim,
+            hv: c.head_v_dim,
+        }
+    }
+}
+
+/// Conv history `[K-1][cd]` <- last K-1 rows of `[history; rows]`.
+pub(super) fn update_conv_history(conv_state: &mut [f32], rows: &[&[f32]], cd: usize) {
+    let hist = conv_state.len() / cd.max(1);
+    if hist == 0 || rows.is_empty() {
+        return;
+    }
+    let n = rows.len();
+    let mut new_hist = vec![0.0f32; hist * cd];
+    for r in 0..hist {
+        let src_row = n + r; // index in [history; new] (len hist + n)
+        let src: &[f32] = if src_row < hist {
+            &conv_state[src_row * cd..(src_row + 1) * cd]
+        } else {
+            rows[src_row - hist]
+        };
+        new_hist[r * cd..(r + 1) * cd].copy_from_slice(src);
+    }
+    conv_state.copy_from_slice(&new_hist);
+}
+
+/// The gated delta rule over tokens `0..n` for every value head, parallel
+/// over heads: `ssm` is `[v_heads][hv][hk]`, `conv_out` `[n][cd]`, `beta` /
+/// `decay` `[n][v_heads]`. Outputs go to `out` (`[head][t][hv]`) if given.
+/// The one implementation of the recurrence: decode, prefill, provisional
+/// verification and the commit replay all run it, so they agree bit for bit.
+pub(super) fn gdn_heads(
+    d: &GdnDims,
+    ssm: &mut [f32],
+    conv_out: &[f32],
+    beta: &[f32],
+    decay: &[f32],
+    n: usize,
+    out: Option<&mut [f32]>,
+) {
+    let (cd, kd, nv, nk, hk, hv) = (d.cd, d.kd, d.nv, d.nk, d.hk, d.hv);
+    let head = |vh: usize, st: &mut [f32], mut oh: Option<&mut [f32]>| {
+        let kh = vh % nk; // tiled V-head order (see module docs)
+        with_best_simd!({
+            for t in 0..n {
+                let row = &conv_out[t * cd..(t + 1) * cd];
+                let q = &row[kh * hk..(kh + 1) * hk];
+                let k = &row[kd + kh * hk..kd + (kh + 1) * hk];
+                let v = &row[2 * kd + vh * hv..2 * kd + (vh + 1) * hv];
+                let (b, dc) = (beta[t * nv + vh], decay[t * nv + vh]);
+                for (j, sj) in st.chunks_exact_mut(hk).enumerate() {
+                    let y = delta_row(sj, k, q, v[j], b, dc);
+                    if let Some(oh) = oh.as_deref_mut() {
+                        oh[t * hv + j] = y;
+                    }
+                }
+            }
+        });
+    };
+    match out {
+        Some(out) => ssm
+            .par_chunks_mut(hv * hk)
+            .zip(out.par_chunks_mut(n * hv))
+            .enumerate()
+            .for_each(|(vh, (st, oh))| head(vh, st, Some(oh))),
+        None => ssm
+            .par_chunks_mut(hv * hk)
+            .enumerate()
+            .for_each(|(vh, st)| head(vh, st, None)),
+    }
+}
+
+/// Apply the first `m` tokens of a provisional forward to one layer's conv
+/// history and DeltaNet state (see [`Pending`]).
+fn replay_gdn(d: &GdnDims, g: &PendingGdn, m: usize, conv_state: &mut [f32], ssm: &mut [f32]) {
+    if m == 0 {
+        return;
+    }
+    let rows: Vec<&[f32]> = g.conv_in.chunks_exact(d.cd).take(m).collect();
+    update_conv_history(conv_state, &rows, d.cd);
+    gdn_heads(
+        d,
+        ssm,
+        &g.conv_out[..m * d.cd],
+        &g.beta[..m * d.nv],
+        &g.decay[..m * d.nv],
+        m,
+        None,
+    );
 }
 
 impl GdnMixer {
@@ -418,6 +650,7 @@ impl GdnMixer {
         ssm: &mut [f32],
         s: &mut Scratch,
         out: &mut [f32],
+        pend: Option<&mut PendingGdn>,
     ) {
         let (cd, vd) = (c.conv_dim(), c.value_dim());
         let (kd, kk) = (c.key_dim(), c.conv_kernel);
@@ -483,47 +716,45 @@ impl GdnMixer {
                 norm_qk(o);
             }
         }
-        // New history = last K-1 rows of [history; new].
-        if hist > 0 {
-            let mut new_hist = vec![0.0f32; hist * cd];
-            for r in 0..hist {
-                let src_row = n + r; // index in [history; new] (len hist + n)
-                let src: &[f32] = if src_row < hist {
-                    &conv_state[src_row * cd..(src_row + 1) * cd]
-                } else {
-                    &qkvz[(src_row - hist) * w..(src_row - hist) * w + cd]
-                };
-                new_hist[r * cd..(r + 1) * cd].copy_from_slice(src);
+        // Per token and value head: beta = sigmoid(b), decay = exp(softplus(a + dt_bias) * A).
+        let mut beta = vec![0.0f32; n * nv];
+        let mut decay = vec![0.0f32; n * nv];
+        for t in 0..n {
+            for vh in 0..nv {
+                beta[t * nv + vh] = sigmoid(ba[t * 2 * nv + vh]);
+                let alpha = ba[t * 2 * nv + nv + vh];
+                decay[t * nv + vh] = (softplus(alpha + self.dt_bias[vh]) * self.ssm_a[vh]).exp();
             }
-            conv_state.copy_from_slice(&new_hist);
         }
-
-        // Delta rule, parallel over value heads, sequential over tokens.
+        let dims = GdnDims::new(c);
         let o = resize(&mut s.d, n * vd);
         let mut tmp = vec![0.0f32; nv * n * hv]; // [head][t][hv]
-        let conv_out = &*conv_out;
-        let ba = &*ba;
-        ssm.par_chunks_mut(hv * hk)
-            .zip(tmp.par_chunks_mut(n * hv))
-            .enumerate()
-            .for_each(|(vh, (st, oh))| {
-                let kh = vh % nk; // tiled V-head order (see module docs)
-                with_best_simd!({
-                    for t in 0..n {
-                        let row = &conv_out[t * cd..(t + 1) * cd];
-                        let q = &row[kh * hk..(kh + 1) * hk];
-                        let k = &row[kd + kh * hk..kd + (kh + 1) * hk];
-                        let v = &row[2 * kd + vh * hv..2 * kd + (vh + 1) * hv];
-                        let beta = sigmoid(ba[t * 2 * nv + vh]);
-                        let alpha = ba[t * 2 * nv + nv + vh];
-                        let decay = (softplus(alpha + self.dt_bias[vh]) * self.ssm_a[vh]).exp();
-                        let ot = &mut oh[t * hv..(t + 1) * hv];
-                        for (j, sj) in st.chunks_exact_mut(hk).enumerate() {
-                            ot[j] = delta_row(sj, k, q, v[j], beta, decay);
-                        }
-                    }
-                });
-            });
+        match pend {
+            None => {
+                // New history = last K-1 rows of [history; new].
+                let rows: Vec<&[f32]> = (0..n).map(|t| &qkvz[t * w..t * w + cd]).collect();
+                update_conv_history(conv_state, &rows, cd);
+                gdn_heads(&dims, ssm, conv_out, &beta, &decay, n, Some(&mut tmp));
+            }
+            Some(pg) => {
+                // Provisional: leave conv / ssm at the base state, run the
+                // delta rule on a copy and keep the per-token inputs for
+                // `commit`.
+                pg.conv_in.clear();
+                for t in 0..n {
+                    pg.conv_in.extend_from_slice(&qkvz[t * w..t * w + cd]);
+                }
+                pg.conv_out.clear();
+                pg.conv_out.extend_from_slice(conv_out);
+                let work = resize(&mut s.ssm_tmp, ssm.len());
+                work.par_chunks_mut(1 << 16)
+                    .zip(ssm.par_chunks(1 << 16))
+                    .for_each(|(d, s)| d.copy_from_slice(s));
+                gdn_heads(&dims, work, conv_out, &beta, &decay, n, Some(&mut tmp));
+                pg.beta = beta;
+                pg.decay = decay;
+            }
+        }
         // Gated RMS norm per head: rms(o_h) * norm * silu(z_h).
         let gate = |(t, ot): (usize, &mut [f32])| {
             let z = &qkvz[t * w + cd..(t + 1) * w];
@@ -845,6 +1076,7 @@ impl Qwen35Model {
             ssm,
             len: 0,
             ckpt: RecurrentCheckpoint::default(),
+            pending: None,
             s: Scratch::default(),
         }
     }
@@ -855,8 +1087,26 @@ impl Qwen35Model {
         pos: usize,
         state: &mut Qwen35State,
     ) -> anyhow::Result<Vec<f32>> {
+        self.forward_tokens_with(tokens, pos, state, &mut ForwardOpts::default())
+    }
+
+    /// [`forward_tokens`](Self::forward_tokens) with [`ForwardOpts`]: logits
+    /// of every position, hidden taps, and provisional (speculative
+    /// verification) forwards whose recurrent update waits for
+    /// [`ModelState::commit`].
+    pub fn forward_tokens_with(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut Qwen35State,
+        opts: &mut ForwardOpts<'_>,
+    ) -> anyhow::Result<Vec<f32>> {
         let c = &self.cfg;
         let n = tokens.len();
+        anyhow::ensure!(
+            state.pending.is_none(),
+            "forward: a provisional forward is pending (commit it first)"
+        );
         anyhow::ensure!(n > 0, "forward: no tokens");
         anyhow::ensure!(
             pos + n <= c.context_length,
@@ -880,6 +1130,21 @@ impl Qwen35Model {
         self.rope.tables(pos, n, &mut state.s.cos, &mut state.s.sin);
         let mut hbuf = std::mem::take(&mut state.s.h);
         let mut proj = vec![0.0f32; n * h];
+        let mut pending = opts.provisional.then(|| Pending {
+            base: pos,
+            n,
+            dims: GdnDims::new(c),
+            gdn: (0..c.layers).map(|_| PendingGdn::default()).collect(),
+        });
+        let mut taps = opts.taps.as_deref_mut();
+        if let Some(t) = taps.as_deref_mut() {
+            anyhow::ensure!(
+                t.layers.iter().all(|&i| i < c.layers),
+                "hidden taps: layer out of range"
+            );
+            t.data.clear();
+            t.data.resize(n * t.layers.len() * h, 0.0);
+        }
 
         for (i, l) in self.layers.iter().enumerate() {
             hbuf.resize(n * h, 0.0);
@@ -901,6 +1166,7 @@ impl Qwen35Model {
                         &mut state.ssm[i],
                         &mut state.s,
                         &mut proj,
+                        pending.as_mut().map(|p| &mut p.gdn[i]),
                     );
                 }
             }
@@ -915,19 +1181,23 @@ impl Qwen35Model {
             swiglu_rows(gu, act, inter);
             l.down.forward(act, n, &mut s.acts, &mut proj);
             x.iter_mut().zip(&proj).for_each(|(a, b)| *a += b);
+            if let Some(t) = taps.as_deref_mut() {
+                copy_taps(t, i, &x, n, h);
+            }
         }
 
-        hbuf.resize(h, 0.0);
-        hbuf.copy_from_slice(&x[(n - 1) * h..]);
+        let rows = if opts.all_logits { n } else { 1 };
+        hbuf.resize(rows * h, 0.0);
+        hbuf.copy_from_slice(&x[(n - rows) * h..]);
         rms_norm_rows(&mut hbuf, &self.output_norm, c.eps);
         let head = self.lm_head();
-        let mut logits = vec![0.0f32; head.rows()];
-        head.forward(&hbuf, 1, &mut state.s.acts, &mut logits);
-        logits.truncate(c.vocab);
+        let mut logits = vec![0.0f32; rows * head.rows()];
+        head.forward(&hbuf, rows, &mut state.s.acts, &mut logits);
         state.s.x = x;
         state.s.h = hbuf;
         state.len = pos + n;
-        Ok(logits)
+        state.pending = pending;
+        Ok(super::trim_logit_rows(logits, head.rows(), c.vocab))
     }
 }
 
@@ -944,6 +1214,29 @@ impl CausalLM for Qwen35Model {
     ) -> anyhow::Result<Logits> {
         let st = downcast_state::<Qwen35State>(state)?;
         self.forward_tokens(tokens, pos, st)
+    }
+
+    fn forward_with(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut dyn ModelState,
+        opts: &mut ForwardOpts<'_>,
+    ) -> anyhow::Result<Logits> {
+        let st = downcast_state::<Qwen35State>(state)?;
+        self.forward_tokens_with(tokens, pos, st, opts)
+    }
+
+    fn batched_verify(&self) -> bool {
+        true
+    }
+
+    fn hidden_shape(&self) -> Option<(usize, usize)> {
+        Some((self.cfg.hidden, self.cfg.layers))
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 
     fn vocab_size(&self) -> usize {

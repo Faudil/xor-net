@@ -18,6 +18,12 @@ pub struct ServerConfig {
     pub port: u16,
     pub slots: usize,
     pub threads_per_slot: usize,
+    /// `None` = auto: batch for models with a batched forward, else slots.
+    pub scheduler: Option<Scheduler>,
+    /// Concurrent sequences of the batch scheduler (its slot count).
+    pub max_batch: usize,
+    /// Batch scheduler: prefill tokens per step while other requests decode.
+    pub batch_prefill: usize,
     pub max_connections: usize,
     pub max_queue: usize,
     pub max_body_bytes: usize,
@@ -36,6 +42,12 @@ pub struct ServerConfig {
     pub prompt_cache_mb: Option<usize>,
     /// Shortest prefix (tokens) worth a prompt-cache entry.
     pub prompt_cache_min_tokens: usize,
+    /// Speculative decoding drafter: `lookup` or a DSpark `.gguf` path.
+    pub draft: Option<String>,
+    /// Draft tokens per round (`None` = the drafter's default).
+    pub draft_k: Option<usize>,
+    /// DSpark head: `shared` (default) or `own`.
+    pub draft_head: Option<String>,
 }
 
 impl ServerConfig {
@@ -55,6 +67,9 @@ impl ServerConfig {
             port: 8080,
             slots,
             threads_per_slot,
+            scheduler: None,
+            max_batch: 8,
+            batch_prefill: 256,
             max_connections: 256,
             max_queue: 64,
             max_body_bytes: 4 * 1024 * 1024,
@@ -69,8 +84,21 @@ impl ServerConfig {
             cors_origin: None,
             prompt_cache_mb: None,
             prompt_cache_min_tokens: xor_net::prompt_cache::DEFAULT_MIN_TOKENS,
+            draft: None,
+            draft_k: None,
+            draft_head: None,
         }
     }
+}
+
+/// How concurrent requests share the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scheduler {
+    /// `--slots` independent decoders, each in its own rayon pool.
+    Slots,
+    /// Continuous batching: one engine steps every active request together
+    /// (`--max-batch` of them) on all cores.
+    Batch,
 }
 
 /// Default `(slots, threads_per_slot)` for `logical` CPUs (assumes SMT-2,
@@ -108,8 +136,19 @@ OPTIONS:
                                                             [XORNET_REASONING_FORMAT] (auto)
         --host <HOST>            bind host                  [XORNET_SERVER_HOST] (127.0.0.1)
     -p, --port <PORT>            bind port                  [XORNET_SERVER_PORT] (8080)
-        --slots <N>              concurrent decode slots    [XORNET_SLOTS] (2 if >= 4 physical cores, else 1)
-        --threads-per-slot <N>   rayon threads per slot     [XORNET_THREADS_PER_SLOT] (physical cores / slots)
+        --scheduler <S>          auto | batch | slots: batch = continuous batching (all active
+                                 requests decoded together, each weight read once per step,
+                                 all physical cores); slots = independent per-slot decoders;
+                                 auto = batch for Bonsai (.gguf / .xq1) models, else slots
+                                                            [XORNET_SCHEDULER] (auto)
+        --max-batch <N>          batch: concurrent requests [XORNET_MAX_BATCH] (8)
+        --batch-prefill <N>      batch: prompt tokens prefilled per step while others decode
+                                 (bounds their extra latency)
+                                                            [XORNET_BATCH_PREFILL] (256)
+        --slots <N>              slots: concurrent decode slots
+                                                            [XORNET_SLOTS] (2 if >= 4 physical cores, else 1)
+        --threads-per-slot <N>   slots: rayon threads per slot
+                                                            [XORNET_THREADS_PER_SLOT] (physical cores / slots)
                                  Decode is memory-bound: 1 slot x all cores = lowest latency,
                                  more slots = more aggregate tok/s (6-core Zen 5, Bonsai-1.7B:
                                  1x6 155, 2x3 190, 3x2 215, 6x1 264 tok/s aggregate).
@@ -134,6 +173,12 @@ OPTIONS:
         --prompt-cache-min-tokens <N>
                                  shortest prefix worth caching
                                                             [XORNET_PROMPT_CACHE_MIN_TOKENS] (64)
+        --draft <D>              lossless speculative decoding (slot scheduler; selects it
+                                 when --scheduler is auto): `lookup` (n-gram prompt lookup)
+                                 or a DSpark drafter .gguf (Bonsai 27B)
+                                                            [XORNET_DRAFT] (off)
+        --draft-k <N>            draft tokens per round     [XORNET_DRAFT_K] (dspark 4, lookup 4)
+        --draft-head <H>         DSpark head: shared | own  [XORNET_DRAFT_HEAD] (shared)
     -h, --help                   print this help
 ";
 
@@ -193,6 +238,21 @@ const OPTS: &[Opt] = &[
         long: "threads-per-slot",
         short: None,
         env: "XORNET_THREADS_PER_SLOT",
+    },
+    Opt {
+        long: "scheduler",
+        short: None,
+        env: "XORNET_SCHEDULER",
+    },
+    Opt {
+        long: "max-batch",
+        short: None,
+        env: "XORNET_MAX_BATCH",
+    },
+    Opt {
+        long: "batch-prefill",
+        short: None,
+        env: "XORNET_BATCH_PREFILL",
     },
     Opt {
         long: "max-connections",
@@ -263,6 +323,21 @@ const OPTS: &[Opt] = &[
         long: "prompt-cache-min-tokens",
         short: None,
         env: "XORNET_PROMPT_CACHE_MIN_TOKENS",
+    },
+    Opt {
+        long: "draft",
+        short: None,
+        env: "XORNET_DRAFT",
+    },
+    Opt {
+        long: "draft-k",
+        short: None,
+        env: "XORNET_DRAFT_K",
+    },
+    Opt {
+        long: "draft-head",
+        short: None,
+        env: "XORNET_DRAFT_HEAD",
     },
 ];
 
@@ -344,6 +419,20 @@ pub fn parse(
             "port" => c.port = num(n, &v)?,
             "slots" => c.slots = positive(n, &v)?,
             "threads-per-slot" => c.threads_per_slot = positive(n, &v)?,
+            "scheduler" => {
+                c.scheduler = match v.trim() {
+                    "auto" => None,
+                    "batch" => Some(Scheduler::Batch),
+                    "slots" => Some(Scheduler::Slots),
+                    _ => {
+                        return Err(format!(
+                            "invalid value for --{n}: {v:?} (auto | batch | slots)"
+                        ));
+                    }
+                }
+            }
+            "max-batch" => c.max_batch = positive(n, &v)?,
+            "batch-prefill" => c.batch_prefill = positive(n, &v)?,
             "max-connections" => c.max_connections = positive(n, &v)?,
             "max-queue" => c.max_queue = positive(n, &v)?,
             "max-body-bytes" => c.max_body_bytes = positive(n, &v)?,
@@ -363,6 +452,12 @@ pub fn parse(
                 }
             }
             "prompt-cache-min-tokens" => c.prompt_cache_min_tokens = positive(n, &v)?,
+            "draft" => c.draft = Some(v),
+            "draft-k" => c.draft_k = Some(positive(n, &v)?),
+            "draft-head" => match v.trim() {
+                "own" | "shared" => c.draft_head = Some(v.trim().to_string()),
+                _ => return Err(format!("invalid value for --{n}: {v:?} (own | shared)")),
+            },
             _ => {}
         }
     }
@@ -445,6 +540,49 @@ mod tests {
         assert_eq!(c.reasoning_format, Some(ReasoningFormat::Separate));
         let c = run(&["--reasoning-format=auto"], &[]).unwrap();
         assert_eq!(c.reasoning_format, None);
+    }
+
+    #[test]
+    fn scheduler_flags() {
+        let c = run(&[], &[]).unwrap();
+        assert_eq!((c.scheduler, c.max_batch, c.batch_prefill), (None, 8, 256));
+        let c = run(
+            &[
+                "--scheduler",
+                "batch",
+                "--max-batch=6",
+                "--batch-prefill",
+                "64",
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            (c.scheduler, c.max_batch, c.batch_prefill),
+            (Some(Scheduler::Batch), 6, 64)
+        );
+        let c = run(&[], &[("XORNET_SCHEDULER", "slots")]).unwrap();
+        assert_eq!(c.scheduler, Some(Scheduler::Slots));
+        assert_eq!(run(&["--scheduler=auto"], &[]).unwrap().scheduler, None);
+        assert!(run(&["--scheduler", "fifo"], &[]).is_err());
+        assert!(run(&["--max-batch", "0"], &[]).is_err());
+    }
+
+    #[test]
+    fn draft_flags() {
+        let c = run(&[], &[]).unwrap();
+        assert_eq!((c.draft.as_deref(), c.draft_k), (None, None));
+        let c = run(&["--draft", "lookup", "--draft-k=5"], &[]).unwrap();
+        assert_eq!((c.draft.as_deref(), c.draft_k), (Some("lookup"), Some(5)));
+        let c = run(
+            &[],
+            &[("XORNET_DRAFT", "d.gguf"), ("XORNET_DRAFT_HEAD", "own")],
+        )
+        .unwrap();
+        assert_eq!(c.draft.as_deref(), Some("d.gguf"));
+        assert_eq!(c.draft_head.as_deref(), Some("own"));
+        assert!(run(&["--draft-k", "0"], &[]).is_err());
+        assert!(run(&["--draft-head", "x"], &[]).is_err());
     }
 
     #[test]

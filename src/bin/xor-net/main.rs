@@ -57,6 +57,12 @@ GENERATION OPTIONS:
                              (`enable_thinking`; only templates that read it,
                              e.g. Bonsai 27B; Bonsai 1.7B-8B never think)
         --show-thinking      Print reasoning (dimmed) instead of hiding it
+        --draft <D>          Lossless speculative decoding: `lookup` (n-gram
+                             prompt lookup, any model) or a DSpark drafter
+                             .gguf (Bonsai 27B: Bonsai-27B-dspark-Q4_1.gguf)
+        --draft-k <N>        Draft tokens per round   [dspark: 4, lookup: 4]
+        --draft-head <H>     DSpark head: shared (the target's, faster) or
+                             own (the drafter GGUF's Q4_1 head)    [shared]
 
 MODEL OPTIONS:
     -t, --threads <N>        Worker threads (default: auto, max 8)

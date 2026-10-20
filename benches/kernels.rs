@@ -251,12 +251,16 @@ fn main() {
                 if rows == 4096 && ab == 32 {
                     // Short multi-token calls (chat turns, speculative
                     // chunks): tiled vs per-token row kernels.
-                    for n in [2usize, 4, 8, 16] {
+                    for n in [2usize, 4, 5, 8, 16] {
                         let xs: Vec<f32> = (0..n * cols).map(|_| rng.f32()).collect();
                         let mut acts = Q8Acts::new();
                         acts.quantize(&xs, n, cols, ab);
                         let mut out = vec![0.0f32; n * rows];
-                        for k in [GemmKernel::best(), GemmKernel::Rows(Isa::best())] {
+                        for k in [
+                            GemmKernel::best_small(),
+                            GemmKernel::best(),
+                            GemmKernel::Rows(Isa::best()),
+                        ] {
                             run_bw(
                                 &filter,
                                 &format!("q1_gemm_small {name} n={n} {k:?} (mt, x n)"),
@@ -309,6 +313,106 @@ fn main() {
                         }
                     }
                 }
+            }
+        }
+        // Prefill GEMM at the projection shapes of 1.7B / 8B / 27B (n=256):
+        // GMAC/s (1 MAC = one 1-bit weight x int8 activation product).
+        {
+            let one = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            let n = 256usize;
+            for &(name, rows, cols) in &[
+                ("1.7B gate_up", 12288usize, 2048usize),
+                ("1.7B down", 2048, 6144),
+                ("8B gate_up", 24576, 4096),
+                ("8B down", 4096, 12288),
+                ("27B gate_up", 34816, 5120),
+                ("27B down", 5120, 17408),
+            ] {
+                let w = q1(&mut rng, rows, cols, 128);
+                let xs: Vec<f32> = (0..n * cols).map(|_| rng.f32()).collect();
+                let mut acts = Q8Acts::new();
+                acts.quantize(&xs, n, cols, 32);
+                let mut out = vec![0.0f32; n * rows];
+                let macs = (rows * cols * n) as f64;
+                let mut gmacs = |label: &str, iters: usize, f: &mut dyn FnMut(&mut [f32])| {
+                    if let Some(flt) = &filter
+                        && !label.contains(flt.as_str())
+                    {
+                        return;
+                    }
+                    f(&mut out);
+                    let mut s: Vec<f64> = (0..iters)
+                        .map(|_| {
+                            let t = Instant::now();
+                            f(&mut out);
+                            t.elapsed().as_secs_f64()
+                        })
+                        .collect();
+                    s.sort_by(f64::total_cmp);
+                    println!(
+                        "{label:<60} median {:>10.2} us   {:>7.1} GMAC/s",
+                        s[s.len() / 2] * 1e6,
+                        macs / s[s.len() / 2] / 1e9
+                    );
+                };
+                gmacs(
+                    &format!("q1_prefill_gemm {name} {rows}x{cols} n={n} (mt)"),
+                    5,
+                    &mut |o| gemm(&w, &acts, o),
+                );
+                if rows * cols <= 12288 * 2048 {
+                    gmacs(
+                        &format!("q1_prefill_gemm {name} {rows}x{cols} n={n} (1 thread)"),
+                        3,
+                        &mut |o| one.install(|| gemm(&w, &acts, o)),
+                    );
+                }
+            }
+        }
+        // Small batches at Bonsai-27B shapes (speculative verification,
+        // batched decode): `gemm` on T tokens over DRAM-resident weights
+        // (gate_up: 6 x 34816x5120 = 140 MB; down: 8 x 5120x17408 = 90 MB)
+        // and an L3-resident matrix (compute only); cost relative to T = 1.
+        for &(name, rows, cols, mats) in &[
+            ("27B gate_up DRAM", 34816usize, 5120usize, 6usize),
+            ("27B down DRAM", 5120, 17408, 8),
+            ("27B gate_up-slice L3", 4096, 5120, 1),
+        ] {
+            let label = format!("q1_small27 {name}");
+            if filter.as_ref().is_some_and(|f| !label.contains(f.as_str())) {
+                continue;
+            }
+            let ws: Vec<Q1Weight> = (0..mats).map(|_| q1(&mut rng, rows, cols, 128)).collect();
+            let mut out = vec![0.0f32; 8 * rows];
+            let mut t1 = 0.0f64;
+            for t in 1..=8usize {
+                let xs: Vec<f32> = (0..t * cols).map(|_| rng.f32()).collect();
+                let mut acts = Q8Acts::new();
+                acts.quantize(&xs, t, cols, 32);
+                let reps = if mats == 1 { 400 } else { 15 };
+                let mut sweep = || {
+                    let st = Instant::now();
+                    for w in &ws {
+                        gemm(w, &acts, &mut out[..t * rows]);
+                    }
+                    st.elapsed().as_secs_f64()
+                };
+                sweep();
+                let mut v: Vec<f64> = (0..reps).map(|_| sweep()).collect();
+                v.sort_by(f64::total_cmp);
+                let (mn, med) = (v[0], v[v.len() / 2]);
+                if t == 1 {
+                    t1 = mn;
+                }
+                println!(
+                    "{label} T={t} min {:>8.1} us median {:>8.1} us  cost x{:.2} (min vs T=1)",
+                    mn * 1e6,
+                    med * 1e6,
+                    mn / t1
+                );
             }
         }
         // One Bonsai-1.7B layer's projections at prefill sizes (quantize +
@@ -392,6 +496,134 @@ fn main() {
                 black_box(&out);
             },
         );
+        // Transparent huge pages: the same sweep with all weights in one
+        // 2 MiB-aligned MADV_HUGEPAGE arena (`util::HugeBuf`, what
+        // XORNET_HUGEPAGES=1 uses) vs the plain 4 KiB-page buffers, timed
+        // alternately in one process so load drift hits both alike.
+        let thp = "q1_gemv 1.7B 28-layer sweep THP A/B";
+        if filter.as_ref().is_none_or(|f| thp.contains(f.as_str())) {
+            use std::sync::Arc;
+            let mut arena = xor_net::util::HugeBuf::new(total).unwrap();
+            let mut off = 0;
+            let mut spans = Vec::new();
+            for w in layers.iter().flatten() {
+                let (b, sc) = (w.bits().as_slice(), w.scales().as_slice());
+                arena.as_mut_slice()[off..off + b.len()].copy_from_slice(b);
+                arena.as_mut_slice()[off + b.len()..off + b.len() + sc.len()].copy_from_slice(sc);
+                spans.push((off, b.len(), sc.len()));
+                off += b.len() + sc.len();
+            }
+            let arena: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(arena);
+            let huge: Vec<Q1Weight> = layers
+                .iter()
+                .flatten()
+                .zip(&spans)
+                .map(|(w, &(o, nb, ns))| {
+                    Q1Weight::new(
+                        w.rows(),
+                        w.cols(),
+                        w.block(),
+                        ByteBuf::from_shared(arena.clone(), o, nb).unwrap(),
+                        ByteBuf::from_shared(arena.clone(), o + nb, ns).unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let plain: Vec<&Q1Weight> = layers.iter().flatten().collect();
+            let mut sweep = |ws: &mut dyn Iterator<Item = &Q1Weight>| {
+                let t = Instant::now();
+                for w in ws {
+                    let a = if w.cols() == 2048 { &a2k } else { &a6k };
+                    gemv(w, a, &mut out[..w.rows()]);
+                }
+                t.elapsed().as_secs_f64()
+            };
+            let (mut tp, mut th) = (Vec::new(), Vec::new());
+            for i in 0..60 {
+                let p = sweep(&mut plain.iter().copied());
+                let h = sweep(&mut huge.iter());
+                if i >= 5 {
+                    tp.push(p);
+                    th.push(h);
+                }
+            }
+            tp.sort_by(f64::total_cmp);
+            th.sort_by(f64::total_cmp);
+            let anon_huge = std::fs::read_to_string("/proc/self/smaps_rollup")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("AnonHugePages:"))
+                        .map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string())
+                })
+                .unwrap_or_else(|| "?".into());
+            for (name, t) in [("4K pages", &tp), ("THP", &th)] {
+                println!(
+                    "{thp} {name:<8} min {:>8.1} us  median {:>8.1} us  {:.1} GB/s (min)",
+                    t[0] * 1e6,
+                    t[t.len() / 2] * 1e6,
+                    total as f64 / t[0] / 1e9
+                );
+            }
+            println!(
+                "{thp} THP/4K: min x{:.3}, median x{:.3}; AnonHugePages {anon_huge} kB",
+                th[0] / tp[0],
+                th[th.len() / 2] / tp[tp.len() / 2]
+            );
+        }
+        // Speculative verification / batched decode: T tokens through the
+        // same DRAM-bound sweep with `gemm` (its default kernel for T).
+        // "cost" is the time relative to T = 1.
+        let verify = "q1_verify 1.7B 28-layer sweep";
+        if filter.as_ref().is_none_or(|f| verify.contains(f.as_str())) {
+            let mut t1 = 0.0f64;
+            let mut cases: Vec<(usize, Option<GemmKernel>)> = (1..=9).map(|t| (t, None)).collect();
+            for t in [9usize, 12, 16, 24, 32] {
+                cases.push((t, Some(GemmKernel::best_small())));
+                cases.push((t, Some(GemmKernel::best())));
+            }
+            for (t, kern) in cases {
+                let xs: Vec<f32> = (0..t * 6144).map(|_| rng.f32()).collect();
+                let (mut b2k, mut b6k) = (Q8Acts::new(), Q8Acts::new());
+                b2k.quantize(&xs[..t * 2048], t, 2048, 32);
+                b6k.quantize(&xs, t, 6144, 32);
+                let mut o = vec![0.0f32; t * 12288];
+                let mut sweep = || {
+                    for l in &layers {
+                        for w in l {
+                            let a = if w.cols() == 2048 { &b2k } else { &b6k };
+                            let o = &mut o[..t * w.rows()];
+                            match kern {
+                                Some(k) => gemm_with(k, w, a, o),
+                                None => gemm(w, a, o),
+                            }
+                        }
+                    }
+                };
+                for _ in 0..3 {
+                    sweep();
+                }
+                let mut s: Vec<f64> = (0..15)
+                    .map(|_| {
+                        let st = Instant::now();
+                        sweep();
+                        st.elapsed().as_secs_f64()
+                    })
+                    .collect();
+                s.sort_by(f64::total_cmp);
+                let med = s[s.len() / 2];
+                if t == 1 {
+                    t1 = med;
+                }
+                let kname = kern.map_or("gemm".to_string(), |k| format!("{k:?}"));
+                println!(
+                    "{verify} T={t:<2} {kname:<18} median {:>9.1} us  cost x{:.2} (vs T=1)  {:.1} GB/s",
+                    med * 1e6,
+                    med / t1,
+                    total as f64 / med / 1e9
+                );
+            }
+        }
     }
 
     // ── End-to-end synthetic models (non-kernel code: attention, RoPE, ──

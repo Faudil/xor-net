@@ -1,5 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+pub mod batch_session;
 pub mod bit1;
 pub mod bit1_58;
 pub mod generation;
@@ -8,6 +9,7 @@ pub mod models;
 pub mod nn;
 pub mod prompt_cache;
 pub mod sampler;
+pub mod speculative;
 pub mod tensor;
 pub mod util;
 pub mod vision;
@@ -25,6 +27,7 @@ pub use generation::{
 pub use loader::gguf::{BonsaiConfig, GgufFile, is_prism_dtype};
 pub use loader::{SafeTensorLoader, SafeTensorRepo};
 pub use models::auto::AutoModelForCausalLM;
+pub use models::batched::{BatchItem, BatchedCausalLM};
 pub use models::llama::causal_lm::LlamaCausalLM;
 pub use models::llama::{Activation, Cache, Config, Llama, LlamaConfig};
 pub use models::q1::qwen3::{Qwen3Config, Qwen3Model};
@@ -53,8 +56,19 @@ pub fn init_threads(num_threads: usize) -> Result<(), Box<dyn std::error::Error>
     } else {
         num_threads
     };
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(n)
-        .build_global()?;
+    let mut b = rayon::ThreadPoolBuilder::new().num_threads(n);
+    // `XORNET_PIN=1`: pin worker i to one CPU, physical cores first (see
+    // `util::pin_plan`). Linux only; without a readable topology, or with
+    // fewer allowed CPUs than workers, the pool stays unpinned.
+    if std::env::var("XORNET_PIN").is_ok_and(|v| v.trim() == "1")
+        && let Some(plan) = util::pin_plan(n)
+    {
+        b = b.start_handler(move |i| {
+            if let Some(&cpu) = plan.get(i) {
+                util::pin_current_thread(cpu);
+            }
+        });
+    }
+    b.build_global()?;
     Ok(())
 }

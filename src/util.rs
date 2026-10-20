@@ -16,6 +16,168 @@ pub fn uninit_vec<T: Copy + Default>(size: usize) -> Vec<T> {
     vec![T::default(); size]
 }
 
+// ---------------------------------------------------------------------------
+// Transparent huge pages for weight buffers
+// ---------------------------------------------------------------------------
+
+/// Size of an x86_64 / aarch64 (4 KiB granule) PMD huge page.
+const HUGE_PAGE: usize = 2 << 20;
+
+/// Whether `XORNET_HUGEPAGES=1` asks for weights in transparent huge pages:
+/// `.xq1` weights are then copied at load into a THP-backed anonymous buffer
+/// instead of being used from the file mapping (file-backed THP is not
+/// available on most kernels / filesystems), and GGUF weights are repacked
+/// into THP-backed buffers. Linux only; elsewhere it has no effect.
+pub fn hugepages_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(target_os = "linux")
+            && std::env::var("XORNET_HUGEPAGES").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
+/// A zero-initialised anonymous buffer whose start is 2 MiB aligned and that
+/// is marked `MADV_HUGEPAGE` before first touch, so the kernel backs it with
+/// transparent huge pages when `/sys/kernel/mm/transparent_hugepage/enabled`
+/// is `always` or `madvise` (fewer TLB misses when streaming weights).
+/// Elsewhere, or if the advice fails, it is ordinary anonymous memory.
+pub struct HugeBuf {
+    map: memmap2::MmapMut,
+    off: usize,
+    len: usize,
+}
+
+impl HugeBuf {
+    pub fn new(len: usize) -> std::io::Result<Self> {
+        // Over-allocate one huge page so the used range can start on a
+        // huge-page boundary.
+        let map = memmap2::MmapOptions::new()
+            .len(
+                len.checked_add(HUGE_PAGE)
+                    .ok_or(std::io::ErrorKind::OutOfMemory)?,
+            )
+            .map_anon()?;
+        let off = (map.as_ptr() as usize).next_multiple_of(HUGE_PAGE) - map.as_ptr() as usize;
+        #[cfg(target_os = "linux")]
+        {
+            // Best effort: without THP support this is ordinary memory.
+            let _ = map.advise_range(memmap2::Advice::HugePage, off, len);
+        }
+        Ok(Self { map, off, len })
+    }
+
+    /// A [`HugeBuf`] holding a copy of `src`.
+    pub fn copy_of(src: &[u8]) -> std::io::Result<Self> {
+        let mut b = Self::new(src.len())?;
+        b.as_mut_slice().copy_from_slice(src);
+        Ok(b)
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.map[self.off..self.off + self.len]
+    }
+}
+
+impl AsRef<[u8]> for HugeBuf {
+    fn as_ref(&self) -> &[u8] {
+        &self.map[self.off..self.off + self.len]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Thread pinning
+// ---------------------------------------------------------------------------
+
+/// CPUs to pin `n` pool workers to, one per physical core first (the lowest
+/// numbered SMT sibling of each core), then the remaining siblings; only CPUs
+/// in the process affinity mask are used. `None` if the topology cannot be
+/// read (non-Linux, no sysfs) or there are fewer allowed CPUs than `n`.
+pub fn pin_plan(n: usize) -> Option<Vec<usize>> {
+    #[cfg(target_os = "linux")]
+    {
+        let allowed = affinity::allowed_cpus()?;
+        let mut primaries = Vec::new();
+        let mut secondaries = Vec::new();
+        for &cpu in &allowed {
+            let sib = std::fs::read_to_string(format!(
+                "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+            ))
+            .ok()?;
+            let sibs = parse_cpu_list(sib.trim())?;
+            // The first allowed sibling of a core stands for the core.
+            let first = sibs.iter().copied().find(|c| allowed.contains(c))?;
+            if first == cpu {
+                primaries.push(cpu);
+            } else {
+                secondaries.push(cpu);
+            }
+        }
+        primaries.extend(secondaries);
+        (primaries.len() >= n).then(|| primaries[..n].to_vec())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = n;
+        None
+    }
+}
+
+/// Parse a sysfs CPU list such as `0,6` or `0-3,8-11`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_cpu_list(s: &str) -> Option<Vec<usize>> {
+    let mut v = Vec::new();
+    for part in s.split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => v.extend(a.trim().parse::<usize>().ok()?..=b.trim().parse().ok()?),
+            None => v.push(part.trim().parse().ok()?),
+        }
+    }
+    Some(v)
+}
+
+/// Pin the calling thread to `cpu`. Returns whether it succeeded (always
+/// `false` off Linux).
+pub fn pin_current_thread(cpu: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        affinity::pin(cpu)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cpu;
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod affinity {
+    /// CPUs in the calling thread's affinity mask.
+    pub fn allowed_cpus() -> Option<Vec<usize>> {
+        // SAFETY: `cpu_set_t` is plain data; the kernel writes at most
+        // `size_of::<cpu_set_t>()` bytes into it.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+                return None;
+            }
+            let max = 8 * std::mem::size_of::<libc::cpu_set_t>();
+            Some((0..max).filter(|&c| libc::CPU_ISSET(c, &set)).collect())
+        }
+    }
+
+    pub fn pin(cpu: usize) -> bool {
+        if cpu >= 8 * std::mem::size_of::<libc::cpu_set_t>() {
+            return false;
+        }
+        // SAFETY: as above; pid 0 is the calling thread.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+        }
+    }
+}
+
 static NUM_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn get_num_threads() -> usize {
@@ -228,7 +390,33 @@ pub(crate) unsafe fn run_avx2<R>(f: impl FnOnce() -> R) -> R {
 
 #[cfg(test)]
 mod tests {
-    use super::CpuFeatures;
+    use super::{CpuFeatures, parse_cpu_list};
+
+    #[test]
+    fn cpu_list_parsing() {
+        assert_eq!(parse_cpu_list("0,6"), Some(vec![0, 6]));
+        assert_eq!(parse_cpu_list("0-3,8-9"), Some(vec![0, 1, 2, 3, 8, 9]));
+        assert_eq!(parse_cpu_list("5"), Some(vec![5]));
+        assert_eq!(parse_cpu_list("x"), None);
+    }
+
+    #[test]
+    fn huge_buf_is_aligned_and_zeroed() {
+        let mut b = super::HugeBuf::new(3 << 20).unwrap();
+        assert_eq!(b.as_ref().as_ptr() as usize % (2 << 20), 0);
+        assert!(b.as_ref().iter().all(|&x| x == 0));
+        b.as_mut_slice()[12345] = 7;
+        assert_eq!(b.as_ref()[12345], 7);
+        let c = super::HugeBuf::copy_of(&[1, 2, 3]).unwrap();
+        assert_eq!(c.as_ref(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn pin_plan_prefers_physical_cores() {
+        if let Some(p) = super::pin_plan(1) {
+            assert_eq!(p.len(), 1);
+        }
+    }
 
     #[test]
     fn force_isa_only_lowers() {

@@ -54,10 +54,15 @@
 //!   expands one row's bits with `vpsrlvd` + AND, sums with `vpmaddubsw` and
 //!   a `vphaddw` tree, and transposes 8 rows × 8 blocks before the float
 //!   part.
-//! - Token-tiled GEMM ([`gemm_with`], [`TileIsa`]): a slab of 8/16 rows is
-//!   expanded once to bytes and reused by every token; each `vpdpbusd` (or
-//!   `vpmaddubsw`) does `4 · lanes` MACs of a tile of tokens held in
-//!   registers.
+//! - Small-batch GEMM ([`GemmKernel::Multi`], 2 to 16 tokens: speculative
+//!   verification, batched decode): the GEMV structure with every expanded
+//!   group reused by up to [`MULTI_MAX_TOKENS`] tokens, so the weights are
+//!   read from memory once for all of them.
+//! - Token-tiled GEMM ([`gemm_with`], [`TileIsa`], prefill): a slab of rows
+//!   is expanded once to bytes and reused by every token; each `vpdpbusd`
+//!   (or `vpmaddubsw`) does `4 · lanes` MACs of a register tile of rows ×
+//!   tokens. The AVX-512 VNNI tile is 48 rows × 4 tokens, walked in column
+//!   chunks that stay in L1 (see [`gemm_with`]).
 
 use std::sync::Arc;
 
@@ -90,6 +95,27 @@ impl std::fmt::Debug for ByteBuf {
 }
 
 impl ByteBuf {
+    /// A zeroed buffer of `len` bytes for weights built at load time
+    /// (GGUF repacking, fused projections): THP-backed
+    /// ([`crate::util::HugeBuf`]) with `XORNET_HUGEPAGES=1` for buffers of
+    /// at least one huge page, a plain `Vec` otherwise. `fill` writes it.
+    pub fn build(len: usize, fill: impl FnOnce(&mut [u8])) -> Self {
+        if len >= 2 << 20
+            && crate::util::hugepages_requested()
+            && let Ok(mut h) = crate::util::HugeBuf::new(len)
+        {
+            fill(h.as_mut_slice());
+            return Self {
+                owner: Arc::new(h),
+                off: 0,
+                len,
+            };
+        }
+        let mut v = vec![0u8; len];
+        fill(&mut v);
+        Self::from_vec(v)
+    }
+
     pub fn from_vec(v: Vec<u8>) -> Self {
         let len = v.len();
         Self {
@@ -209,19 +235,17 @@ impl Q1Weight {
             rows * nb * bbytes
         );
         let nbb = block / 8;
-        let mut bits = vec![0u8; rows * cols / 8];
-        let mut scales = vec![0u8; rows * nb * 2];
-        for (i, blk) in data.chunks_exact(bbytes).enumerate() {
-            bits[i * nbb..(i + 1) * nbb].copy_from_slice(&blk[boff..boff + nbb]);
-            scales[i * 2..i * 2 + 2].copy_from_slice(&blk[soff..soff + 2]);
-        }
-        Self::new(
-            rows,
-            cols,
-            block,
-            ByteBuf::from_vec(bits),
-            ByteBuf::from_vec(scales),
-        )
+        let bits = ByteBuf::build(rows * cols / 8, |bits| {
+            for (i, blk) in data.chunks_exact(bbytes).enumerate() {
+                bits[i * nbb..(i + 1) * nbb].copy_from_slice(&blk[boff..boff + nbb]);
+            }
+        });
+        let scales = ByteBuf::build(rows * nb * 2, |scales| {
+            for (i, blk) in data.chunks_exact(bbytes).enumerate() {
+                scales[i * 2..i * 2 + 2].copy_from_slice(&blk[soff..soff + 2]);
+            }
+        });
+        Self::new(rows, cols, block, bits, scales)
     }
 
     /// Re-encode as GGUF blocks of `dtype` (must have the same block size).
@@ -245,25 +269,26 @@ impl Q1Weight {
     pub fn concat_rows(parts: &[&Q1Weight]) -> anyhow::Result<Self> {
         anyhow::ensure!(!parts.is_empty(), "concat_rows: no parts");
         let (cols, block) = (parts[0].cols, parts[0].block);
-        let mut bits = Vec::new();
-        let mut scales = Vec::new();
-        let mut rows = 0;
         for p in parts {
             anyhow::ensure!(
                 p.cols == cols && p.block == block,
                 "concat_rows: shape mismatch"
             );
-            bits.extend_from_slice(p.bits.as_slice());
-            scales.extend_from_slice(p.scales.as_slice());
-            rows += p.rows;
         }
-        Self::new(
-            rows,
-            cols,
-            block,
-            ByteBuf::from_vec(bits),
-            ByteBuf::from_vec(scales),
-        )
+        let rows = parts.iter().map(|p| p.rows).sum();
+        let cat = |len: usize, get: fn(&Q1Weight) -> &ByteBuf| {
+            ByteBuf::build(len, |dst| {
+                let mut o = 0;
+                for p in parts {
+                    let src = get(p).as_slice();
+                    dst[o..o + src.len()].copy_from_slice(src);
+                    o += src.len();
+                }
+            })
+        };
+        let bits = cat(parts.iter().map(|p| p.bits.len()).sum(), |p| &p.bits);
+        let scales = cat(parts.iter().map(|p| p.scales.len()).sum(), |p| &p.scales);
+        Self::new(rows, cols, block, bits, scales)
     }
 
     pub fn rows(&self) -> usize {
@@ -1165,13 +1190,23 @@ pub fn gemv(w: &Q1Weight, acts: &Q8Acts, out: &mut [f32]) {
 }
 
 /// From this many tokens on, [`gemm`] uses the token-tiled kernel; below,
-/// expanding each slab's bits costs more than it saves.
-pub const GEMM_TILED_MIN_TOKENS: usize = 8;
+/// the small-batch kernel ([`GemmKernel::Multi`]), which reads the weights
+/// from memory once (in passes of [`MULTI_MAX_TOKENS`] tokens over
+/// cache-hot row chunks). Measured on Zen 5 with DRAM-resident weights, the
+/// two cross over between 16 and 32 tokens; the tiled kernel's per-slab
+/// expansion only pays off over many tokens.
+pub const GEMM_TILED_MIN_TOKENS: usize = 17;
+
+/// Tokens one pass of the small-batch kernel ([`GemmKernel::Multi`])
+/// handles; more tokens take several passes over (cache-hot) row chunks.
+pub const MULTI_MAX_TOKENS: usize = 8;
 
 /// `out[t] = W · x[t]` for every activation row `t` (`out` is
-/// `[acts.n(), rows]` row-major). One row uses [`gemv`]; a few use the row
-/// kernels; [`GEMM_TILED_MIN_TOKENS`] or more the token-tiled kernel
-/// ([`GemmKernel::best`]).
+/// `[acts.n(), rows]` row-major). One row uses [`gemv`]; up to
+/// `GEMM_TILED_MIN_TOKENS - 1` the small-batch kernel
+/// ([`GemmKernel::best_small`]: about one weight read for all of them, as
+/// needed by speculative verification and batched decode); more the
+/// token-tiled kernel ([`GemmKernel::best`]).
 pub fn gemm(w: &Q1Weight, acts: &Q8Acts, out: &mut [f32]) {
     let n = acts.n();
     assert_eq!(out.len(), n * w.rows, "gemm: output length mismatch");
@@ -1179,7 +1214,7 @@ pub fn gemm(w: &Q1Weight, acts: &Q8Acts, out: &mut [f32]) {
         return gemv(w, acts, out);
     }
     let k = if n < GEMM_TILED_MIN_TOKENS {
-        GemmKernel::Rows(Isa::best())
+        GemmKernel::best_small()
     } else {
         GemmKernel::best()
     };
@@ -1194,7 +1229,20 @@ pub enum GemmKernel {
     Rows(Isa),
     /// Token-tiled kernel (see [`gemm_with`]) with the given inner product.
     Tiled(TileIsa),
+    /// Small-batch kernel: the GEMV structure (sign words transposed to one
+    /// row per lane, expanded in registers) with the expanded groups reused
+    /// by up to [`MULTI_MAX_TOKENS`] tokens, so a pass reads the weights
+    /// once for all of them. Uses 16 rows per zmm, 8 per ymm.
+    Multi(TileIsa),
 }
+
+/// AVX-512 VNNI token tile: `VNNI_SLABS × 16` rows × `VNNI_TILE` tokens of
+/// i32 accumulators (and as many f32 partial sums) in registers. Zen 5 runs
+/// two `vpdpbusd` but only two broadcast loads per cycle, so reusing each
+/// broadcast activation for several 16-row groups (and each weight vector
+/// for several tokens) is what keeps the VNNI pipes busy.
+const VNNI_SLABS: usize = 3;
+const VNNI_TILE: usize = 4;
 
 /// Inner product of the token-tiled GEMM kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1225,8 +1273,23 @@ impl TileIsa {
     pub fn tile(self) -> usize {
         match self {
             TileIsa::Avx2 | TileIsa::AvxVnni => 4,
-            TileIsa::Avx512Bw | TileIsa::Avx512Vnni => 8,
+            TileIsa::Avx512Bw => 8,
+            TileIsa::Avx512Vnni => VNNI_TILE,
         }
+    }
+
+    /// Lane groups (of [`Self::lanes`] rows) per register tile: each
+    /// broadcast activation word feeds this many `vpdpbusd`.
+    pub fn slabs(self) -> usize {
+        match self {
+            TileIsa::Avx512Vnni => VNNI_SLABS,
+            _ => 1,
+        }
+    }
+
+    /// Output rows per slab (`lanes · slabs`).
+    pub fn slab_rows(self) -> usize {
+        self.lanes() * self.slabs()
     }
 
     /// Output rows per kernel call (SIMD lanes).
@@ -1252,29 +1315,36 @@ impl GemmKernel {
         .map_or(GemmKernel::Rows(Isa::best()), GemmKernel::Tiled)
     }
 
+    /// Fastest variant for fewer than [`GEMM_TILED_MIN_TOKENS`] tokens.
+    pub fn best_small() -> Self {
+        match Self::best() {
+            GemmKernel::Tiled(t) => GemmKernel::Multi(t),
+            k => k,
+        }
+    }
+
     pub fn supported(self) -> bool {
         match self {
             GemmKernel::Rows(i) => i.supported(),
-            GemmKernel::Tiled(t) => t.supported(),
+            GemmKernel::Tiled(t) | GemmKernel::Multi(t) => t.supported(),
         }
     }
 
     /// All variants this CPU supports.
     pub fn all_supported() -> Vec<GemmKernel> {
+        let tiles = [
+            TileIsa::Avx2,
+            TileIsa::AvxVnni,
+            TileIsa::Avx512Bw,
+            TileIsa::Avx512Vnni,
+        ]
+        .into_iter()
+        .filter(|t| t.supported());
         Isa::all_supported()
             .into_iter()
             .map(GemmKernel::Rows)
-            .chain(
-                [
-                    TileIsa::Avx2,
-                    TileIsa::AvxVnni,
-                    TileIsa::Avx512Bw,
-                    TileIsa::Avx512Vnni,
-                ]
-                .into_iter()
-                .filter(|t| t.supported())
-                .map(GemmKernel::Tiled),
-            )
+            .chain(tiles.clone().map(GemmKernel::Tiled))
+            .chain(tiles.map(GemmKernel::Multi))
             .collect()
     }
 }
@@ -1299,6 +1369,14 @@ impl GemmKernel {
 /// keeps its `T` accumulators in registers and reuses each expanded group
 /// `T` times.
 ///
+/// The AVX-512 VNNI kernel holds `R` = 3 lane groups (48 rows) × `T` = 4
+/// tokens of accumulators, so each broadcast activation feeds 3 `vpdpbusd`
+/// and each weight vector 4: Zen 5 issues two `vpdpbusd` but only two
+/// broadcast loads per cycle, so with one lane group (one load per
+/// `vpdpbusd`) the loads, not the VNNI units, were the limit. It walks the
+/// columns in chunks of 512 so the chunk's expanded weights stay in L1
+/// across all token tiles; weight blocks are still accumulated in order.
+///
 /// Work is split over (token block, slab range) items so every thread works
 /// on the same activations at a time (shared in L3) and its slab stays in L2.
 pub fn gemm_with(kernel: GemmKernel, w: &Q1Weight, acts: &Q8Acts, out: &mut [f32]) {
@@ -1316,8 +1394,502 @@ pub fn gemm_with(kernel: GemmKernel, w: &Q1Weight, acts: &Q8Acts, out: &mut [f32
     match kernel {
         GemmKernel::Rows(isa) => gemm_rows(isa, w, acts, out),
         GemmKernel::Tiled(t) => gemm_tiled(t, w, acts, out),
+        GemmKernel::Multi(t) => gemm_multi(t, w, acts, out),
     }
 }
+
+/// Small-batch GEMM: parallel over row chunks; each chunk runs the
+/// multi-token kernel over groups of up to [`MULTI_MAX_TOKENS`] tokens.
+fn gemm_multi(isa: TileIsa, w: &Q1Weight, acts: &Q8Acts, out: &mut [f32]) {
+    with_packed(acts, MULTI_MAX_TOKENS, |pa| {
+        gemm_multi_packed(isa, w, acts, pa, out)
+    })
+}
+
+fn gemm_multi_packed(isa: TileIsa, w: &Q1Weight, acts: &Q8Acts, pa: &PackedActs, out: &mut [f32]) {
+    let (n, rows) = (acts.n(), w.rows);
+    let chunk = task_rows(rows, 4, 32);
+    let nchunks = rows.div_ceil(chunk);
+    let optr = OutPtr(out.as_mut_ptr());
+    let total = out.len();
+    let run = |c: usize| {
+        let r0 = c * chunk;
+        let nr = chunk.min(rows - r0);
+        let mut t0 = 0;
+        while t0 < n {
+            let tc = (n - t0).min(MULTI_MAX_TOKENS);
+            let job = MultiJob {
+                w,
+                acts,
+                pa,
+                r0,
+                nr,
+                t0,
+                out: optr,
+                out_len: total,
+            };
+            // SAFETY: `isa` is supported (checked by `gemm_with`); `job`
+            // is checked by the kernel; tasks write disjoint row ranges.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                macro_rules! dispatch {
+                    ($k:ident) => {
+                        match tc {
+                            1 => $k::<1>(&job),
+                            2 => $k::<2>(&job),
+                            3 => $k::<3>(&job),
+                            4 => $k::<4>(&job),
+                            5 => $k::<5>(&job),
+                            6 => $k::<6>(&job),
+                            7 => $k::<7>(&job),
+                            _ => $k::<8>(&job),
+                        }
+                    };
+                }
+                match isa {
+                    TileIsa::Avx2 => dispatch!(multi_avx2),
+                    TileIsa::AvxVnni => dispatch!(multi_avxvnni),
+                    TileIsa::Avx512Bw => dispatch!(multi_avx512bw),
+                    TileIsa::Avx512Vnni => dispatch!(multi_avx512vnni),
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = (isa, job);
+                unreachable!()
+            }
+            t0 += tc;
+        }
+    };
+    if nchunks == 1 {
+        run(0);
+    } else {
+        (0..nchunks).into_par_iter().for_each(run);
+    }
+}
+
+/// Rows `r0 .. r0 + nr` of tokens `t0 .. t0 + T` of the small-batch GEMM.
+struct MultiJob<'a> {
+    w: &'a Q1Weight,
+    acts: &'a Q8Acts,
+    /// The activations packed in tiles of [`MULTI_MAX_TOKENS`].
+    pa: &'a PackedActs,
+    r0: usize,
+    nr: usize,
+    t0: usize,
+    out: OutPtr,
+    out_len: usize,
+}
+
+impl MultiJob<'_> {
+    /// Checks the invariants the kernels rely on.
+    fn check(&self, tokens: usize) {
+        let (w, a, pa) = (self.w, self.acts, self.pa);
+        let mt = MULTI_MAX_TOKENS;
+        let (nsub, nab) = (w.cols / SUB, w.cols / a.block);
+        assert!((1..=mt).contains(&tokens) && self.t0.is_multiple_of(mt));
+        assert!(self.t0 + tokens <= a.n && self.nr >= 1);
+        assert!(self.r0 + self.nr <= w.rows);
+        assert_eq!(self.out_len, a.n * w.rows);
+        assert_eq!(a.cols, w.cols);
+        assert!(w.block.is_multiple_of(a.block) && a.block.is_multiple_of(SUB));
+        let tiles = self.t0 / mt + 1;
+        assert!(pa.tile == mt && pa.nsub == nsub && pa.nab == nab);
+        assert!(pa.x.len() >= tiles * mt * w.cols);
+        assert!(pa.ns.len() >= tiles * mt * nab && pa.dx.len() >= tiles * mt * nab);
+    }
+
+    /// Store `vals[..cnt]` as rows `r .. r + cnt` of token `t0 + i`.
+    #[inline(always)]
+    fn store(&self, i: usize, r: usize, vals: &[f32], cnt: usize) {
+        let rows = self.w.rows;
+        let off = (self.t0 + i) * rows + r;
+        assert!(cnt <= vals.len() && r + cnt <= self.r0 + self.nr && off + cnt <= self.out_len);
+        // SAFETY: in bounds (checked); tasks write disjoint row ranges.
+        unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), self.out.0.add(off), cnt) }
+    }
+}
+
+/// `$body` once per group `$g` in `0..8` with `$wg` = the sign bits of group
+/// `$g` of the transposed sub-block words `$t` expanded to bytes `{0, 2}`:
+/// byte `p` of lane `l` = 2 · bit `8p + g` of lane `l` (shift + AND).
+#[cfg(target_arch = "x86_64")]
+macro_rules! for_groups02 {
+    // Group `$g` (a constant after unrolling) alone.
+    (@one $t:expr, $m02:expr, $and:path, $srli:ident, $slli:ident, $g:expr) => {
+        match $g {
+            0 => $and($slli::<1>($t), $m02),
+            1 => $and($t, $m02),
+            2 => $and($srli::<1>($t), $m02),
+            3 => $and($srli::<2>($t), $m02),
+            4 => $and($srli::<3>($t), $m02),
+            5 => $and($srli::<4>($t), $m02),
+            6 => $and($srli::<5>($t), $m02),
+            _ => $and($srli::<6>($t), $m02),
+        }
+    };
+    ($t:expr, $m02:expr, $and:path, $srli:ident, $slli:ident, |$g:ident, $wg:ident| $body:block) => {{
+        let (t, m) = ($t, $m02);
+        {
+            let $g: usize = 0;
+            let $wg = $and($slli::<1>(t), m);
+            $body
+        }
+        {
+            let $g: usize = 1;
+            let $wg = $and(t, m);
+            $body
+        }
+        {
+            let $g: usize = 2;
+            let $wg = $and($srli::<1>(t), m);
+            $body
+        }
+        {
+            let $g: usize = 3;
+            let $wg = $and($srli::<2>(t), m);
+            $body
+        }
+        {
+            let $g: usize = 4;
+            let $wg = $and($srli::<3>(t), m);
+            $body
+        }
+        {
+            let $g: usize = 5;
+            let $wg = $and($srli::<4>(t), m);
+            $body
+        }
+        {
+            let $g: usize = 6;
+            let $wg = $and($srli::<5>(t), m);
+            $body
+        }
+        {
+            let $g: usize = 7;
+            let $wg = $and($srli::<6>(t), m);
+            $body
+        }
+    }};
+}
+
+/// Sign words of sub-blocks `kc .. kc + cnt` (`cnt` ≤ 16) of 16 rows,
+/// transposed: `out[s]` lane `r` = word `kc + s` of row `r` (0 past `cnt`).
+///
+/// # Safety
+/// The CPU must support `avx512f`; each row has `kc + cnt` words.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn load_words16(
+    rbits: &[*const u8; 16],
+    kc: usize,
+    cnt: usize,
+) -> [std::arch::x86_64::__m512i; 16] {
+    use std::arch::x86_64::*;
+    let mask = ((1u32 << cnt) - 1) as u16;
+    let v: [__m512i; 16] =
+        std::array::from_fn(|r| _mm512_maskz_loadu_epi32(mask, rbits[r].add(4 * kc) as *const i32));
+    transpose16_epi32(&v)
+}
+
+/// [`load_words16`] for 8 rows and `cnt` ≤ 8 sub-blocks (AVX2).
+///
+/// # Safety
+/// The CPU must support `avx2`; each row has `kc + cnt` words.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn load_words8(
+    rbits: &[*const u8; 8],
+    kc: usize,
+    cnt: usize,
+) -> [std::arch::x86_64::__m256i; 8] {
+    use std::arch::x86_64::*;
+    let mask = _mm256_cmpgt_epi32(
+        _mm256_set1_epi32(cnt as i32),
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+    );
+    let v: [__m256i; 8] =
+        std::array::from_fn(|r| _mm256_maskload_epi32(rbits[r].add(4 * kc) as *const i32, mask));
+    let u0 = _mm256_unpacklo_epi32(v[0], v[1]);
+    let u1 = _mm256_unpackhi_epi32(v[0], v[1]);
+    let u2 = _mm256_unpacklo_epi32(v[2], v[3]);
+    let u3 = _mm256_unpackhi_epi32(v[2], v[3]);
+    let u4 = _mm256_unpacklo_epi32(v[4], v[5]);
+    let u5 = _mm256_unpackhi_epi32(v[4], v[5]);
+    let u6 = _mm256_unpacklo_epi32(v[6], v[7]);
+    let u7 = _mm256_unpackhi_epi32(v[6], v[7]);
+    let v0 = _mm256_unpacklo_epi64(u0, u2);
+    let v1 = _mm256_unpackhi_epi64(u0, u2);
+    let v2 = _mm256_unpacklo_epi64(u1, u3);
+    let v3 = _mm256_unpackhi_epi64(u1, u3);
+    let v4 = _mm256_unpacklo_epi64(u4, u6);
+    let v5 = _mm256_unpackhi_epi64(u4, u6);
+    let v6 = _mm256_unpacklo_epi64(u5, u7);
+    let v7 = _mm256_unpackhi_epi64(u5, u7);
+    [
+        _mm256_permute2x128_si256::<0x20>(v0, v4),
+        _mm256_permute2x128_si256::<0x20>(v1, v5),
+        _mm256_permute2x128_si256::<0x20>(v2, v6),
+        _mm256_permute2x128_si256::<0x20>(v3, v7),
+        _mm256_permute2x128_si256::<0x31>(v0, v4),
+        _mm256_permute2x128_si256::<0x31>(v1, v5),
+        _mm256_permute2x128_si256::<0x31>(v2, v6),
+        _mm256_permute2x128_si256::<0x31>(v3, v7),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! multi_kernel {
+    (
+        $(#[$doc:meta])* $name:ident, $feat:literal, lanes = $lanes:literal, vnni = $vnni:expr,
+        vec = $vi:ty, fvec = $vf:ty, load_words = $loadw:path,
+        set1 = $set1:path, setzi = $setzi:path, add32 = $add32:path, and = $and:path,
+        srli = $srli:ident, slli = $slli:ident, dpbusd = $dpbusd:path,
+        maddubs = $maddubs:path, add16 = $add16:path, madd = $madd:path, set1_16 = $set1_16:path,
+        storef = $storef:path, setzf = $setzf:path, set1f = $set1f:path, cvt = $cvt:path,
+        fma = $fma:path, gather = |$gp:ident, $gi:ident| $gather:expr, gidx = $gidx:expr
+    ) => {
+        $(#[$doc])*
+        #[target_feature(enable = $feat)]
+        unsafe fn $name<const T: usize>(job: &MultiJob<'_>) {
+            use std::arch::x86_64::*;
+            const L: usize = $lanes;
+            // Sub-blocks per transposed chunk (= lanes).
+            const KC: usize = $lanes;
+            job.check(T);
+            const MT: usize = MULTI_MAX_TOKENS;
+            let (w, a, pa) = (job.w, job.acts, job.pa);
+            let cols = w.cols;
+            let rb = cols / 8;
+            let nb = cols / w.block;
+            let nab = cols / a.block;
+            let nsub = cols / SUB;
+            let apw = w.block / a.block; // activation blocks per weight block
+            let spa = a.block / SUB; // sub-blocks per activation block
+            let bits_all = w.bits.as_slice().as_ptr();
+            // Packed tile c = t0 / MT: token t of sub-block k at
+            // xb + (k·MT + t)·32, -Σq / scale of activation block j at
+            // [j·MT + t].
+            let c = job.t0 / MT;
+            let xb = pa.x.as_ptr().add(c * nsub * MT * SUB) as *const u8;
+            let nsb = pa.ns.as_ptr().add(c * nab * MT);
+            let dxb = pa.dx.as_ptr().add(c * nab * MT);
+            let m02 = $set1(0x0202_0202);
+            let gidx = $gidx(nb as i32);
+            let mut dwr = vec![0.0f32; L * nb];
+            let (r0, n) = (job.r0, job.nr);
+            let mut i = 0;
+            while i < n {
+                let rr = (n - i).min(L);
+                // Rows beyond `rr` repeat the last row (results discarded).
+                let rows: [usize; L] = std::array::from_fn(|k| r0 + i + k.min(rr - 1));
+                let rbits: [*const u8; L] = std::array::from_fn(|k| bits_all.add(rows[k] * rb));
+                if i == 0 {
+                    for off in (0..rb * rr).step_by(64) {
+                        _mm_prefetch::<_MM_HINT_T0>(bits_all.add(r0 * rb + off) as *const i8);
+                    }
+                }
+                let pf_rows = (n - i).saturating_sub(L).min(L);
+                let pf = bits_all.add((r0 + i + L).min(r0 + n - 1) * rb);
+                row_scales_f32(w, &rows, &mut dwr);
+                let mut y: [$vf; T] = [$setzf(); T];
+                let mut part: [$vf; T] = [$setzf(); T];
+                let mut iacc: [$vi; T] = [$setzi(); T];
+                // Position in the canonical order: sub-block `sc` of
+                // activation block `j`, which is number `jc` of weight
+                // block `bw`.
+                let (mut sc, mut j, mut jc, mut bw) = (0usize, 0usize, 0usize, 0usize);
+                // End of activation block j: p += I_j · d_x[j]; at the end
+                // of a weight block y += p · d_w (the canonical order).
+                let finish = |acc: &[$vi; T],
+                              part: &mut [$vf; T],
+                              y: &mut [$vf; T],
+                              j: &mut usize,
+                              jc: &mut usize,
+                              bw: &mut usize| {
+                    for t in 0..T {
+                        part[t] = $fma($cvt(acc[t]), $set1f(*dxb.add(*j * MT + t)), part[t]);
+                    }
+                    *j += 1;
+                    *jc += 1;
+                    if *jc == apw {
+                        *jc = 0;
+                        let ($gp, $gi) = (dwr.as_ptr().add(*bw), gidx);
+                        let dwv = $gather;
+                        for t in 0..T {
+                            y[t] = $fma(part[t], dwv, y[t]);
+                            part[t] = $setzf();
+                        }
+                        *bw += 1;
+                    }
+                };
+                for kc in (0..nsub).step_by(KC) {
+                    let cnt = (nsub - kc).min(KC);
+                    for r in 0..pf_rows {
+                        _mm_prefetch::<_MM_HINT_T0>(pf.add(r * rb + 4 * kc) as *const i8);
+                    }
+                    let tw = $loadw(&rbits, kc, cnt);
+                    let mut s = 0;
+                    while s < cnt {
+                        let xk = xb.add((kc + s) * MT * SUB);
+                        if $vnni && spa == 1 && s + 1 < cnt {
+                            // Two sub-blocks (= two activation blocks) at
+                            // once: 2·T independent accumulator chains hide
+                            // the vpdpbusd latency; each block's integer
+                            // sum, and the float order, are unchanged.
+                            let xk1 = xk.add(MT * SUB);
+                            let mut a0: [$vi; T] =
+                                std::array::from_fn(|t| $set1(*nsb.add(j * MT + t)));
+                            let mut a1: [$vi; T] =
+                                std::array::from_fn(|t| $set1(*nsb.add((j + 1) * MT + t)));
+                            let (t0, t1) = (tw[s], tw[s + 1]);
+                            for_groups02!(t0, m02, $and, $srli, $slli, |g, w0| {
+                                let w1 = for_groups02!(@one t1, m02, $and, $srli, $slli, g);
+                                for t in 0..T {
+                                    let x0 = $set1(bcast_u32(xk, t * SUB + 4 * g));
+                                    let x1 = $set1(bcast_u32(xk1, t * SUB + 4 * g));
+                                    a0[t] = $dpbusd(a0[t], w0, x0);
+                                    a1[t] = $dpbusd(a1[t], w1, x1);
+                                }
+                            });
+                            finish(&a0, &mut part, &mut y, &mut j, &mut jc, &mut bw);
+                            finish(&a1, &mut part, &mut y, &mut j, &mut jc, &mut bw);
+                            s += 2;
+                            continue;
+                        }
+                        let ts = tw[s];
+                        if sc == 0 {
+                            // Exact block dot I = Σ 2·bit·q - Σq: start at -Σq.
+                            for (t, acc) in iacc.iter_mut().enumerate() {
+                                *acc = $set1(*nsb.add(j * MT + t));
+                            }
+                        }
+                        if $vnni {
+                            for_groups02!(ts, m02, $and, $srli, $slli, |g, wg| {
+                                for (t, acc) in iacc.iter_mut().enumerate() {
+                                    let x = $set1(bcast_u32(xk, t * SUB + 4 * g));
+                                    *acc = $dpbusd(*acc, wg, x);
+                                }
+                            });
+                        } else {
+                            // i16 pair sums ≤ 2·2·127, eight groups ≤ 4064.
+                            let mut s16: [$vi; T] = [$setzi(); T];
+                            for_groups02!(ts, m02, $and, $srli, $slli, |g, wg| {
+                                for (t, acc) in s16.iter_mut().enumerate() {
+                                    let x = $set1(bcast_u32(xk, t * SUB + 4 * g));
+                                    *acc = $add16(*acc, $maddubs(wg, x));
+                                }
+                            });
+                            for (acc, s) in iacc.iter_mut().zip(&s16) {
+                                *acc = $add32(*acc, $madd(*s, $set1_16(1)));
+                            }
+                        }
+                        sc += 1;
+                        if sc == spa {
+                            sc = 0;
+                            finish(&iacc, &mut part, &mut y, &mut j, &mut jc, &mut bw);
+                        }
+                        s += 1;
+                    }
+                }
+                debug_assert!(bw == nb && j == nab);
+                for (t, yt) in y.iter().enumerate() {
+                    let mut v = [0.0f32; L];
+                    $storef(v.as_mut_ptr(), *yt);
+                    job.store(t, r0 + i, &v, rr);
+                }
+                i += L;
+            }
+        }
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+multi_kernel!(
+    /// Small-batch kernel, zmm, `vpdpbusd`.
+    ///
+    /// # Safety
+    /// The CPU must support `avx512f`, `avx512bw`, `avx512vnni`, `avx2`,
+    /// `fma` and `f16c`. `job` is checked.
+    multi_avx512vnni, "avx512f,avx512bw,avx512vnni,avx2,fma,f16c", lanes = 16, vnni = true,
+    vec = __m512i, fvec = __m512, load_words = load_words16,
+    set1 = _mm512_set1_epi32, setzi = _mm512_setzero_si512, add32 = _mm512_add_epi32,
+    and = _mm512_and_si512, srli = _mm512_srli_epi32, slli = _mm512_slli_epi32,
+    dpbusd = _mm512_dpbusd_epi32, maddubs = _mm512_maddubs_epi16, add16 = _mm512_add_epi16,
+    madd = _mm512_madd_epi16, set1_16 = _mm512_set1_epi16,
+    storef = _mm512_storeu_ps, setzf = _mm512_setzero_ps, set1f = _mm512_set1_ps,
+    cvt = _mm512_cvtepi32_ps, fma = _mm512_fmadd_ps,
+    gather = |p, idx| _mm512_i32gather_ps::<4>(idx, p),
+    gidx = (|nb: i32| _mm512_mullo_epi32(
+        _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+        _mm512_set1_epi32(nb),
+    ))
+);
+
+#[cfg(target_arch = "x86_64")]
+multi_kernel!(
+    /// Small-batch kernel, zmm, `vpmaddubsw` + `vpmaddwd`.
+    ///
+    /// # Safety
+    /// The CPU must support `avx512f`, `avx512bw`, `avx2`, `fma` and `f16c`.
+    /// `job` is checked.
+    multi_avx512bw, "avx512f,avx512bw,avx2,fma,f16c", lanes = 16, vnni = false,
+    vec = __m512i, fvec = __m512, load_words = load_words16,
+    set1 = _mm512_set1_epi32, setzi = _mm512_setzero_si512, add32 = _mm512_add_epi32,
+    and = _mm512_and_si512, srli = _mm512_srli_epi32, slli = _mm512_slli_epi32,
+    dpbusd = _mm512_dpbusd_epi32, maddubs = _mm512_maddubs_epi16, add16 = _mm512_add_epi16,
+    madd = _mm512_madd_epi16, set1_16 = _mm512_set1_epi16,
+    storef = _mm512_storeu_ps, setzf = _mm512_setzero_ps, set1f = _mm512_set1_ps,
+    cvt = _mm512_cvtepi32_ps, fma = _mm512_fmadd_ps,
+    gather = |p, idx| _mm512_i32gather_ps::<4>(idx, p),
+    gidx = (|nb: i32| _mm512_mullo_epi32(
+        _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+        _mm512_set1_epi32(nb),
+    ))
+);
+
+#[cfg(target_arch = "x86_64")]
+multi_kernel!(
+    /// Small-batch kernel, ymm, VEX `vpdpbusd`.
+    ///
+    /// # Safety
+    /// The CPU must support `avx2`, `fma`, `f16c` and `avxvnni`. `job` is
+    /// checked.
+    multi_avxvnni, "avx2,fma,f16c,avxvnni", lanes = 8, vnni = true,
+    vec = __m256i, fvec = __m256, load_words = load_words8,
+    set1 = _mm256_set1_epi32, setzi = _mm256_setzero_si256, add32 = _mm256_add_epi32,
+    and = _mm256_and_si256, srli = _mm256_srli_epi32, slli = _mm256_slli_epi32,
+    dpbusd = _mm256_dpbusd_avx_epi32, maddubs = _mm256_maddubs_epi16,
+    add16 = _mm256_add_epi16, madd = _mm256_madd_epi16, set1_16 = _mm256_set1_epi16,
+    storef = _mm256_storeu_ps, setzf = _mm256_setzero_ps, set1f = _mm256_set1_ps,
+    cvt = _mm256_cvtepi32_ps, fma = _mm256_fmadd_ps,
+    gather = |p, idx| _mm256_i32gather_ps::<4>(p, idx),
+    gidx = (|nb: i32| _mm256_mullo_epi32(
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+        _mm256_set1_epi32(nb),
+    ))
+);
+
+#[cfg(target_arch = "x86_64")]
+multi_kernel!(
+    /// Small-batch kernel, ymm, `vpmaddubsw` + `vpmaddwd`.
+    ///
+    /// # Safety
+    /// The CPU must support `avx2`, `fma` and `f16c`. `job` is checked.
+    multi_avx2, "avx2,fma,f16c", lanes = 8, vnni = false,
+    vec = __m256i, fvec = __m256, load_words = load_words8,
+    set1 = _mm256_set1_epi32, setzi = _mm256_setzero_si256, add32 = _mm256_add_epi32,
+    and = _mm256_and_si256, srli = _mm256_srli_epi32, slli = _mm256_slli_epi32,
+    dpbusd = _mm256_dpbusd_avx_epi32, maddubs = _mm256_maddubs_epi16,
+    add16 = _mm256_add_epi16, madd = _mm256_madd_epi16, set1_16 = _mm256_set1_epi16,
+    storef = _mm256_storeu_ps, setzf = _mm256_setzero_ps, set1f = _mm256_set1_ps,
+    cvt = _mm256_cvtepi32_ps, fma = _mm256_fmadd_ps,
+    gather = |p, idx| _mm256_i32gather_ps::<4>(p, idx),
+    gidx = (|nb: i32| _mm256_mullo_epi32(
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+        _mm256_set1_epi32(nb),
+    ))
+);
 
 /// Per-token row kernels over slabs of rows kept hot in cache: each task
 /// sweeps all activation rows for its slab, so the weights are streamed from
@@ -1344,21 +1916,25 @@ fn gemm_rows(isa: Isa, w: &Q1Weight, acts: &Q8Acts, out: &mut [f32]) {
     }
 }
 
-/// Expanded weights of one slab of `lanes` rows (see [`gemm_with`]).
+/// Expanded weights of one slab of `slabs · lanes` rows (see
+/// [`gemm_with`]).
 #[derive(Default)]
 struct Slab {
-    /// `[sub-block][group][lane]`, four bytes `{0, 2}` each.
+    /// `[sub-block][group][lane group][lane]`, four bytes `{0, 2}` each.
     wexp: Vec<u32>,
-    /// Weight scales `[weight block][lane]` (0 for lanes past the last row).
+    /// Weight scales `[weight block][lane group][lane]` (0 for rows past
+    /// the last).
     dw: Vec<f32>,
     /// Scratch: the slab's scales `[lane][weight block]`.
     rs: Vec<f32>,
 }
 
 impl Slab {
-    /// Expand rows `r0 .. r0 + lanes` of `w` for the kernels of `isa`.
+    /// Expand rows `r0 .. r0 + isa.slab_rows()` of `w` for the kernels of
+    /// `isa`.
     fn fill(&mut self, isa: TileIsa, w: &Q1Weight, r0: usize) {
-        let lanes = isa.lanes();
+        let (lanes, nr) = (isa.lanes(), isa.slabs());
+        let srows = lanes * nr;
         let nsub = w.cols / SUB;
         let nb = w.cols / w.block;
         assert!(r0 < w.rows);
@@ -1366,10 +1942,10 @@ impl Slab {
             lanes * (w.cols / 8) < i32::MAX as usize,
             "Q1 GEMM: rows too long"
         );
-        self.wexp.resize(nsub * 8 * lanes, 0);
+        self.wexp.resize(nsub * 8 * srows, 0);
         self.dw.clear();
-        self.dw.resize(nb * lanes, 0.0);
-        let valid = lanes.min(w.rows - r0);
+        self.dw.resize(nb * srows, 0.0);
+        let valid = srows.min(w.rows - r0);
         let rows: Vec<usize> = (r0..r0 + valid).collect();
         self.rs.resize(valid * nb, 0.0);
         // SAFETY: every tiled ISA includes the AVX2 tier (F16C).
@@ -1377,39 +1953,63 @@ impl Slab {
         unsafe {
             row_scales_f32(w, &rows, &mut self.rs)
         };
-        for (lane, rsl) in self.rs.chunks_exact(nb).enumerate() {
+        // Row l of the slab is lane l % lanes of lane group l / lanes.
+        for (l, rsl) in self.rs.chunks_exact(nb).enumerate() {
             for (b, &d) in rsl.iter().enumerate() {
-                self.dw[b * lanes + lane] = d;
+                self.dw[b * srows + l] = d;
             }
         }
-        // SAFETY: `isa` is supported (the caller dispatches on it); the
-        // gathers read sub-block words of rows r0 .. r0 + valid only.
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            match lanes {
-                16 => expand_slab_avx512(w, r0, valid, &mut self.wexp),
-                _ => expand_slab_avx2(w, r0, valid, &mut self.wexp),
+        for g in 0..nr {
+            let gr0 = r0 + g * lanes;
+            let gvalid = valid.saturating_sub(g * lanes).min(lanes);
+            // SAFETY: `isa` is supported (the caller dispatches on it); the
+            // gathers read sub-block words of rows gr0 .. gr0 + gvalid
+            // only (none if the group is past the last row).
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                match lanes {
+                    16 => expand_slab_avx512(w, gr0, gvalid, &mut self.wexp, g, nr),
+                    _ => expand_slab_avx2(w, gr0, gvalid, &mut self.wexp),
+                }
             }
+            #[cfg(not(target_arch = "x86_64"))]
+            unreachable!("tiled GEMM is x86_64 only");
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        unreachable!("tiled GEMM is x86_64 only");
     }
 }
 
-/// Transpose and expand the sign bits of `valid` (≤ 16) rows from `r0`:
-/// entry `[k][j][lane]` holds byte `p` = 2 · bit `8p + j` of sub-block `k`
-/// of that lane's row (0 for lanes ≥ `valid`).
+/// Transpose and expand the sign bits of `valid` (≤ 16) rows from `r0`
+/// into lane group `g` of `ng`: entry `[k][j][g][lane]` holds byte `p` =
+/// 2 · bit `8p + j` of sub-block `k` of that lane's row (0 for lanes ≥
+/// `valid`).
 ///
 /// # Safety
-/// The CPU must support `avx512f`. `r0 + valid <= rows`, `wexp` holds
-/// `cols / 32 · 8 · 16` entries and `16 · cols / 8 < 2^31`.
+/// The CPU must support `avx512f`. `r0 + valid <= rows`, `g < ng`, `wexp`
+/// holds `cols / 32 · 8 · 16 · ng` entries and `16 · cols / 8 < 2^31`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-unsafe fn expand_slab_avx512(w: &Q1Weight, r0: usize, valid: usize, wexp: &mut [u32]) {
+unsafe fn expand_slab_avx512(
+    w: &Q1Weight,
+    r0: usize,
+    valid: usize,
+    wexp: &mut [u32],
+    g: usize,
+    ng: usize,
+) {
     use std::arch::x86_64::*;
     let rb = w.cols / 8;
     let nsub = w.cols / SUB;
-    assert!(r0 + valid <= w.rows && valid <= 16 && wexp.len() == nsub * 8 * 16);
+    assert!(valid <= 16 && g < ng && wexp.len() == nsub * 8 * 16 * ng);
+    assert!(valid == 0 || r0 + valid <= w.rows);
+    let dst = wexp.as_mut_ptr() as *mut __m512i;
+    if valid == 0 {
+        for k in 0..nsub {
+            for j in 0..8 {
+                _mm512_storeu_si512(dst.add((8 * k + j) * ng + g), _mm512_setzero_si512());
+            }
+        }
+        return;
+    }
     let base = w.bits.as_slice().as_ptr().add(r0 * rb);
     let idx = _mm512_mullo_epi32(
         _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
@@ -1417,7 +2017,6 @@ unsafe fn expand_slab_avx512(w: &Q1Weight, r0: usize, valid: usize, wexp: &mut [
     );
     let mask: __mmask16 = ((1u32 << valid) - 1) as u16;
     let m01 = _mm512_set1_epi32(0x0101_0101);
-    let dst = wexp.as_mut_ptr() as *mut __m512i;
     for k in 0..nsub {
         let v = _mm512_mask_i32gather_epi32::<1>(
             _mm512_setzero_si512(),
@@ -1428,7 +2027,7 @@ unsafe fn expand_slab_avx512(w: &Q1Weight, r0: usize, valid: usize, wexp: &mut [
         macro_rules! group {
             ($j:literal) => {
                 let e = _mm512_and_si512(_mm512_srli_epi32::<$j>(v), m01);
-                _mm512_storeu_si512(dst.add(8 * k + $j), _mm512_add_epi32(e, e));
+                _mm512_storeu_si512(dst.add((8 * k + $j) * ng + g), _mm512_add_epi32(e, e));
             };
         }
         group!(0);
@@ -1583,17 +2182,30 @@ thread_local! {
 }
 
 fn gemm_tiled(isa: TileIsa, w: &Q1Weight, acts: &Q8Acts, out: &mut [f32]) {
-    PACKED.with_borrow_mut(|pa| {
-        pa.fill(acts, isa.tile());
+    with_packed(acts, isa.tile(), |pa| {
         gemm_tiled_packed(isa, w, acts, pa, out)
     })
 }
 
+/// Run `f` on `acts` packed in tiles of `tile` tokens, in this thread's
+/// reusable buffer. The buffer is moved out of the thread-local while `f`
+/// runs (no `RefCell` borrow is held across the parallel section), so a
+/// `gemm` that work-stealing runs on this thread meanwhile, e.g. when
+/// callers issue GEMMs from their own rayon tasks, just packs into a fresh
+/// buffer instead of panicking on a double borrow.
+fn with_packed<R>(acts: &Q8Acts, tile: usize, f: impl FnOnce(&PackedActs) -> R) -> R {
+    let mut pa = PACKED.with_borrow_mut(std::mem::take);
+    pa.fill(acts, tile);
+    let r = f(&pa);
+    PACKED.with_borrow_mut(|p| *p = pa);
+    r
+}
+
 fn gemm_tiled_packed(isa: TileIsa, w: &Q1Weight, acts: &Q8Acts, pa: &PackedActs, out: &mut [f32]) {
     let n = acts.n();
-    let lanes = isa.lanes();
+    let srows = isa.slab_rows();
     let tile = pa.tile;
-    let nslab = w.rows.div_ceil(lanes);
+    let nslab = w.rows.div_ceil(srows);
     let ntiles = n.div_ceil(tile);
     let ntb = n.div_ceil(GEMM_TOKEN_BLOCK);
     let tpb = ntiles.div_ceil(ntb); // tiles per token block
@@ -1610,7 +2222,7 @@ fn gemm_tiled_packed(isa: TileIsa, w: &Q1Weight, acts: &Q8Acts, pa: &PackedActs,
         let (c0, c1) = (tbi * tpb, ((tbi + 1) * tpb).min(ntiles));
         SLAB.with_borrow_mut(|slab| {
             for sl in si * spi..((si + 1) * spi).min(nslab) {
-                let r0 = sl * lanes;
+                let r0 = sl * srows;
                 slab.fill(isa, w, r0);
                 let job = TileJob {
                     w,
@@ -1661,7 +2273,8 @@ struct TileJob<'a> {
 }
 
 impl TileJob<'_> {
-    /// Checks the invariants the kernels rely on (cheap; once per slab).
+    /// Checks the invariants the kernels rely on (cheap; once per slab);
+    /// `lanes` is the number of rows of the slab.
     fn check(&self, lanes: usize, tile: usize) {
         let (w, a, s, pa) = (self.w, self.acts, self.slab, self.pa);
         let nsub = w.cols / SUB;
@@ -1702,7 +2315,10 @@ macro_rules! tile_kernel {
         set1 = $set1:path, loadi = $loadi:path, loadf = $loadf:path,
         storef = $storef:path, setzf = $setzf:path, set1f = $set1f:path, cvt = $cvt:path,
         fma = $fma:path,
-        step = |$iacc:ident, $wv:ident, $xp:ident| $step:expr
+        // Adds sub-block `k` to the `T` token accumulators: expanded group
+        // `g` of the slab is at `$wk + g·4·L`, token `i`'s permuted
+        // activations at `$xk + 32·i`.
+        sub = |$iacc:ident, $wk:ident, $xk:ident| $sub:block
     ) => {
         $(#[$doc])*
         #[target_feature(enable = $feat)]
@@ -1727,7 +2343,6 @@ macro_rules! tile_kernel {
                 let dxb = pa.dx.as_ptr().add(c * nab * T);
                 let mut facc: [$vf; T] = [$setzf(); T];
                 for b in 0..nb {
-                    let dwv = $loadf(dw.add(b * L));
                     // Σ_j cvt(I_j) · d_x[j] over the activation blocks of
                     // weight block b, then one FMA with the lane scales.
                     let mut part: [$vf; T] = [$setzf(); T];
@@ -1735,20 +2350,17 @@ macro_rules! tile_kernel {
                         let mut iacc: [$vi; T] = std::array::from_fn(|i| $set1(*nsb.add(j * T + i)));
                         for s in 0..spa {
                             let k = j * spa + s;
+                            // Group g of sub-block k at wk + g·4·L.
                             let wk = wexp.add(k * 8 * 4 * L);
-                            let wv: [$vi; 8] =
-                                std::array::from_fn(|g| $loadi(wk.add(g * 4 * L) as *const _));
                             let xk = xb.add(k * T * SUB);
-                            for i in 0..T {
-                                let $xp = xk.add(i * SUB) as *const u32;
-                                let ($iacc, $wv) = (iacc[i], &wv);
-                                iacc[i] = $step;
-                            }
+                            let ($iacc, $wk, $xk) = (&mut iacc, wk, xk);
+                            $sub
                         }
                         for i in 0..T {
                             part[i] = $fma($cvt(iacc[i]), $set1f(*dxb.add(j * T + i)), part[i]);
                         }
                     }
+                    let dwv = $loadf(dw.add(b * L));
                     for i in 0..T {
                         facc[i] = $fma(part[i], dwv, facc[i]);
                     }
@@ -1761,6 +2373,53 @@ macro_rules! tile_kernel {
             }
         }
     };
+}
+
+/// `$body` once for each `$g` in `0..8`, unrolled.
+#[cfg(target_arch = "x86_64")]
+macro_rules! unroll8 {
+    ($g:ident => $body:block) => {{
+        {
+            let $g: usize = 0;
+            $body
+        }
+        {
+            let $g: usize = 1;
+            $body
+        }
+        {
+            let $g: usize = 2;
+            $body
+        }
+        {
+            let $g: usize = 3;
+            $body
+        }
+        {
+            let $g: usize = 4;
+            $body
+        }
+        {
+            let $g: usize = 5;
+            $body
+        }
+        {
+            let $g: usize = 6;
+            $body
+        }
+        {
+            let $g: usize = 7;
+            $body
+        }
+    }};
+}
+
+/// Broadcast the `u32` at byte offset `off` of `p` (four permuted int8
+/// activations).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn bcast_u32(p: *const u8, off: usize) -> i32 {
+    (p.add(off) as *const u32).read_unaligned() as i32
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1777,13 +2436,17 @@ tile_kernel!(
     set1f = _mm256_set1_ps, cvt = _mm256_cvtepi32_ps,
     fma = _mm256_fmadd_ps,
     // i16 pair sums ≤ 2·2·127, eight groups ≤ 4064: no overflow.
-    step = |acc, wv, xp| {
-        let mut s16 = _mm256_setzero_si256();
-        for (g, &wg) in wv.iter().enumerate() {
-            let x = _mm256_set1_epi32(xp.add(g).read_unaligned() as i32);
-            s16 = _mm256_add_epi16(s16, _mm256_maddubs_epi16(wg, x));
+    sub = |iacc, wk, xk| {
+        let wv: [__m256i; 8] =
+            std::array::from_fn(|g| _mm256_loadu_si256(wk.add(32 * g) as *const _));
+        for (i, acc) in iacc.iter_mut().enumerate() {
+            let mut s16 = _mm256_setzero_si256();
+            for (g, &wg) in wv.iter().enumerate() {
+                let x = _mm256_set1_epi32(bcast_u32(xk, i * SUB + 4 * g));
+                s16 = _mm256_add_epi16(s16, _mm256_maddubs_epi16(wg, x));
+            }
+            *acc = _mm256_add_epi32(*acc, _mm256_madd_epi16(s16, _mm256_set1_epi16(1)));
         }
-        _mm256_add_epi32(acc, _mm256_madd_epi16(s16, _mm256_set1_epi16(1)))
     }
 );
 
@@ -1800,14 +2463,15 @@ tile_kernel!(
     loadf = _mm256_loadu_ps, storef = _mm256_storeu_ps, setzf = _mm256_setzero_ps,
     set1f = _mm256_set1_ps, cvt = _mm256_cvtepi32_ps,
     fma = _mm256_fmadd_ps,
-    step = |acc, wv, xp| {
-        let x = |g: usize| _mm256_set1_epi32(xp.add(g).read_unaligned() as i32);
-        let (mut a0, mut a1) = (acc, _mm256_setzero_si256());
-        for g in (0..8).step_by(2) {
-            a0 = _mm256_dpbusd_avx_epi32(a0, wv[g], x(g));
-            a1 = _mm256_dpbusd_avx_epi32(a1, wv[g + 1], x(g + 1));
-        }
-        _mm256_add_epi32(a0, a1)
+    // Group-major: the T token chains are interleaved.
+    sub = |iacc, wk, xk| {
+        unroll8!(g => {
+            let wg = _mm256_loadu_si256(wk.add(32 * g) as *const _);
+            for (i, acc) in iacc.iter_mut().enumerate() {
+                let x = _mm256_set1_epi32(bcast_u32(xk, i * SUB + 4 * g));
+                *acc = _mm256_dpbusd_avx_epi32(*acc, wg, x);
+            }
+        });
     }
 );
 
@@ -1824,40 +2488,157 @@ tile_kernel!(
     loadf = _mm512_loadu_ps, storef = _mm512_storeu_ps, setzf = _mm512_setzero_ps,
     set1f = _mm512_set1_ps, cvt = _mm512_cvtepi32_ps,
     fma = _mm512_fmadd_ps,
-    step = |acc, wv, xp| {
-        let mut s16 = _mm512_setzero_si512();
-        for (g, &wg) in wv.iter().enumerate() {
-            let x = _mm512_set1_epi32(xp.add(g).read_unaligned() as i32);
-            s16 = _mm512_add_epi16(s16, _mm512_maddubs_epi16(wg, x));
+    sub = |iacc, wk, xk| {
+        let wv: [__m512i; 8] =
+            std::array::from_fn(|g| _mm512_loadu_si512(wk.add(64 * g) as *const _));
+        for (i, acc) in iacc.iter_mut().enumerate() {
+            let mut s16 = _mm512_setzero_si512();
+            for (g, &wg) in wv.iter().enumerate() {
+                let x = _mm512_set1_epi32(bcast_u32(xk, i * SUB + 4 * g));
+                s16 = _mm512_add_epi16(s16, _mm512_maddubs_epi16(wg, x));
+            }
+            *acc = _mm512_add_epi32(*acc, _mm512_madd_epi16(s16, _mm512_set1_epi16(1)));
         }
-        _mm512_add_epi32(acc, _mm512_madd_epi16(s16, _mm512_set1_epi16(1)))
     }
 );
 
+/// Token-tiled GEMM, zmm, `vpdpbusd`, register tile of [`VNNI_SLABS`]
+/// lane groups × [`VNNI_TILE`] tokens: per expanded group, `VNNI_SLABS`
+/// weight vectors and `VNNI_TILE` broadcast activation words feed
+/// `VNNI_SLABS · VNNI_TILE` `vpdpbusd`. The f32 sums of the current weight
+/// block stay in registers; the per-row accumulators `y` are kept in L1
+/// between weight blocks.
+///
+/// # Safety
+/// The CPU must support `avx512f`, `avx512bw`, `avx512vnni`, `avx2`, `fma`
+/// and `f16c`. `job` is checked.
 #[cfg(target_arch = "x86_64")]
-tile_kernel!(
-    /// Token-tiled GEMM, zmm, `vpdpbusd`.
-    ///
-    /// # Safety
-    /// The CPU must support `avx512f`, `avx512bw`, `avx512vnni`, `avx2`,
-    /// `fma` and `f16c`. `job` is checked.
-    tile_avx512vnni, "avx512f,avx512bw,avx512vnni,avx2,fma,f16c", lanes = 16, tile = 8,
-    vec = __m512i, fvec = __m512,
-    set1 = _mm512_set1_epi32, loadi = _mm512_loadu_si512,
-    loadf = _mm512_loadu_ps, storef = _mm512_storeu_ps, setzf = _mm512_setzero_ps,
-    set1f = _mm512_set1_ps, cvt = _mm512_cvtepi32_ps,
-    fma = _mm512_fmadd_ps,
-    // One chain per token: the next sub-block's chains are independent, so
-    // out-of-order execution overlaps them (splitting measured no faster).
-    step = |acc, wv, xp| {
-        let x = |g: usize| _mm512_set1_epi32(xp.add(g).read_unaligned() as i32);
-        let mut a0 = acc;
-        for (g, &wg) in wv.iter().enumerate() {
-            a0 = _mm512_dpbusd_epi32(a0, wg, x(g));
-        }
-        a0
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx2,fma,f16c")]
+unsafe fn tile_avx512vnni(job: &TileJob<'_>) {
+    // Block geometry as constants: the per-block loops are then unrolled.
+    match (job.acts.block / SUB, job.w.block / job.acts.block) {
+        (1, 4) => tile_avx512vnni_g::<1, 4>(job),
+        (1, 1) => tile_avx512vnni_g::<1, 1>(job),
+        (4, 1) => tile_avx512vnni_g::<4, 1>(job),
+        _ => unreachable!("Q1 block geometry"),
     }
-);
+}
+
+/// [`tile_avx512vnni`] for `SPA` sub-blocks per activation block and `APW`
+/// activation blocks per weight block.
+///
+/// # Safety
+/// As [`tile_avx512vnni`]; `SPA` and `APW` match `job`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx2,fma,f16c")]
+unsafe fn tile_avx512vnni_g<const SPA: usize, const APW: usize>(job: &TileJob<'_>) {
+    use std::arch::x86_64::*;
+    const L: usize = 16;
+    const R: usize = VNNI_SLABS;
+    const T: usize = VNNI_TILE;
+    job.check(L * R, T);
+    let (w, a, slab, pa) = (job.w, job.acts, job.slab, job.pa);
+    let cols = w.cols;
+    let nab = cols / a.block;
+    let nsub = cols / SUB;
+    let (spa, apw) = (SPA, APW);
+    assert!(a.block / SUB == spa && w.block / a.block == apw);
+    let nb = cols / w.block;
+    let wexp = slab.wexp.as_ptr() as *const u8;
+    let dw = slab.dw.as_ptr();
+    // Columns in chunks of `kb` weight blocks (VNNI_KCHUNK columns): the
+    // chunk's expanded weights (VNNI_KCHUNK · 48 bytes) stay in L1 while
+    // every token tile of the job passes over them; the tiles' row sums
+    // wait in `ybuf` between chunks. Weight blocks are still added in
+    // order 0, 1, .., nb - 1, so the result is unchanged.
+    let kb = (VNNI_KCHUNK / w.block).max(1);
+    let ntile = job.c1 - job.c0;
+    TILE_Y.with_borrow_mut(|ybuf| {
+        ybuf.resize(ntile * R * T * L, 0.0);
+        let yb = ybuf.as_mut_ptr();
+        for b0 in (0..nb).step_by(kb) {
+            let b1 = (b0 + kb).min(nb);
+            for c in job.c0..job.c1 {
+                // Tile c: token i of sub-block k at xb + (k·T + i)·32.
+                let xb = pa.x.as_ptr().add(c * nsub * T * SUB) as *const u8;
+                let nsb = pa.ns.as_ptr().add(c * nab * T);
+                let dxb = pa.dx.as_ptr().add(c * nab * T);
+                let ys = yb.add((c - job.c0) * R * T * L);
+                let mut facc = [[_mm512_setzero_ps(); T]; R];
+                if b0 > 0 {
+                    for (r, f) in facc.iter_mut().enumerate() {
+                        for (i, v) in f.iter_mut().enumerate() {
+                            *v = _mm512_loadu_ps(ys.add((r * T + i) * L));
+                        }
+                    }
+                }
+                for b in b0..b1 {
+                    let mut part = [[_mm512_setzero_ps(); T]; R];
+                    for j in b * apw..(b + 1) * apw {
+                        let mut iacc = [[_mm512_setzero_si512(); T]; R];
+                        for i in 0..T {
+                            let v = _mm512_set1_epi32(*nsb.add(j * T + i));
+                            for acc in iacc.iter_mut() {
+                                acc[i] = v;
+                            }
+                        }
+                        for s in 0..spa {
+                            let k = j * spa + s;
+                            let wk = wexp.add(k * 8 * R * 4 * L);
+                            let xk = xb.add(k * T * SUB);
+                            unroll8!(g => {
+                                let wv: [__m512i; R] = std::array::from_fn(|r| {
+                                    _mm512_loadu_si512(wk.add((g * R + r) * 4 * L) as *const _)
+                                });
+                                for i in 0..T {
+                                    let x = _mm512_set1_epi32(bcast_u32(xk, i * SUB + 4 * g));
+                                    for (acc, &wr) in iacc.iter_mut().zip(&wv) {
+                                        acc[i] = _mm512_dpbusd_epi32(acc[i], wr, x);
+                                    }
+                                }
+                            });
+                        }
+                        for i in 0..T {
+                            let d = _mm512_set1_ps(*dxb.add(j * T + i));
+                            for (p, acc) in part.iter_mut().zip(&iacc) {
+                                p[i] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[i]), d, p[i]);
+                            }
+                        }
+                    }
+                    for (r, (f, p)) in facc.iter_mut().zip(&part).enumerate() {
+                        let dwv = _mm512_loadu_ps(dw.add((b * R + r) * L));
+                        for i in 0..T {
+                            f[i] = _mm512_fmadd_ps(p[i], dwv, f[i]);
+                        }
+                    }
+                }
+                if b1 < nb {
+                    for (r, f) in facc.iter().enumerate() {
+                        for (i, &v) in f.iter().enumerate() {
+                            _mm512_storeu_ps(ys.add((r * T + i) * L), v);
+                        }
+                    }
+                    continue;
+                }
+                for i in 0..T {
+                    let mut v = [0.0f32; L * R];
+                    for (r, f) in facc.iter().enumerate() {
+                        _mm512_storeu_ps(v.as_mut_ptr().add(r * L), f[i]);
+                    }
+                    job.store(c * T + i, &v);
+                }
+            }
+        }
+    });
+}
+
+/// Columns per L1-resident chunk of the AVX-512 VNNI tile kernel.
+const VNNI_KCHUNK: usize = 512;
+
+thread_local! {
+    /// Row sums of the token tiles between column chunks.
+    static TILE_Y: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// Convenience: quantize `x` (`n` rows) and compute `W · x` into `out`.
 pub fn matmul_f32(w: &Q1Weight, x: &[f32], n: usize, acts: &mut Q8Acts, out: &mut [f32]) {

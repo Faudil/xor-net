@@ -282,9 +282,10 @@ impl GgufTensorInfo {
             0 => Some(4),
             1 => Some(2),
             30 => Some(2),
-            2 => Some(20),
-            3 => Some(24),
-            6 => Some(20),
+            // ggml block_q4_0 / q4_1 / q5_0 / q5_1 (32 elements each).
+            2 => Some(18),
+            3 => Some(20),
+            6 => Some(22),
             7 => Some(24),
             8 => Some(34),
             9 => Some(36),
